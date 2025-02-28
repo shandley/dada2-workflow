@@ -1,0 +1,381 @@
+---
+title: "DADA2 Workflow for 16S rRNA Amplicon Sequence Variants"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+This document implements a workflow for processing 16S rRNA gene amplicon data using DADA2. The workflow includes quality filtering, denoising, merging paired reads, chimera removal, and taxonomic assignment to generate a table of amplicon sequence variants (ASVs).
+
+# Setup
+
+```{r load-packages}
+# Load required packages
+library(dada2)        # Core package for denoising and processing amplicon data
+library(ggplot2)      # For creating publication-quality graphics
+library(phyloseq)     # For handling and analyzing microbiome census data
+library(Biostrings)   # For efficient string objects representation of biological sequences
+library(ShortRead)    # For manipulation of FASTQ files and short read sequences
+library(tidyverse)    # Collection of data science packages for data manipulation and visualization
+
+# Set the random seed for reproducibility
+set.seed(100)
+```
+
+# Set Working Directory and Locate Files
+
+```{r locate-files}
+# Set your working directory to where the fastq files are located
+# Replace with the path to your sequencing data
+path <- "path/to/your/fastq/files"
+
+# List fastq files - handling both naming conventions
+# Try standard Illumina naming pattern first (_R1_001.fastq.gz)
+fnFs.illumina <- sort(list.files(path, pattern="_R1_001.fastq.gz", full.names = TRUE))
+fnRs.illumina <- sort(list.files(path, pattern="_R2_001.fastq.gz", full.names = TRUE))
+
+# Try alternative naming pattern (_R1.fastq.gz)
+fnFs.alt <- sort(list.files(path, pattern="_R1.fastq.gz", full.names = TRUE))
+fnRs.alt <- sort(list.files(path, pattern="_R2.fastq.gz", full.names = TRUE))
+
+# Check naming pattern and use the appropriate files
+if (length(fnFs.illumina) > 0) {
+  # Use Illumina naming pattern
+  fnFs <- fnFs.illumina
+  fnRs <- fnRs.illumina
+  cat("Using Illumina naming pattern (_R1_001.fastq.gz)\n")
+  file_pattern <- "_R\\d_001.fastq.gz"
+} else if (length(fnFs.alt) > 0) {
+  # Use alternative naming pattern
+  fnFs <- fnFs.alt
+  fnRs <- fnRs.alt
+  cat("Using alternative naming pattern (_R1.fastq.gz)\n")
+  file_pattern <- "_R\\d.fastq.gz"
+} else {
+  stop("No fastq files found with standard naming patterns. Please check your file paths and naming conventions.")
+}
+
+# Extract sample names from filenames
+# Function to extract sample names that works with both naming conventions
+extract_sample_names <- function(file_paths, pattern) {
+  sample_names <- basename(file_paths)
+  # Remove file extension and the R1/R2 pattern
+  sample_names <- gsub(pattern, "", sample_names)
+  # Remove trailing underscores if present
+  sample_names <- gsub("_+$", "", sample_names)
+  return(sample_names)
+}
+
+# Extract sample names
+sample.names <- extract_sample_names(fnFs, file_pattern)
+
+# Verify forward and reverse files match
+if (length(fnFs) != length(fnRs)) {
+  stop("Number of forward and reverse files don't match. Check your files.")
+}
+
+# Print summary
+cat("Found", length(fnFs), "samples\n")
+```
+
+# Quality Profiles
+
+```{r quality-plots}
+# Plot quality profiles for forward reads
+plotQualityProfile(fnFs[1:2])
+
+# Plot quality profiles for reverse reads
+plotQualityProfile(fnRs[1:2])
+```
+
+# Filter and Trim
+
+```{r filter-trim}
+# Create directory for filtered files
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# Make sure the filtered directory exists
+if(!dir.exists(file.path(path, "filtered"))) {
+  dir.create(file.path(path, "filtered"))
+}
+
+# Filter and trim
+# Adjust truncLen and other parameters based on your quality profiles
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs,
+                     truncLen=c(240, 200), 
+                     maxN=0, maxEE=c(2,2), truncQ=2,
+                     rm.phix=TRUE, compress=TRUE, multithread=TRUE)
+
+# View filtering statistics
+head(out)
+```
+
+# Learn Error Rates
+
+```{r learn-errors}
+# Learn error rates
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+
+# Plot error rates
+plotErrors(errF, nominalQ=TRUE)
+```
+
+# Dereplication
+
+```{r dereplication}
+# Dereplicate identical reads
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+```
+
+# Sample Inference
+
+```{r dada2}
+# Apply the DADA2 algorithm
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+
+# Inspect the returned dada-class object
+dadaFs[[1]]
+```
+
+# Merge Paired Reads
+
+```{r merge-reads}
+# Merge paired reads
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+
+# Inspect the merger data.frame
+head(mergers[[1]])
+```
+
+# Construct ASV Table
+
+```{r seqtab}
+# Construct sequence table
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+
+# Remove Chimeras
+
+```{r chimeras}
+# Remove chimeric sequences
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+
+# Calculate the percentage of non-chimeric sequences
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+# Track Reads Through the Pipeline
+
+```{r track}
+# Track reads through the pipeline
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, 
+               sapply(dadaFs, getN), 
+               sapply(dadaRs, getN), 
+               sapply(mergers, getN),
+               rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+
+# Assign Taxonomy
+
+```{r taxonomy}
+# Create directory for reference databases if it doesn't exist
+if(!dir.exists("ref_db")) dir.create("ref_db")
+
+# Using Silva database for taxonomy assignment
+cat("Using Silva database for taxonomy assignment...\n")
+
+# Check if Silva files are available in the DADA2 package
+silva_train <- system.file("extdata", "silva_nr99_v138.1_train_set.fa.gz", package="dada2")
+silva_species <- system.file("extdata", "silva_species_assignment_v138.1.fa.gz", package="dada2")
+
+silva_files_in_package <- (file.exists(silva_train) && file.exists(silva_species))
+
+if(silva_files_in_package) {
+  cat("Using Silva database files from DADA2 package\n")
+} else {
+  cat("Silva files not found in DADA2 package, will download from Zenodo\n")
+  
+  # URLs for Silva files from Zenodo
+  silva_url_base <- "https://zenodo.org/records/4587955/files/"
+  silva_train_url <- paste0(silva_url_base, "silva_nr99_v138.1_train_set.fa.gz")
+  silva_species_url <- paste0(silva_url_base, "silva_species_assignment_v138.1.fa.gz")
+  
+  # Local file paths for Silva files
+  silva_train <- file.path("ref_db", "silva_train_set.fa.gz")
+  silva_species <- file.path("ref_db", "silva_species.fa.gz")
+  
+  # Download training set if needed
+  if(!file.exists(silva_train)) {
+    cat("Downloading Silva taxonomy training file...\n")
+    # Set extended timeout
+    options(timeout = max(300, getOption("timeout")))
+    
+    tryCatch({
+      download.file(silva_train_url, silva_train, method="auto", mode="wb")
+      cat("Download successful!\n")
+    }, error = function(e) {
+      cat("Error downloading Silva taxonomy file:", conditionMessage(e), "\n")
+      cat("Please try downloading it manually from:", silva_train_url, "\n")
+      cat("and save it to:", silva_train, "\n")
+      stop("Download failed. Please download files manually.")
+    })
+  }
+  
+  # Download species file if needed
+  if(!file.exists(silva_species)) {
+    cat("Downloading Silva species assignment file...\n")
+    
+    tryCatch({
+      download.file(silva_species_url, silva_species, method="auto", mode="wb")
+      cat("Download successful!\n")
+    }, error = function(e) {
+      cat("Error downloading Silva species file:", conditionMessage(e), "\n")
+      cat("Please try downloading it manually from:", silva_species_url, "\n")
+      cat("and save it to:", silva_species, "\n")
+      stop("Download failed. Please download files manually.")
+    })
+  }
+}
+
+# Check if files exist before proceeding
+if(!file.exists(silva_train) || !file.exists(silva_species)) {
+  stop("Required Silva files not available. Please download them manually as noted above.")
+}
+
+# Assign taxonomy at the genus level
+cat("Assigning taxonomy using Silva database...\n")
+taxa <- assignTaxonomy(seqtab.nochim, silva_train, multithread=TRUE)
+
+# Add species-level assignments
+cat("Adding species-level assignments...\n")
+taxa <- addSpecies(taxa, silva_species)
+
+# View taxonomic assignments
+taxa.print <- taxa
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+# Check the frequency of species-level assignments
+species_assigned <- sum(!is.na(taxa[, "Species"]))
+total_asvs <- nrow(taxa)
+cat("Percentage of ASVs assigned to species level:", round(species_assigned/total_asvs*100, 2), "%\n")
+```
+
+# Create Phyloseq Object
+
+```{r phyloseq}
+# Create sample data frame
+# Replace with your metadata file
+# samples.df <- read.table("path/to/metadata.txt", header=TRUE, row.names=1, sep="\t")
+
+# For demonstration, create a simple sample data frame
+samples.df <- data.frame(
+  Sample = sample.names,
+  Group = sample(c("Control", "Treatment"), length(sample.names), replace = TRUE),
+  row.names = sample.names
+)
+
+# Create phyloseq object
+# Make sure taxonomy table has the right dimensions
+if (nrow(taxa) != ncol(seqtab.nochim)) {
+  cat("WARNING: Taxonomy table dimensions don't match sequence table.\n")
+  cat("Taxonomy table rows:", nrow(taxa), "\n")
+  cat("Sequence table columns:", ncol(seqtab.nochim), "\n")
+  cat("This could cause problems in the dashboard. Converting to a simple phyloseq object.\n")
+  
+  ps <- phyloseq(
+    otu_table(seqtab.nochim, taxa_are_rows=FALSE),
+    sample_data(samples.df)
+  )
+  
+  # Add taxonomy table if it can be made to fit
+  if (nrow(taxa) <= ncol(seqtab.nochim)) {
+    # Only use the available taxonomy rows
+    ps <- phyloseq(
+      otu_table(seqtab.nochim, taxa_are_rows=FALSE),
+      sample_data(samples.df),
+      tax_table(taxa[1:ncol(seqtab.nochim),])
+    )
+  }
+} else {
+  # Normal case when dimensions match
+  ps <- phyloseq(
+    otu_table(seqtab.nochim, taxa_are_rows=FALSE),
+    sample_data(samples.df),
+    tax_table(taxa)
+  )
+}
+
+# Inspect phyloseq object
+ps
+```
+
+# Save Results
+
+```{r save-results}
+# Create directory for results if it doesn't exist
+if(!dir.exists("results")) dir.create("results")
+
+# Save read tracking information for dashboard visualization
+track_path <- "results/read_tracking.rds"
+track_df <- as.data.frame(track)
+saveRDS(track_df, track_path)
+cat("Saved read tracking data to", track_path, "\n")
+
+# Save sequence table
+write.csv(t(seqtab.nochim), "results/seqtab_nochim.csv")
+
+# Save taxonomy table
+write.csv(taxa, "results/taxonomy.csv")
+
+# Save phyloseq object
+saveRDS(ps, "results/phyloseq_object.rds")
+
+# Extract and save ASV sequences
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+# Write ASVs as fasta
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "results/ASVs.fasta")
+```
+
+# Conclusion
+
+This document outlines a complete DADA2 workflow for processing 16S rRNA gene amplicon data. The workflow produces a table of amplicon sequence variants (ASVs) and their taxonomic assignments, as well as a phyloseq object for downstream analysis.
+
+Remember to adjust parameters such as truncLen, maxEE, etc. based on the quality of your sequencing data and the primers used.
