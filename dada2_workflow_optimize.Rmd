@@ -892,24 +892,41 @@ if (chimera_pct < 50) {
 getN <- function(x) sum(getUniques(x))
 
 # Create tracking table with all processing steps
-track <- cbind(
-  # Input reads
-  out[rownames(out) %in% names(derepFs), "reads.in"],
-  # Filtered reads
-  out[rownames(out) %in% names(derepFs), "reads.out"],
-  # Denoised forward reads
-  sapply(dadaFs, getN),
-  # Denoised reverse reads
-  sapply(dadaRs, getN),
-  # Merged reads
-  sapply(mergers, getN),
-  # Non-chimeric reads
-  rowSums(seqtab.nochim)
+# First check that we have the same samples throughout
+# Get common sample names across all steps
+common_samples <- Reduce(intersect, list(
+  rownames(out),
+  names(derepFs),
+  names(dadaFs),
+  names(dadaRs),
+  names(mergers)
+))
+
+# Warn if any samples were dropped
+if (length(common_samples) < length(names(derepFs))) {
+  cat("Warning: Some samples are missing from one or more processing steps.\n")
+  cat("Using only", length(common_samples), "samples for tracking.\n")
+}
+
+# Create tracking table explicitly for each sample to avoid dimension issues
+track <- data.frame(
+  Input = out[common_samples, "reads.in"],
+  Filtered = out[common_samples, "reads.out"],
+  Denoised_F = sapply(dadaFs[common_samples], getN),
+  Denoised_R = sapply(dadaRs[common_samples], getN),
+  Merged = sapply(mergers[common_samples], getN)
 )
 
-# Set column and row names
-colnames(track) <- c("Input", "Filtered", "Denoised_F", "Denoised_R", "Merged", "NonChimeric")
-rownames(track) <- names(derepFs)
+# Add non-chimeric reads column - handle potential dimension mismatch
+track$NonChimeric <- 0  # Initialize with zeros
+for (sample in rownames(track)) {
+  if (sample %in% rownames(seqtab.nochim)) {
+    track[sample, "NonChimeric"] <- sum(seqtab.nochim[sample, ])
+  }
+}
+
+# Ensure row names are preserved
+rownames(track) <- common_samples
 
 # Convert to data frame for better display
 track_df <- as.data.frame(track)
