@@ -1630,6 +1630,14 @@ if (length(filtFs) > 0) {
 
 # Learn Error Rates
 
+In this step, DADA2 learns the error rates from the filtered sequence data. This is a critical step that models the relationship between sequence quality scores and the observed error rates, allowing the algorithm to better distinguish between sequencing errors and true biological variation.
+
+The workflow uses parallelization and memory optimization techniques to efficiently process the data:
+- For large datasets, a representative subset of samples is randomly selected
+- Error models are learned separately for forward and reverse reads
+- The resulting error rates are visualized to show the quality of the model fit
+- These error models will be used in the subsequent denoising step to infer the true biological sequences
+
 ```{r learn-errors}
 # Learn error rates with optimized parallelization
 cat("Learning error rates with optimized parallelization...\n")
