@@ -1050,15 +1050,180 @@ if (nrow(zero_samples) > 0) {
 Let's check the quality profiles of the filtered reads to confirm our filtering parameters worked as expected.
 
 ```{r quality-filtered}
-# Plot quality profiles for filtered reads (first few samples)
+# Enhanced quality visualization for filtered reads
 if (length(filtFs) > 0) {
-  # Look at quality profiles of filtered reads
-  filtered_forward_qual <- plotQualityProfile(filtFs[1:min(3, length(filtFs))])
-  filtered_reverse_qual <- plotQualityProfile(filtRs[1:min(3, length(filtRs))])
+  # Function to create enhanced quality profile visualization
+  create_enhanced_quality_viz <- function(fastq_files, read_type = "Forward", aggregate = FALSE) {
+    # Generate standard quality profile
+    qual_plot <- plotQualityProfile(fastq_files, aggregate = aggregate)
+    
+    if (aggregate) {
+      # Extract data for enhanced visualization
+      plot_data <- qual_plot$data
+      
+      # Calculate mean, median, and percentile quality by position
+      qual_stats <- plot_data %>%
+        group_by(Cycle) %>%
+        summarize(
+          Mean = mean(Score),
+          Median = median(Score),
+          Q10 = quantile(Score, 0.1),
+          Q25 = quantile(Score, 0.25),
+          Q75 = quantile(Score, 0.75),
+          Q90 = quantile(Score, 0.9)
+        )
+      
+      # Create enhanced visualization
+      enhanced_plot <- ggplot(qual_stats, aes(x = Cycle)) +
+        # Add shaded regions for quality interpretation
+        annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0, ymax = 20, 
+                 fill = "red", alpha = 0.2) +
+        annotate("rect", xmin = -Inf, xmax = Inf, ymin = 20, ymax = 28, 
+                 fill = "yellow", alpha = 0.2) +
+        annotate("rect", xmin = -Inf, xmax = Inf, ymin = 28, ymax = Inf, 
+                 fill = "green", alpha = 0.2) +
+        # Add percentile ribbons
+        geom_ribbon(aes(ymin = Q10, ymax = Q90), alpha = 0.2, fill = "grey50") +
+        geom_ribbon(aes(ymin = Q25, ymax = Q75), alpha = 0.3, fill = "grey40") +
+        # Add lines for mean and median
+        geom_line(aes(y = Mean, color = "Mean"), size = 1.2) +
+        geom_line(aes(y = Median, color = "Median"), size = 1.2, linetype = "dashed") +
+        # Add quality thresholds
+        geom_hline(yintercept = 30, linetype = "dashed", color = "blue") +
+        geom_hline(yintercept = 20, linetype = "dashed", color = "red") +
+        # Add trimming position indicators if available
+        {if (read_type == "Forward" && exists("truncLen_forward")) 
+          geom_vline(xintercept = truncLen_forward, color = "purple", size = 1, alpha = 0.7)} +
+        {if (read_type == "Reverse" && exists("truncLen_reverse")) 
+          geom_vline(xintercept = truncLen_reverse, color = "purple", size = 1, alpha = 0.7)} +
+        # Labels and theme
+        labs(
+          title = paste(read_type, "Read Quality After Filtering"),
+          subtitle = "With quality interpretation zones and percentile distribution",
+          x = "Cycle (bp position)",
+          y = "Quality Score",
+          caption = "Red: Q<20 (poor) | Yellow: Q20-28 (acceptable) | Green: Q>28 (excellent)"
+        ) +
+        scale_color_manual(
+          name = "Statistic", 
+          values = c("Mean" = "blue", "Median" = "darkgreen")
+        ) +
+        scale_y_continuous(limits = c(0, 40)) +
+        theme_minimal() +
+        theme(
+          legend.position = "bottom",
+          plot.caption = element_text(hjust = 0.5),
+          panel.grid.minor = element_blank()
+        ) +
+        # Add annotations
+        annotate("text", x = 5, y = 38, label = "Excellent", color = "darkgreen", hjust = 0) +
+        annotate("text", x = 5, y = 24, label = "Acceptable", color = "darkgoldenrod4", hjust = 0) +
+        annotate("text", x = 5, y = 10, label = "Poor", color = "darkred", hjust = 0)
+      
+      # Add trimming point annotation
+      if (read_type == "Forward" && exists("truncLen_forward")) {
+        enhanced_plot <- enhanced_plot + 
+          annotate("text", x = truncLen_forward, y = 35, 
+                   label = paste("Trim position:", truncLen_forward), 
+                   color = "purple", hjust = 1)
+      } else if (read_type == "Reverse" && exists("truncLen_reverse")) {
+        enhanced_plot <- enhanced_plot + 
+          annotate("text", x = truncLen_reverse, y = 35, 
+                   label = paste("Trim position:", truncLen_reverse), 
+                   color = "purple", hjust = 1)
+      }
+      
+      return(enhanced_plot)
+    } else {
+      # Return standard plot for non-aggregated visualization
+      return(qual_plot + 
+               ggtitle(paste(read_type, "Read Quality After Filtering (Individual Samples)")))
+    }
+  }
   
-  # Display the quality plots
+  # Create enhanced visualizations for filtered reads
+  n_sample_viz <- min(3, length(filtFs))
+  
+  # Individual sample plots
+  filtered_forward_qual <- create_enhanced_quality_viz(filtFs[1:n_sample_viz], "Forward")
+  filtered_reverse_qual <- create_enhanced_quality_viz(filtRs[1:n_sample_viz], "Reverse")
   print(filtered_forward_qual)
   print(filtered_reverse_qual)
+  
+  # Aggregated profiles with enhanced visualization
+  cat("Creating aggregated quality profiles with enhanced visualization...\n")
+  
+  # Use more samples for aggregated view if available (up to 10)
+  n_sample_agg <- min(10, length(filtFs))
+  
+  # Aggregated plots with enhanced visualization
+  forward_enhanced <- create_enhanced_quality_viz(filtFs[1:n_sample_agg], "Forward", aggregate = TRUE)
+  reverse_enhanced <- create_enhanced_quality_viz(filtRs[1:n_sample_agg], "Reverse", aggregate = TRUE)
+  
+  # Display enhanced plots
+  print(forward_enhanced)
+  print(reverse_enhanced)
+  
+  # Side-by-side view
+  grid.arrange(forward_enhanced, reverse_enhanced, ncol = 2,
+               top = "Quality Profiles After Filtering (Aggregated)")
+  
+  # Create a quality comparison visualization (before vs after filtering)
+  if (exists("forward_qual") && exists("reverse_qual")) {
+    cat("Creating before vs after filtering quality comparison...\n")
+    
+    # Extract data from before filtering plots
+    before_forward_data <- forward_qual$data
+    before_reverse_data <- reverse_qual$data
+    
+    # Sample a subset of filtered reads quality data for comparison
+    filtered_forward_data <- plotQualityProfile(filtFs[1:n_sample_agg], aggregate = TRUE)$data
+    filtered_reverse_data <- plotQualityProfile(filtRs[1:n_sample_agg], aggregate = TRUE)$data
+    
+    # Add a 'Stage' column to both datasets
+    before_forward_data$Stage <- "Before Filtering"
+    filtered_forward_data$Stage <- "After Filtering"
+    before_reverse_data$Stage <- "Before Filtering"
+    filtered_reverse_data$Stage <- "After Filtering"
+    
+    # Combine data
+    combined_forward <- rbind(before_forward_data, filtered_forward_data)
+    combined_reverse <- rbind(before_reverse_data, filtered_reverse_data)
+    
+    # Create comparison plots
+    forward_comparison <- ggplot(combined_forward, aes(x = Cycle, y = Score, color = Stage)) +
+      stat_summary(fun = mean, geom = "line", size = 1.2) +
+      geom_hline(yintercept = 30, linetype = "dashed", color = "blue") +
+      geom_hline(yintercept = 20, linetype = "dashed", color = "red") +
+      {if (exists("truncLen_forward")) 
+        geom_vline(xintercept = truncLen_forward, color = "purple", size = 1, alpha = 0.7)} +
+      scale_color_manual(values = c("Before Filtering" = "gray40", "After Filtering" = "steelblue")) +
+      labs(
+        title = "Forward Reads: Quality Before vs After Filtering",
+        x = "Cycle (bp position)",
+        y = "Mean Quality Score"
+      ) +
+      theme_minimal()
+    
+    reverse_comparison <- ggplot(combined_reverse, aes(x = Cycle, y = Score, color = Stage)) +
+      stat_summary(fun = mean, geom = "line", size = 1.2) +
+      geom_hline(yintercept = 30, linetype = "dashed", color = "blue") +
+      geom_hline(yintercept = 20, linetype = "dashed", color = "red") +
+      {if (exists("truncLen_reverse")) 
+        geom_vline(xintercept = truncLen_reverse, color = "purple", size = 1, alpha = 0.7)} +
+      scale_color_manual(values = c("Before Filtering" = "gray40", "After Filtering" = "steelblue")) +
+      labs(
+        title = "Reverse Reads: Quality Before vs After Filtering",
+        x = "Cycle (bp position)",
+        y = "Mean Quality Score"
+      ) +
+      theme_minimal()
+    
+    # Display comparison plots
+    grid.arrange(forward_comparison, reverse_comparison, ncol = 2,
+                 top = "Quality Improvement After Filtering")
+  }
+  
 } else {
   cat("No samples remain after filtering. Please review filtering parameters.\n")
   knitr::knit_exit()
