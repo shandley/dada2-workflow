@@ -17,6 +17,71 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 # Checkpointing functions
 checkpoint_dir <- "checkpoints"
 
+# Enhanced package checking and loading function
+check_and_load_packages <- function() {
+  required_packages <- c(
+    "dada2", "ggplot2", "phyloseq", "Biostrings", "ShortRead", 
+    "tidyverse", "gridExtra", "knitr", "future", "future.apply"
+  )
+  
+  optional_packages <- c(
+    "DECIPHER", "phangorn", "msa", "taxize"
+  )
+  
+  missing_required <- required_packages[!sapply(required_packages, requireNamespace, quietly = TRUE)]
+  missing_optional <- optional_packages[!sapply(optional_packages, requireNamespace, quietly = TRUE)]
+  
+  # Alert about missing required packages
+  if (length(missing_required) > 0) {
+    message("Installing required packages: ", paste(missing_required, collapse = ", "))
+    for (pkg in missing_required) {
+      if (pkg %in% c("dada2", "DECIPHER", "phyloseq", "ShortRead", "Biostrings")) {
+        if (!requireNamespace("BiocManager", quietly = TRUE)) {
+          install.packages("BiocManager")
+        }
+        BiocManager::install(pkg, update = FALSE)
+      } else {
+        install.packages(pkg)
+      }
+    }
+  }
+  
+  # Alert about missing optional packages but don't install automatically
+  if (length(missing_optional) > 0) {
+    message("NOTE: The following optional packages are not installed: ", 
+            paste(missing_optional, collapse = ", "))
+    message("These packages enable additional functionality like phylogenetic tree building.")
+    message("You can install them with:")
+    
+    for (pkg in missing_optional) {
+      if (pkg %in% c("DECIPHER", "phangorn")) {
+        message("  BiocManager::install('", pkg, "')")
+      } else {
+        message("  install.packages('", pkg, "')")
+      }
+    }
+  }
+  
+  # Load all required packages
+  for (pkg in required_packages) {
+    suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+  }
+  
+  # Load available optional packages
+  for (pkg in optional_packages) {
+    if (requireNamespace(pkg, quietly = TRUE)) {
+      suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+    }
+  }
+  
+  return(list(
+    required = required_packages,
+    optional = intersect(optional_packages, 
+                        optional_packages[sapply(optional_packages, requireNamespace, quietly = TRUE)]),
+    missing = missing_optional
+  ))
+}
+
 # Create a checkpoint
 save_checkpoint <- function(checkpoint_name, object_list, overwrite = FALSE) {
   # Validate inputs
@@ -323,17 +388,26 @@ Key features of this optimized workflow:
 # Setup
 
 ```{r load-packages}
-# Load required packages
-library(dada2)        # Core package for denoising and processing amplicon data
-library(ggplot2)      # For creating publication-quality graphics
-library(phyloseq)     # For handling and analyzing microbiome census data
-library(Biostrings)   # For efficient string objects representation of biological sequences
-library(ShortRead)    # For manipulation of FASTQ files and short read sequences
-library(tidyverse)    # Collection of data science packages for data manipulation and visualization
-library(gridExtra)    # For arranging multiple plots
-library(knitr)        # For tables in R Markdown
-library(future)       # For parallel processing
-library(future.apply) # For parallel apply functions
+# Check and load all required and optional packages
+package_status <- check_and_load_packages()
+
+# Display information about available packages
+cat("Required packages loaded:", length(package_status$required), "\n")
+if (length(package_status$optional) > 0) {
+  cat("Optional packages loaded:", paste(package_status$optional, collapse = ", "), "\n")
+}
+if (length(package_status$missing) > 0) {
+  cat("Optional packages not available:", paste(package_status$missing, collapse = ", "), "\n")
+  cat("Some advanced features may be disabled.\n")
+}
+
+# Check if phylogenetic tree building is available
+can_build_trees <- all(c("phangorn", "DECIPHER") %in% package_status$optional)
+if (can_build_trees) {
+  cat("✓ Phylogenetic tree construction is available\n")
+} else {
+  cat("✗ Phylogenetic tree construction is disabled (install phangorn and DECIPHER to enable)\n")
+}
 
 # Set up parallelization for faster processing
 # Automatically detect optimal number of workers based on system
@@ -2749,6 +2823,268 @@ save_checkpoint("after_phyloseq",
 cat("Checkpoint saved after phyloseq creation step\n")
 ```
 
+# Create Phyloseq Object
+
+```{r phyloseq}
+# Create a directory for results if it doesn't exist
+if(!dir.exists("results")) dir.create("results")
+
+# Create sample data frame
+# Try to extract metadata from file names
+cat("Extracting metadata from sample names...\n")
+
+# Extract sample group information (if follows naming pattern like Sample_GroupName_...)
+sample_metadata <- data.frame(
+  SampleID = sample.names,
+  Group = sample.names,  # Default to sample name if no pattern is found
+  row.names = sample.names
+)
+
+# Try to extract experimental groups from sample names using a common pattern
+# This is just a generic example - modify based on your actual naming convention
+group_pattern <- ".*?_(.*?)_.*|.*?-(.*?)-.*"
+group_matches <- regmatches(sample.names, 
+                          regexec(group_pattern, sample.names))
+
+# Extract group information if the pattern matched
+valid_matches <- sapply(group_matches, length) > 1
+if (any(valid_matches)) {
+  for (i in which(valid_matches)) {
+    match <- group_matches[[i]]
+    # Use the first capturing group that matched
+    for (j in 2:length(match)) {
+      if (!is.na(match[j]) && match[j] != "") {
+        sample_metadata$Group[i] <- match[j]
+        break
+      }
+    }
+  }
+}
+
+# Count the number of samples in each group
+group_counts <- table(sample_metadata$Group)
+cat("Detected sample groups:\n")
+print(group_counts)
+
+# First create basic phyloseq components
+otu <- otu_table(seqtab.nochim, taxa_are_rows = FALSE)
+tax <- tax_table(taxa)
+sam <- sample_data(sample_metadata)
+
+# Add ASV sequences as reference sequences
+dna <- Biostrings::DNAStringSet(colnames(seqtab.nochim))
+names(dna) <- colnames(seqtab.nochim)
+
+# Replace sequence names with ASV_1, ASV_2, etc. for easier reference
+asv_ids <- paste0("ASV_", seq(ncol(otu)))
+taxa_names(otu) <- asv_ids
+taxa_names(tax) <- asv_ids
+names(dna) <- asv_ids
+
+# Create phyloseq object (we'll add the tree later if available)
+ps <- phyloseq(otu, tax, sam, dna)
+
+# Inspect phyloseq object
+cat("Created phyloseq object with:\n")
+cat(" -", nsamples(ps), "samples\n")
+cat(" -", ntaxa(ps), "ASVs\n")
+cat(" -", sum(sample_sums(ps)), "total reads\n")
+cat(" - Mean", round(mean(sample_sums(ps))), "reads per sample\n")
+
+# Display sample read counts
+ps_counts <- tibble(
+  SampleID = sample_names(ps),
+  Group = sample_data(ps)$Group,
+  ReadCount = sample_sums(ps)
+) %>%
+  arrange(desc(ReadCount))
+
+kable(head(ps_counts, 10), caption = "Sample Read Counts (Top 10)")
+
+# Create checkpoint after phyloseq creation step
+save_checkpoint("after_phyloseq", 
+               c("seqtab.nochim", "taxa", "ps", "sample_metadata", "track_df"),
+               overwrite = TRUE)
+cat("Checkpoint saved after phyloseq creation step\n")
+```
+
+# Phylogenetic Tree Construction
+
+```{r build-phylogenetic-tree}
+# Function to build phylogenetic tree from ASV sequences
+build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores = NULL, 
+                                    progressbar = TRUE, verbose = TRUE) {
+  # Check if required packages are available
+  if (!requireNamespace("DECIPHER", quietly = TRUE) || !requireNamespace("phangorn", quietly = TRUE)) {
+    cat("ERROR: DECIPHER and phangorn packages are required for tree building.\n")
+    cat("Please install them with BiocManager::install(c('DECIPHER', 'phangorn'))\n")
+    return(NULL)
+  }
+  
+  # Set number of cores for parallel processing
+  if (is.null(cores)) {
+    cores <- min(parallel::detectCores() - 1, 8)
+  }
+  
+  # Convert sequences to DNAStringSet if they aren't already
+  if (!inherits(seqs, "DNAStringSet")) {
+    if (is.character(seqs)) {
+      # If this is a vector of sequences, convert to DNAStringSet
+      seqs <- Biostrings::DNAStringSet(seqs)
+    } else {
+      stop("Sequences must be DNAStringSet or character vector")
+    }
+  }
+  
+  if (verbose) cat("Starting phylogenetic tree construction with method:", method, "\n")
+  
+  # Phase 1: Multiple sequence alignment with DECIPHER
+  if (verbose) cat("Performing multiple sequence alignment...\n")
+  alignment <- DECIPHER::AlignSeqs(seqs, anchor = NA, processors = cores, 
+                                   verbose = progressbar)
+  
+  # Convert to phangorn format
+  if (verbose) cat("Converting alignment to phyDat format...\n")
+  phang.align <- phangorn::phyDat(as(alignment, "matrix"), type = "DNA")
+  
+  # Phase 2: Calculate distance matrix
+  if (verbose) cat("Calculating distance matrix...\n")
+  dm <- phangorn::dist.ml(phang.align)
+  
+  # Phase 3: Build initial tree with Neighbor-Joining
+  if (verbose) cat("Building initial Neighbor-Joining tree...\n")
+  nj_tree <- phangorn::NJ(dm)
+  
+  # Check if we should return just the NJ tree
+  if (method == "NJ") {
+    if (verbose) cat("NJ tree construction complete.\n")
+    return(nj_tree)
+  } 
+  
+  # Phase 4: Maximum Likelihood optimization
+  if (verbose) cat("Optimizing tree with Maximum Likelihood method...\n")
+  
+  # Initial fit
+  if (verbose) cat("  Initial tree fitting...\n")
+  fit <- phangorn::pml(nj_tree, data = phang.align)
+  
+  # Model selection
+  if (verbose) cat("  Optimizing with GTR+G+I model...\n")
+  fit_gtr <- phangorn::optim.pml(fit, model = "GTR+G+I", 
+                               rearrangement = "stochastic",
+                               control = phangorn::pml.control(trace = progressbar))
+  
+  # Phase 5: Bootstrap support (if requested)
+  if (bootstrap > 0) {
+    if (verbose) cat("Calculating bootstrap support with", bootstrap, "replicates...\n")
+    bs <- phangorn::bootstrap.pml(fit_gtr, bs = bootstrap, 
+                                multicore = TRUE, 
+                                mc.cores = cores)
+    tree <- phangorn::plotBS(fit_gtr$tree, bs, type = "phylogram")
+    if (verbose) cat("Bootstrap analysis complete.\n")
+  } else {
+    tree <- fit_gtr$tree
+  }
+  
+  if (verbose) cat("Phylogenetic tree construction complete.\n")
+  return(tree)
+}
+
+# Check if we can build trees
+if (can_build_trees) {
+  cat("Building phylogenetic tree from ASV sequences...\n")
+  
+  # Get ASV sequences
+  asv_sequences <- colnames(seqtab.nochim)
+  
+  # Convert to DNAStringSet
+  dna <- Biostrings::DNAStringSet(asv_sequences)
+  names(dna) <- paste0("ASV_", seq_along(asv_sequences))
+  
+  # Check if this is a reasonably sized dataset for tree building
+  if (length(dna) > 5000) {
+    cat("Large number of ASVs detected (", length(dna), "). ",
+        "Tree building may take a very long time.\n", sep = "")
+    cat("Consider reducing the dataset before building a tree.\n")
+    cat("Proceeding with NJ method only (faster)...\n")
+    tree_method <- "NJ"
+    bootstrap_reps <- 0
+  } else if (length(dna) > 1000) {
+    cat("Moderately large number of ASVs (", length(dna), "). ",
+        "Using NJ method with limited bootstrap...\n", sep = "")
+    tree_method <- "NJ"
+    bootstrap_reps <- 100
+  } else {
+    cat("ASV count suitable for ML tree building (", length(dna), ").\n", sep = "")
+    tree_method <- "ML"
+    bootstrap_reps <- 100
+  }
+  
+  # Time the tree construction
+  start_time <- Sys.time()
+  
+  # Build the tree
+  asv_tree <- build_phylogenetic_tree(
+    dna, 
+    method = tree_method,
+    bootstrap = bootstrap_reps,
+    verbose = TRUE
+  )
+  
+  # Report time taken
+  end_time <- Sys.time()
+  time_taken <- difftime(end_time, start_time, units = "mins")
+  cat("Tree construction completed in", round(time_taken, 2), "minutes\n")
+  
+  # Save tree to file
+  if (!dir.exists("results")) dir.create("results")
+  tree_file <- "results/asv_tree.rds"
+  saveRDS(asv_tree, tree_file)
+  cat("Phylogenetic tree saved to", tree_file, "\n")
+  
+  # Create checkpoint after tree building
+  save_checkpoint("after_tree_building", 
+                 c("asv_tree", "seqtab.nochim", "taxa"),
+                 overwrite = TRUE)
+  cat("Checkpoint saved after tree building step\n")
+  
+  # Update phyloseq object with the tree if available
+  if (!is.null(asv_tree)) {
+    cat("Updating phyloseq object with phylogenetic tree...\n")
+    
+    # Make sure tree has the correct labels
+    asv_ids <- taxa_names(ps)
+    if (!identical(asv_ids, asv_tree$tip.label)) {
+      cat("Adjusting tree tip labels to match ASV IDs...\n")
+      # Map original sequence names to ASV IDs
+      seq_to_asv <- structure(asv_ids, names = colnames(seqtab.nochim))
+      asv_tree$tip.label <- seq_to_asv[match(asv_tree$tip.label, names(seq_to_asv))]
+      
+      # Check if any NAs in tree tips
+      if (any(is.na(asv_tree$tip.label))) {
+        warning("Some tree tips could not be mapped to ASV IDs")
+        # Fix NAs by assigning sequential numbers
+        na_tips <- which(is.na(asv_tree$tip.label))
+        asv_tree$tip.label[na_tips] <- paste0("ASV_unknown_", seq_along(na_tips))
+      }
+    }
+    
+    # Add tree to phyloseq object
+    phy_tree(ps) <- asv_tree
+    cat("Phylogenetic tree added to phyloseq object\n")
+    
+    # Resave phyloseq checkpoint with tree included
+    save_checkpoint("after_phyloseq_with_tree", 
+                   c("ps", "asv_tree", "seqtab.nochim", "taxa", "sample_metadata"),
+                   overwrite = TRUE)
+  }
+} else {
+  cat("Skipping phylogenetic tree construction due to missing dependencies.\n")
+  cat("Install DECIPHER and phangorn to enable this feature.\n")
+  asv_tree <- NULL
+}
+```
+
 # Save Results
 
 ```{r save-results}
@@ -2770,6 +3106,11 @@ cat("Saved taxonomy table to results/taxonomy.csv\n")
 # Save phyloseq object
 saveRDS(ps, "results/phyloseq_object.rds")
 cat("Saved phyloseq object to results/phyloseq_object.rds\n")
+
+# Check if the phyloseq object contains a tree and mention it in the message
+if (!is.null(phy_tree(ps, errorIfNULL = FALSE))) {
+  cat("Note: The saved phyloseq object includes a phylogenetic tree\n")
+}
 
 # Extract and save ASV sequences with IDs
 asv_seqs <- refseq(ps)
@@ -2821,9 +3162,11 @@ Key enhancements in this optimized workflow:
 2. **Adaptive quality filtering** with optimized truncation lengths and expected error thresholds
 3. **Primer detection** for expected amplicon size estimation
 4. **Read merging optimization** to ensure sufficient overlap
-5. **Extensive quality control** throughout the pipeline
-6. **Detailed visualization** of results at each step
-7. **Comprehensive results export** for downstream analysis
+5. **Phylogenetic tree construction** with multiple alignment and maximum likelihood optimization
+6. **Enhanced quality visualization** with percentile distributions and quality interpretation zones
+7. **Extensive quality control** throughout the pipeline
+8. **Detailed visualization** of results at each step
+9. **Comprehensive results export** for downstream analysis
 
 ## Checkpointing System
 
@@ -2850,6 +3193,7 @@ This optimized workflow creates checkpoints after each major processing step:
 - After chimera removal
 - After taxonomy assignment
 - After phyloseq object creation
+- After phylogenetic tree construction
 
 To visualize and explore your results interactively, you can use the companion dashboard:
 
