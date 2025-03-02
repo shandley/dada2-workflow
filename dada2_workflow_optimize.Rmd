@@ -24,6 +24,32 @@ params:
   big_data: FALSE
 ---
 
+# Introduction
+
+This document implements an optimized workflow for processing 16S rRNA gene amplicon data using DADA2. The workflow includes automatic parameter optimization, quality filtering, denoising, merging paired reads, chimera removal, and taxonomic assignment to generate a table of amplicon sequence variants (ASVs).
+
+Key features of this optimized workflow:
+
+- **Automatic detection of sequencing platform** (MiSeq, NovaSeq, etc.) - Identifies platform based on read length and quality patterns
+- **Optimization of quality filtering parameters** - Custom-tuned for your specific sequence data characteristics
+- **Adaptive truncation lengths** - Dynamically adjust to your read lengths and quality profiles for optimal results
+- **Expected error threshold optimization** - Balances quality control and read retention for maximum data utilization
+- **Primer detection** - Automatically identifies primer sequences to assist with amplicon size calculations
+- **Read merging optimization** - Ensures sufficient overlap for reliable ASV calling with minimal artifacts
+- **Memory-optimized processing** - Efficient batched operations for large datasets with automatic memory management
+- **Enhanced checkpointing system** - Robust recovery from interruptions with comprehensive progress tracking
+- **Parallelized execution** - Automatic multi-core utilization with adaptive worker allocation
+- **Reference-based taxonomy confidence scoring** - Bootstrap confidence values for all taxonomic assignments
+- **Multi-method taxonomy assignment** - Combines results from multiple classifiers for improved accuracy
+- **Phylogenetic tree construction** - Integrates phylogenetic information using optimized alignment methods
+- **Rarefaction analysis** - Depth optimization with saturation detection for proper diversity comparisons
+- **Detailed quality visualization** - Enhanced plots with quality interpretation zones and percentile distributions
+- **Comprehensive tracking** - Monitors reads and ASVs through each processing step with detailed reporting
+- **Batch effect detection** - For multi-run studies, identifies and quantifies potential batch effects
+- **Detailed results export** - Comprehensive data files for downstream analysis and sharing
+
+> **Note on amplicon size and sequencing cycles:** While Illumina sequencers run a fixed number of cycles (e.g., 2x250 for MiSeq, 2x150 for NovaSeq), the expected amplicon size is still crucial for parameter optimization. For example, the V4 region using 515F-806R primers produces a ~253 bp amplicon. For a MiSeq 2x250 run, this means the forward read covers positions 1-250 and the reverse read covers positions 253-4 (reading backward), creating substantial overlap (~247 bp). The algorithm needs this information to properly balance quality trimming while maintaining sufficient overlap for read merging. Even if individual reads are limited by cycle count, knowing the true amplicon size helps optimize trimming parameters and validates that merged sequences represent genuine amplicons rather than artifacts.
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
@@ -382,32 +408,6 @@ list_checkpoints <- function() {
   })
 }
 ```
-
-# Introduction
-
-This document implements an optimized workflow for processing 16S rRNA gene amplicon data using DADA2. The workflow includes automatic parameter optimization, quality filtering, denoising, merging paired reads, chimera removal, and taxonomic assignment to generate a table of amplicon sequence variants (ASVs).
-
-Key features of this optimized workflow:
-
-- **Automatic detection of sequencing platform** (MiSeq, NovaSeq, etc.) - Identifies platform based on read length and quality patterns
-- **Optimization of quality filtering parameters** - Custom-tuned for your specific sequence data characteristics
-- **Adaptive truncation lengths** - Dynamically adjust to your read lengths and quality profiles for optimal results
-- **Expected error threshold optimization** - Balances quality control and read retention for maximum data utilization
-- **Primer detection** - Automatically identifies primer sequences to assist with amplicon size calculations
-- **Read merging optimization** - Ensures sufficient overlap for reliable ASV calling with minimal artifacts
-- **Memory-optimized processing** - Efficient batched operations for large datasets with automatic memory management
-- **Enhanced checkpointing system** - Robust recovery from interruptions with comprehensive progress tracking
-- **Parallelized execution** - Automatic multi-core utilization with adaptive worker allocation
-- **Reference-based taxonomy confidence scoring** - Bootstrap confidence values for all taxonomic assignments
-- **Multi-method taxonomy assignment** - Combines results from multiple classifiers for improved accuracy
-- **Phylogenetic tree construction** - Integrates phylogenetic information using optimized alignment methods
-- **Rarefaction analysis** - Depth optimization with saturation detection for proper diversity comparisons
-- **Detailed quality visualization** - Enhanced plots with quality interpretation zones and percentile distributions
-- **Comprehensive tracking** - Monitors reads and ASVs through each processing step with detailed reporting
-- **Batch effect detection** - For multi-run studies, identifies and quantifies potential batch effects
-- **Detailed results export** - Comprehensive data files for downstream analysis and sharing
-
-> **Note on amplicon size and sequencing cycles:** While Illumina sequencers run a fixed number of cycles (e.g., 2x250 for MiSeq, 2x150 for NovaSeq), the expected amplicon size is still crucial for parameter optimization. For example, the V4 region using 515F-806R primers produces a ~253 bp amplicon. For a MiSeq 2x250 run, this means the forward read covers positions 1-250 and the reverse read covers positions 253-4 (reading backward), creating substantial overlap (~247 bp). The algorithm needs this information to properly balance quality trimming while maintaining sufficient overlap for read merging. Even if individual reads are limited by cycle count, knowing the true amplicon size helps optimize trimming parameters and validates that merged sequences represent genuine amplicons rather than artifacts.
 
 # Setup
 
