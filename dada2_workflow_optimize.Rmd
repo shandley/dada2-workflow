@@ -444,7 +444,7 @@ if (num_cores >= 16) {
 }
 
 # Configure memory usage for parallel operations
-options(future.globals.maxSize = 2 * 1024^3)  # 2GB limit for globals
+options(future.globals.maxSize = 4 * 1024^3)  # 4GB limit for globals - increased for larger datasets
 
 # Set the random seed for reproducibility
 set.seed(100)
@@ -1245,13 +1245,19 @@ filter_summary$PercentRetained <- round(filter_summary$reads.out / filter_summar
 filter_summary <- filter_summary[, c("SampleName", "reads.in", "reads.out", "PercentRetained")]
 colnames(filter_summary) <- c("Sample", "Input Reads", "Filtered Reads", "% Retained")
 
-# Create checkpoint after filter and trim step
+# Create checkpoint after filter and trim step with additional tracking info
 save_checkpoint("after_filter_trim", 
                c("fnFs", "fnRs", "filtFs", "filtRs", "out", "sample.names", 
                  "truncLen_forward", "truncLen_reverse", "maxEE_forward", "maxEE_reverse",
-                 "truncation_lengths", "maxEE_params", "expected_amplicon_size"),
+                 "truncation_lengths", "maxEE_params", "expected_amplicon_size",
+                 "filter_summary", "is_multi_run"),
                overwrite = TRUE)
 cat("Checkpoint saved after filter and trim step\n")
+
+# Also save a separate checkpoint with just the filter summary for quick access
+if (!dir.exists("results")) dir.create("results")
+saveRDS(filter_summary, "results/filter_summary.rds")
+cat("Filter summary saved to results/filter_summary.rds\n")
 
 # View filtering statistics
 kable(filter_summary, caption = "Filtering Statistics", row.names = FALSE)
@@ -1537,12 +1543,27 @@ errR_plot <- plotErrors(errR, nominalQ = TRUE) +
 # Create a side-by-side plot
 grid.arrange(errF_plot, errR_plot, ncol = 2)
 
-# Create checkpoint after learning error rates
+# Create checkpoint after learning error rates with performance metrics
 save_checkpoint("after_error_learning", 
                c("filtFs", "filtRs", "errF", "errR", "sample.names",
-                 "truncLen_forward", "truncLen_reverse", "maxEE_forward", "maxEE_reverse"),
+                 "truncLen_forward", "truncLen_reverse", "maxEE_forward", "maxEE_reverse",
+                 "is_multi_run"),  # Added multi-run tracking
                overwrite = TRUE)
 cat("Checkpoint saved after error learning step\n")
+
+# Create a separate file with error model parameters for reproducibility
+if (!dir.exists("results")) dir.create("results")
+error_models <- list(
+  forward = errF,
+  reverse = errR,
+  timestamp = Sys.time(),
+  parameters = list(
+    truncation = c(forward = truncLen_forward, reverse = truncLen_reverse),
+    maxEE = c(forward = maxEE_forward, reverse = maxEE_reverse)
+  )
+)
+saveRDS(error_models, "results/error_models.rds")
+cat("Error models saved to results/error_models.rds\n")
 ```
 
 # Dereplication
@@ -1576,9 +1597,16 @@ cat("Average compression ratio:", round(avg_compression, 1),
     
 # Create checkpoint after dereplication step
 save_checkpoint("after_dereplication", 
-               c("filtFs", "filtRs", "errF", "errR", "derepFs", "derepRs", "sample.names"),
+               c("filtFs", "filtRs", "errF", "errR", "derepFs", "derepRs", "sample.names", 
+                 "derep_summary", "avg_compression"),
                overwrite = TRUE)
 cat("Checkpoint saved after dereplication step\n")
+
+# Save dereplication summary for easier access
+if (!dir.exists("results")) dir.create("results")
+saveRDS(derep_summary, "results/derep_summary.rds")
+write.csv(derep_summary, "results/derep_summary.csv", row.names = FALSE)
+cat("Dereplication summary saved to results/derep_summary.csv\n")
 ```
 
 # Sample Inference
@@ -1604,6 +1632,23 @@ if(is_multi_run && exists("file_to_run")) {
 if (length(derepFs) > 20 || is_multi_run) {
   # Process in batches for better memory management
   batch_size <- min(10, ceiling(length(derepFs)/4))
+  
+  # Calculate optimal batch size based on available memory
+  mem_info <- tryCatch({
+    if (.Platform$OS.type == "unix") {
+      mem <- system("vmstat -s | grep 'free memory'", intern = TRUE)
+      free_mem_kb <- as.numeric(gsub("\\D", "", mem))
+      free_mem_gb <- free_mem_kb / 1024^2
+      # Adjust batch size based on available memory (rough heuristic)
+      mem_based_batch <- max(1, floor(free_mem_gb / 0.5)) # Assume ~0.5GB per 10 samples
+      batch_size <- min(batch_size, mem_based_batch)
+      cat(sprintf("Detected %.1fGB free memory, adjusted batch size to %d\n", free_mem_gb, batch_size))
+    }
+  }, error = function(e) {
+    # If memory detection fails, use conservative default
+    cat("Memory detection failed, using default batch size\n")
+  })
+  
   cat(sprintf("Processing forward reads in batches of %d samples...\n", batch_size))
   
   if(is_multi_run && exists("file_to_run")) {
@@ -1757,12 +1802,28 @@ total_asvs_forward <- sum(sapply(dadaFs, function(x) length(x$denoised)))
 cat("Average percentage of reads retained after denoising:", round(avg_denoised_pct, 1), "%\n")
 cat("Total ASVs identified in forward reads:", total_asvs_forward, "\n")
 
-# Create checkpoint after sample inference step
+# Create checkpoint after sample inference step with better tracking
 save_checkpoint("after_sample_inference", 
                c("derepFs", "derepRs", "errF", "errR", "dadaFs", "dadaRs", "sample.names",
-                 "is_multi_run", "file_to_run"),
+                 "is_multi_run", "file_to_run", "denoise_summary", "pooling_option"),
                overwrite = TRUE)
 cat("Checkpoint saved after sample inference step\n")
+
+# Save denoising summary for easier access and dashboard visualization
+if (!dir.exists("results")) dir.create("results")
+saveRDS(denoise_summary, "results/denoise_summary.rds")
+write.csv(denoise_summary, "results/denoise_summary.csv", row.names = FALSE)
+cat("Denoising summary saved to results/denoise_summary.csv\n")
+
+# Record the pooling strategy used
+pooling_info <- list(
+  strategy = pooling_option,
+  multi_run = is_multi_run,
+  timestamp = Sys.time(),
+  forward_asvs = total_asvs_forward
+)
+saveRDS(pooling_info, "results/pooling_strategy.rds")
+cat("Pooling strategy information saved to results/pooling_strategy.rds\n")
 ```
 
 # Merge Paired Reads
@@ -1848,12 +1909,25 @@ if (nrow(low_merge_samples) > 0) {
   print(low_merge_samples)
 }
 
-# Create checkpoint after merging reads step
+# Create checkpoint after merging reads step with more tracking
 save_checkpoint("after_merge_reads", 
                c("derepFs", "derepRs", "dadaFs", "dadaRs", "mergers", "sample.names",
-                 "truncation_lengths"),
+                 "truncation_lengths", "merge_summary", "avg_merged_pct", "low_merge_samples"),
                overwrite = TRUE)
 cat("Checkpoint saved after merging paired reads step\n")
+
+# Save merging summary for dashboard visualization
+if (!dir.exists("results")) dir.create("results")
+saveRDS(merge_summary, "results/merge_summary.rds")
+write.csv(merge_summary, "results/merge_summary.csv", row.names = FALSE)
+cat("Merging summary saved to results/merge_summary.csv\n")
+
+# Save problematic samples information if any exist
+if (nrow(low_merge_samples) > 0) {
+  saveRDS(low_merge_samples, "results/low_merge_samples.rds")
+  write.csv(low_merge_samples, "results/low_merge_samples.csv", row.names = FALSE)
+  cat("List of problematic samples with low merging rates saved to results/low_merge_samples.csv\n")
+}
 ```
 
 # Construct ASV Table
@@ -1973,12 +2047,31 @@ if (is_multi_run && exists("file_to_run") && exists("run_seqtabs")) {
   cat("After merging:", ncol(seqtab), "ASVs in the combined dataset\n")
 }
 
-# Create checkpoint after ASV table construction step
+# Create checkpoint after ASV table construction step with more tracking
 save_checkpoint("after_asv_table", 
                c("mergers", "seqtab", "sample.names", "seqtab_filtered", "expected_amplicon_size",
-                 "is_multi_run", "file_to_run", "run_seqtabs"),
+                 "is_multi_run", "file_to_run", "run_seqtabs", 
+                 "asv_lengths", "modal_length", "min_allowed_len", "max_allowed_len"),
                overwrite = TRUE)
 cat("Checkpoint saved after ASV table construction step\n")
+
+# Save ASV length distribution and filtering thresholds for documentation
+asv_lengths_info <- list(
+  distribution = asv_lengths_df,
+  modal_length = modal_length,
+  expected_amplicon_size = expected_amplicon_size,
+  filtering_thresholds = c(min = min_allowed_len, max = max_allowed_len),
+  original_counts = c(asvs = ncol(seqtab), reads = sum(seqtab)),
+  filtered_counts = c(asvs = ncol(seqtab_filtered), reads = sum(seqtab_filtered))
+)
+if (!dir.exists("results")) dir.create("results")
+saveRDS(asv_lengths_info, "results/asv_lengths_info.rds")
+cat("ASV length distribution and filtering thresholds saved to results/asv_lengths_info.rds\n")
+
+# Create a separate file with just the filtered sequences for easier downstream use
+if (!dir.exists("results")) dir.create("results")
+saveRDS(colnames(seqtab_filtered), "results/filtered_asv_sequences.rds")
+cat("Filtered ASV sequences saved to results/filtered_asv_sequences.rds\n")
 ```
 
 # Remove Chimeras
@@ -2058,13 +2151,42 @@ if (chimera_pct < 50) {
   cat("WARNING: Less than 50% of sequences remain after chimera removal.\n")
   cat("This could indicate poor read merging or excessive chimera removal.\n")
   cat("Consider revisiting the truncation lengths and quality filtering parameters.\n")
+  
+  # Log problematic samples with high chimera rates
+  sample_chimera_rates <- data.frame(
+    Sample = rownames(seqtab),
+    PreChimera = rowSums(seqtab),
+    PostChimera = rowSums(seqtab.nochim),
+    ChimeraPercent = round((1 - rowSums(seqtab.nochim)/rowSums(seqtab)) * 100, 1)
+  )
+  
+  # Sort by chimera percentage (highest first)
+  sample_chimera_rates <- sample_chimera_rates[order(sample_chimera_rates$ChimeraPercent, decreasing = TRUE),]
+  
+  # Display top 10 most problematic samples
+  cat("\nSamples with highest chimera rates:\n")
+  print(head(sample_chimera_rates, 10))
 }
 
-# Create checkpoint after chimera removal step
+# Create checkpoint after chimera removal step with additional tracking
 save_checkpoint("after_chimera_removal", 
-               c("seqtab", "seqtab.nochim", "sample.names", "chimera_pct"),
+               c("seqtab", "seqtab.nochim", "sample.names", "chimera_pct",
+                 "chimera_summary", "sample_chimera_rates"),
                overwrite = TRUE)
 cat("Checkpoint saved after chimera removal step\n")
+
+# Save chimera removal information for dashboard visualization
+if (!dir.exists("results")) dir.create("results")
+saveRDS(chimera_summary, "results/chimera_summary.rds")
+write.csv(chimera_summary, "results/chimera_summary.csv", row.names = FALSE)
+cat("Chimera removal summary saved to results/chimera_summary.csv\n")
+
+# Save per-sample chimera rates if available
+if (exists("sample_chimera_rates")) {
+  saveRDS(sample_chimera_rates, "results/sample_chimera_rates.rds")
+  write.csv(sample_chimera_rates, "results/sample_chimera_rates.csv", row.names = FALSE)
+  cat("Sample-specific chimera rates saved to results/sample_chimera_rates.csv\n")
+}
 ```
 
 # Track Reads Through the Pipeline
@@ -2320,19 +2442,32 @@ if (nrow(track_df) > 0) {
 }
 
 # Save the tracking data for dashboard visualization if we have results directory and data
-if (dir.exists("results") && nrow(track_df) > 0) {
+if (nrow(track_df) > 0) {
+  if (!dir.exists("results")) dir.create("results")
+  
   tryCatch({
+    # Save the basic tracking data frame
     saveRDS(track_df, "results/read_tracking.rds")
     cat("Saved read tracking data to results/read_tracking.rds\n")
+    
+    # Save a more detailed tracking data that includes percentages
+    tracking_detailed <- track_df
+    if (ncol(track_df) >= 7) {
+      write.csv(tracking_detailed, "results/read_tracking_detailed.csv")
+      cat("Saved detailed tracking data to results/read_tracking_detailed.csv\n")
+    }
+    
+    # Save pipeline summary info separately for easy access
+    if (exists("pipeline_summary")) {
+      saveRDS(pipeline_summary, "results/pipeline_summary.rds")
+      write.csv(pipeline_summary, "results/pipeline_summary.csv")
+      cat("Saved pipeline summary to results/pipeline_summary.csv\n")
+    }
   }, error = function(e) {
     cat("Error saving tracking data:", conditionMessage(e), "\n")
   })
 } else {
-  if (!dir.exists("results")) {
-    cat("Results directory doesn't exist. Create it with dir.create('results') to save tracking data.\n")
-  } else {
-    cat("No tracking data available to save.\n")
-  }
+  cat("No tracking data available to save.\n")
 }
 ```
 
@@ -3555,11 +3690,25 @@ if (can_build_trees) {
   saveRDS(asv_tree, tree_file)
   cat("Phylogenetic tree saved to", tree_file, "\n")
   
-  # Create checkpoint after tree building
+  # Create checkpoint after tree building with metadata about the tree
+  # Create a summary of the tree's properties
+  tree_metadata <- list(
+    method = tree_method,
+    bootstrap = bootstrap_reps,
+    n_tips = length(asv_tree$tip.label),
+    build_time = as.numeric(time_taken, units = "mins"),
+    timestamp = Sys.time()
+  )
+  
   save_checkpoint("after_tree_building", 
-                 c("asv_tree", "seqtab.nochim", "taxa"),
+                 c("asv_tree", "seqtab.nochim", "taxa", "tree_metadata"),
                  overwrite = TRUE)
   cat("Checkpoint saved after tree building step\n")
+  
+  # Save additional metadata about the tree for dashboard and documentation
+  if (!dir.exists("results")) dir.create("results")
+  saveRDS(tree_metadata, "results/tree_metadata.rds")
+  cat("Tree metadata saved to results/tree_metadata.rds\n")
   
   # Update phyloseq object with the tree if available
   if (!is.null(asv_tree)) {
@@ -4085,11 +4234,35 @@ if (can_do_rarefaction) {
     saveRDS(saturation_results, saturation_path)
     cat("Saved rarefaction saturation analysis to", saturation_path, "\n")
     
-    # Create checkpoint after rarefaction analysis step
+    # Create checkpoint after rarefaction analysis step with additional metadata
+    rarefaction_metadata <- list(
+      timestamp = Sys.time(),
+      step_size = step_size,
+      sample_count = nsamples(ps),
+      suggested_depth = if(exists("suggested_depth")) suggested_depth else NULL,
+      min_depth = min_depth,
+      median_depth = median_depth,
+      mean_depth = mean_depth,
+      plateau_percentage = if(exists("plateau_count")) round(plateau_count/total_samples*100, 1) else NULL
+    )
+
     save_checkpoint("after_rarefaction", 
-                  c("ps", "ps_rarefied", "rarefaction_curves", "saturation_results"),
+                  c("ps", "ps_rarefied", "rarefaction_curves", "saturation_results", 
+                    "rarefaction_metadata", "alpha_div_combined"),
                   overwrite = TRUE)
     cat("Checkpoint saved after rarefaction analysis step\n")
+
+    # Save rarefaction metadata separately for dashboard access
+    if (!dir.exists("results")) dir.create("results")
+    saveRDS(rarefaction_metadata, "results/rarefaction_metadata.rds")
+    cat("Rarefaction metadata saved to results/rarefaction_metadata.rds\n")
+
+    # Save alpha diversity comparison data if available
+    if (exists("alpha_div_combined")) {
+      saveRDS(alpha_div_combined, "results/alpha_diversity_comparison.rds")
+      write.csv(alpha_div_combined, "results/alpha_diversity_comparison.csv", row.names = FALSE)
+      cat("Alpha diversity comparison data saved to results/alpha_diversity_comparison.csv\n")
+    }
   }
 } else {
   cat("Skipping rarefaction analysis due to missing dependencies.\n")
@@ -4150,18 +4323,44 @@ param_optimization <- list(
 saveRDS(param_optimization, "results/parameter_optimization.rds")
 cat("Saved parameter optimization results to results/parameter_optimization.rds\n")
 
-# Save workflow results summary
+# Save workflow results summary with enhanced metadata
 workflow_summary <- list(
   date = Sys.Date(),
+  timestamp = Sys.time(),
   num_samples = nsamples(ps),
   num_asvs = ntaxa(ps),
   total_reads = sum(sample_sums(ps)),
   mean_reads_per_sample = mean(sample_sums(ps)),
   read_tracking = track_df,
-  parameters = param_optimization
+  parameters = param_optimization,
+  run_info = list(
+    r_version = R.version.string,
+    run_time = format(Sys.time()),
+    is_multi_run = is_multi_run,
+    has_tree = !is.null(phy_tree(ps, errorIfNULL = FALSE))
+  ),
+  read_stats = list(
+    min_reads = min(sample_sums(ps)),
+    max_reads = max(sample_sums(ps)),
+    median_reads = median(sample_sums(ps)),
+    read_distribution = quantile(sample_sums(ps), probs = c(0, 0.25, 0.5, 0.75, 1))
+  ),
+  taxonomy_stats = list(
+    kingdom = sum(!is.na(tax_table(ps)[, "Kingdom"])),
+    phylum = sum(!is.na(tax_table(ps)[, "Phylum"])),
+    class = sum(!is.na(tax_table(ps)[, "Class"])),
+    order = sum(!is.na(tax_table(ps)[, "Order"])),
+    family = sum(!is.na(tax_table(ps)[, "Family"])),
+    genus = sum(!is.na(tax_table(ps)[, "Genus"])),
+    species = sum(!is.na(tax_table(ps)[, "Species"]))
+  )
 )
 saveRDS(workflow_summary, "results/workflow_summary.rds")
-cat("Saved workflow summary to results/workflow_summary.rds\n")
+write.csv(data.frame(
+  Metric = names(unlist(workflow_summary[c("num_samples", "num_asvs", "total_reads", "mean_reads_per_sample")])),
+  Value = unlist(workflow_summary[c("num_samples", "num_asvs", "total_reads", "mean_reads_per_sample")])
+), "results/workflow_summary_stats.csv", row.names = FALSE)
+cat("Saved enhanced workflow summary to results/workflow_summary.rds\n")
 ```
 
 # Generate Automated Report
