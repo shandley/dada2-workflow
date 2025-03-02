@@ -466,7 +466,10 @@ ui <- dashboardPage(
                                          selectInput("batchEffectMethod", "Analysis Method:", 
                                                     choices = c("Beta Dispersion" = "betadisper",
                                                                "PERMANOVA" = "adonis",
-                                                               "Run vs. Sample Type" = "interaction"),
+                                                               "Run vs. Sample Type" = "interaction",
+                                                               "RDA" = "rda",
+                                                               "Mantel Test" = "mantel",
+                                                               "ANOSIM" = "anosim"),
                                                     selected = "betadisper")
                                   ),
                                   column(3,
@@ -500,7 +503,10 @@ ui <- dashboardPage(
                                                                "Relative Abundance" = "relative",
                                                                "CSS (cumulative sum scaling)" = "css",
                                                                "RLE (DESeq2)" = "rle",
-                                                               "TMM (edgeR)" = "tmm"),
+                                                               "TMM (edgeR)" = "tmm",
+                                                               "CLR (centered log-ratio)" = "clr",
+                                                               "ALR (additive log-ratio)" = "alr",
+                                                               "VST (variance stabilizing)" = "vst"),
                                                     selected = "relative")
                                   ),
                                   column(4,
@@ -4386,6 +4392,96 @@ server <- function(input, output, session) {
             statistic = NA
           ))
         }
+      } else if (input$batchEffectMethod == "rda") {
+        # Redundancy Analysis (RDA)
+        # Check if vegan package is available
+        if (!requireNamespace("vegan", quietly = TRUE)) {
+          batch_effect_results(data.frame(
+            Test = "RDA",
+            Result = "Vegan package is required but not available",
+            p_value = NA,
+            statistic = NA
+          ))
+          return()
+        }
+        
+        # Convert distance matrix to an ordination object
+        # We'll need the OTU table for RDA
+        otu_table_matrix <- as.matrix(otu_table(ps_rel))
+        if (!taxa_are_rows(ps_rel)) {
+          otu_table_matrix <- t(otu_table_matrix)
+        }
+        
+        # Run RDA with Run as constraining variable
+        rda_result <- vegan::rda(otu_table_matrix ~ Run, data = sample_df)
+        
+        # Calculate significance with permutation test
+        rda_test <- vegan::anova.cca(rda_result, permutations = 999)
+        
+        # Extract proportion of variance explained by Run factor
+        variance_explained <- vegan::RsquareAdj(rda_result)$r.squared
+        
+        # Store results
+        batch_effect_results(data.frame(
+          Test = "RDA (Redundancy Analysis)",
+          Result = ifelse(rda_test$`Pr(>F)`[1] < 0.05, 
+                         paste0("Significant batch effect detected (p < 0.05)\n",
+                              "Run explains ", round(variance_explained * 100, 1), "% of community variation."), 
+                         paste0("No significant batch effect detected (p ≥ 0.05)\n",
+                              "Run explains only ", round(variance_explained * 100, 1), "% of community variation.")),
+          p_value = rda_test$`Pr(>F)`[1],
+          statistic = rda_test$F[1]
+        ))
+        
+      } else if (input$batchEffectMethod == "mantel") {
+        # Mantel test to compare run distance matrix with community distance
+        # Create a run distance matrix (0 for same run, 1 for different)
+        run_dist <- matrix(0, nrow = nrow(sample_df), ncol = nrow(sample_df))
+        rownames(run_dist) <- rownames(sample_df)
+        colnames(run_dist) <- rownames(sample_df)
+        
+        # Fill run distance matrix
+        for (i in 1:(nrow(sample_df)-1)) {
+          for (j in (i+1):nrow(sample_df)) {
+            if (sample_df$Run[i] != sample_df$Run[j]) {
+              run_dist[i, j] <- run_dist[j, i] <- 1
+            }
+          }
+        }
+        
+        # Convert to distance object
+        run_dist_obj <- as.dist(run_dist)
+        
+        # Run Mantel test
+        mantel_result <- vegan::mantel(dist_matrix, run_dist_obj, method = "spearman", permutations = 999)
+        
+        # Store results
+        batch_effect_results(data.frame(
+          Test = "Mantel Test",
+          Result = ifelse(mantel_result$signif < 0.05, 
+                         paste0("Significant correlation between run membership and community composition (p < 0.05)\n",
+                              "Mantel r = ", round(mantel_result$statistic, 3), " indicates batch effects are present."), 
+                         paste0("No significant correlation between run membership and community composition (p ≥ 0.05)\n",
+                              "Mantel r = ", round(mantel_result$statistic, 3), " suggests minimal batch effects.")),
+          p_value = mantel_result$signif,
+          statistic = mantel_result$statistic
+        ))
+        
+      } else if (input$batchEffectMethod == "anosim") {
+        # Analysis of Similarities (ANOSIM)
+        anosim_result <- vegan::anosim(dist_matrix, sample_df$Run, permutations = 999)
+        
+        # Store results
+        batch_effect_results(data.frame(
+          Test = "ANOSIM",
+          Result = ifelse(anosim_result$signif < 0.05, 
+                         paste0("Significant differences between runs (p < 0.05)\n",
+                              "ANOSIM R = ", round(anosim_result$statistic, 3), " indicates strong batch effects."), 
+                         paste0("No significant differences between runs (p ≥ 0.05)\n",
+                              "ANOSIM R = ", round(anosim_result$statistic, 3), " suggests minimal batch effects.")),
+          p_value = anosim_result$signif,
+          statistic = anosim_result$statistic
+        ))
       }
       
     }, error = function(e) {
@@ -4809,6 +4905,108 @@ server <- function(input, output, session) {
         } else {
           method_desc <- "TMM (failed - edgeR package not available)"
         }
+      } else if (input$runNormMethod == "clr") {
+        # CLR transformation (requires compositions package)
+        if (requireNamespace("compositions", quietly = TRUE)) {
+          # Get OTU table
+          otu_mat <- as.matrix(otu_table(ps))
+          if (!taxa_are_rows(otu_table(ps))) {
+            otu_mat <- t(otu_mat)
+          }
+          
+          # Add small pseudocount to handle zeros
+          otu_mat_pseudo <- otu_mat + 0.5
+          
+          # Apply CLR transformation
+          clr_counts <- t(compositions::clr(t(otu_mat_pseudo)))
+          
+          # Create new otu_table
+          otu_norm <- otu_table(clr_counts, taxa_are_rows = TRUE)
+          
+          # Replace the otu_table in the phyloseq object
+          ps_norm <- phyloseq(otu_norm, 
+                             tax_table(ps), 
+                             sample_data(ps), 
+                             phy_tree(ps))
+          
+          method_desc <- "CLR (Centered Log-Ratio Transformation)"
+        } else {
+          method_desc <- "CLR (failed - compositions package not available)"
+        }
+      } else if (input$runNormMethod == "vst") {
+        # Variance Stabilizing Transformation (requires DESeq2)
+        if (requireNamespace("DESeq2", quietly = TRUE)) {
+          # Get OTU table
+          otu_mat <- as.matrix(otu_table(ps))
+          if (!taxa_are_rows(otu_table(ps))) {
+            otu_mat <- t(otu_mat)
+          }
+          
+          # Round to integers (VST requires count data)
+          otu_mat <- round(otu_mat)
+          
+          # Create DESeq2 object
+          sample_df <- as.data.frame(sample_data(ps))
+          
+          # Need a design formula - use a column from sample data or create one
+          design_col <- "group"
+          if (!"group" %in% colnames(sample_df)) {
+            # Create a dummy grouping variable
+            sample_df$group <- factor(rep("A", nrow(sample_df)))
+          }
+          
+          # Create DESeq2 object
+          dds <- DESeq2::DESeqDataSetFromMatrix(
+            countData = otu_mat,
+            colData = sample_df,
+            design = as.formula(paste("~", design_col))
+          )
+          
+          # Apply variance stabilizing transformation
+          vst_data <- DESeq2::varianceStabilizingTransformation(dds, blind = TRUE, fitType = "local")
+          vst_counts <- DESeq2::assay(vst_data)
+          
+          # Create new otu_table
+          otu_norm <- otu_table(vst_counts, taxa_are_rows = TRUE)
+          
+          # Replace the otu_table in the phyloseq object
+          ps_norm <- phyloseq(otu_norm, 
+                             tax_table(ps), 
+                             sample_data(ps), 
+                             phy_tree(ps))
+          
+          method_desc <- "VST (Variance Stabilizing Transformation)"
+        } else {
+          method_desc <- "VST (failed - DESeq2 package not available)"
+        }
+      } else if (input$runNormMethod == "alr") {
+        # ALR transformation (requires compositions package)
+        if (requireNamespace("compositions", quietly = TRUE)) {
+          # Get OTU table
+          otu_mat <- as.matrix(otu_table(ps))
+          if (!taxa_are_rows(otu_table(ps))) {
+            otu_mat <- t(otu_mat)
+          }
+          
+          # Add pseudocount to handle zeros
+          otu_mat_pseudo <- otu_mat + 0.5
+          
+          # Apply ALR transformation - using the last taxon as denominator
+          alr_counts <- t(compositions::alr(t(otu_mat_pseudo)))
+          
+          # Create new otu_table
+          otu_norm <- otu_table(alr_counts, taxa_are_rows = TRUE)
+          
+          # Replace the otu_table in the phyloseq object
+          ps_norm <- phyloseq(otu_norm, 
+                             tax_table(ps), 
+                             sample_data(ps), 
+                             phy_tree(ps))
+          
+          method_desc <- "ALR (Additive Log-Ratio Transformation)"
+        } else {
+          method_desc <- "ALR (failed - compositions package not available)"
+        }
       }
       
       # Store the normalized phyloseq object
@@ -4847,6 +5045,28 @@ server <- function(input, output, session) {
         cat("Max:", format(max(otu_mat), digits = 4), "\n")
         cat("Mean:", format(mean(otu_mat), digits = 4), "\n")
         cat("Median:", format(median(otu_mat), digits = 4), "\n")
+        
+        # Calculate coefficient of variation for raw vs. normalized data
+        ps_orig <- filtered_ps_orig()
+        if (!is.null(ps_orig)) {
+          otu_raw <- as.matrix(otu_table(ps_orig))
+          # Only compare if matrices have same dimensions
+          if (dim(otu_raw)[1] == dim(otu_mat)[1] && dim(otu_raw)[2] == dim(otu_mat)[2]) {
+            # Calculate CV for each sample
+            sample_cv_raw <- apply(otu_raw, 2, function(x) sd(x) / mean(x) * 100)
+            sample_cv_norm <- apply(otu_mat, 2, function(x) sd(x) / mean(x) * 100)
+            
+            cat("\nCoefficient of variation (CV):\n")
+            cat("- Raw data mean CV: ", format(mean(sample_cv_raw, na.rm = TRUE), digits = 4), "%\n")
+            cat("- Normalized data mean CV: ", format(mean(sample_cv_norm, na.rm = TRUE), digits = 4), "%\n")
+            
+            if (mean(sample_cv_norm, na.rm = TRUE) < mean(sample_cv_raw, na.rm = TRUE)) {
+              cat("✓ Normalization reduced variability.\n")
+            } else {
+              cat("Note: This normalization method may not reduce variability for this dataset.\n")
+            }
+          }
+        }
         
         if (input$applyRunNormalization) {
           cat("\nThis normalization is now being applied to all analyses in the dashboard.\n")
@@ -4903,6 +5123,16 @@ server <- function(input, output, session) {
       if (!is.null(norm) && !is.null(norm$ps)) {
         # Get normalized counts and scale to same range
         norm_sums <- sample_sums(norm$ps)
+        
+        # Handle zero/negative values that might result from transformations like CLR
+        if (any(norm_sums <= 0)) {
+          # For transformations that can yield negative values (like CLR)
+          # We'll shift values to make them positive for visualization
+          if (min(norm_sums) <= 0) {
+            norm_sums <- norm_sums + abs(min(norm_sums)) + 1
+          }
+        }
+        
         scaling_factor <- mean(raw_sums) / mean(norm_sums)
         norm_sums_scaled <- norm_sums * scaling_factor
         
@@ -4915,6 +5145,13 @@ server <- function(input, output, session) {
         # Add to plot data
         plot_df <- rbind(plot_df, norm_df)
       }
+      
+      # Calculate coefficient of variation for each normalization method
+      # This shows how the methods affect the variability across samples
+      cv_data <- plot_df %>%
+        dplyr::group_by(Type) %>%
+        dplyr::summarize(CoeffVar = sd(Value) / mean(Value) * 100) %>%
+        dplyr::arrange(CoeffVar)
       
       # Add run information if available
       if (!is.null(assignments) && nrow(assignments) > 0) {
@@ -4932,7 +5169,9 @@ server <- function(input, output, session) {
           theme_minimal() +
           theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
           labs(x = "Run", y = "Scaled Read Count", fill = "Normalization",
-               title = "Comparison of Normalization Methods Across Runs") +
+               title = paste0("Comparison of Normalization Methods Across Runs\n",
+                             "Coefficient of Variation: ", 
+                             paste(cv_data$Type, sprintf("(%.1f%%)", cv_data$CoeffVar), collapse = ", "))) +
           scale_y_continuous(labels = scales::comma)
       } else {
         # Create simple boxplot comparison without runs
@@ -4941,7 +5180,9 @@ server <- function(input, output, session) {
           theme_minimal() +
           theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
           labs(x = "Normalization Method", y = "Scaled Read Count", fill = "Normalization",
-               title = "Comparison of Normalization Methods") +
+               title = paste0("Comparison of Normalization Methods\n",
+                             "Coefficient of Variation: ", 
+                             paste(cv_data$Type, sprintf("(%.1f%%)", cv_data$CoeffVar), collapse = ", "))) +
           scale_y_continuous(labels = scales::comma)
       }
       
