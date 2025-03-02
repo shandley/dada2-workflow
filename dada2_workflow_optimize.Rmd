@@ -2752,41 +2752,198 @@ cat("Checkpoint saved after taxonomy assignment step\n")
 if(!dir.exists("results")) dir.create("results")
 
 # Create sample data frame
-# Try to extract metadata from file names
-cat("Extracting metadata from sample names...\n")
+cat("Setting up metadata handling...\n")
 
-# Extract sample group information (if follows naming pattern like Sample_GroupName_...)
-sample_metadata <- data.frame(
-  SampleID = sample.names,
-  Group = sample.names,  # Default to sample name if no pattern is found
-  row.names = sample.names
-)
+# Function for standardizing sample names
+standardize_sample_names <- function(names, pattern = NULL) {
+  # Remove common file extensions and read indicators
+  clean_names <- gsub("_R[12].*|\\.fastq.*|\\.fq.*", "", names)
+  
+  # Apply custom regex if provided
+  if (!is.null(pattern)) {
+    clean_names <- gsub(pattern, "\\1", clean_names)
+  }
+  
+  return(clean_names)
+}
 
-# Try to extract experimental groups from sample names using a common pattern
-# This is just a generic example - modify based on your actual naming convention
-group_pattern <- ".*?_(.*?)_.*|.*?-(.*?)-.*"
-group_matches <- regmatches(sample.names, 
-                            regexec(group_pattern, sample.names))
+# Function to load and match metadata from external file
+load_and_match_metadata <- function(metadata_path, seqtab, 
+                                   sample_col = "SampleID",
+                                   fuzzy_match = FALSE) {
+  if (!file.exists(metadata_path)) {
+    cat("Metadata file not found at:", metadata_path, "\n")
+    cat("Falling back to sample name extraction\n")
+    return(NULL)
+  }
+  
+  cat("Loading metadata from:", metadata_path, "\n")
+  metadata <- tryCatch({
+    # Try to read CSV file
+    read.csv(metadata_path, stringsAsFactors = FALSE)
+  }, error = function(e) {
+    # Try to read tab-delimited file if CSV fails
+    tryCatch({
+      read.delim(metadata_path, stringsAsFactors = FALSE)
+    }, error = function(e2) {
+      cat("Error reading metadata file:", conditionMessage(e2), "\n")
+      return(NULL)
+    })
+  })
+  
+  # Check if metadata loaded successfully
+  if (is.null(metadata) || nrow(metadata) == 0) {
+    cat("Failed to load metadata or empty file\n")
+    return(NULL)
+  }
+  
+  # Check if sample_col exists in metadata
+  if (!sample_col %in% colnames(metadata)) {
+    cat("Sample column", sample_col, "not found in metadata\n")
+    cat("Available columns:", paste(colnames(metadata), collapse=", "), "\n")
+    return(NULL)
+  }
+  
+  # Get standardized names from both sources
+  seqtab_names <- standardize_sample_names(rownames(seqtab))
+  metadata_names <- standardize_sample_names(metadata[[sample_col]])
+  
+  # Create mapping table
+  name_map <- data.frame(
+    seqtab_name = rownames(seqtab),
+    seqtab_std = seqtab_names,
+    stringsAsFactors = FALSE
+  )
+  
+  # Add matched metadata names
+  if (fuzzy_match) {
+    # Check if stringdist package is available for fuzzy matching
+    if (!requireNamespace("stringdist", quietly = TRUE)) {
+      cat("stringdist package required for fuzzy matching. Installing...\n")
+      install.packages("stringdist")
+    }
+    
+    # Use string distance for fuzzy matching
+    matches <- sapply(seqtab_names, function(x) {
+      idx <- which.min(stringdist::stringdist(x, metadata_names))
+      return(metadata[[sample_col]][idx])
+    })
+    name_map$metadata_match <- matches
+    
+    cat("Used fuzzy matching algorithm to match sample names\n")
+  } else {
+    # Direct matching with warning for missing samples
+    matches <- match(seqtab_names, metadata_names)
+    name_map$metadata_match <- metadata[[sample_col]][matches]
+    if (any(is.na(matches))) {
+      cat("WARNING: Missing metadata for samples:", 
+          paste(seqtab_names[is.na(matches)], collapse=", "), "\n")
+    }
+  }
+  
+  # Return metadata in correct order with mapping table
+  metadata_ordered <- metadata[match(name_map$metadata_match, metadata[[sample_col]]),]
+  rownames(metadata_ordered) <- rownames(seqtab)
+  
+  # Print match summary
+  cat("Metadata matching summary:\n")
+  cat("- Total samples in sequence table:", nrow(seqtab), "\n")
+  cat("- Total samples in metadata:", nrow(metadata), "\n")
+  cat("- Successfully matched samples:", sum(!is.na(name_map$metadata_match)), "\n")
+  
+  return(list(metadata = metadata_ordered, mapping = name_map))
+}
 
-# Extract group information if the pattern matched
-valid_matches <- sapply(group_matches, length) > 1
-if (any(valid_matches)) {
-  for (i in which(valid_matches)) {
-    match <- group_matches[[i]]
-    # Use the first capturing group that matched
-    for (j in 2:length(match)) {
-      if (!is.na(match[j]) && match[j] != "") {
-        sample_metadata$Group[i] <- match[j]
-        break
+# First check if external metadata file exists
+metadata_file <- "metadata.csv"
+alt_metadata_files <- c("sample_metadata.csv", "mapping_file.csv", "mapping_file.txt", 
+                      "metadata.txt", "sample_data.csv")
+
+# Look for metadata file
+if (!file.exists(metadata_file)) {
+  for (alt_file in alt_metadata_files) {
+    if (file.exists(alt_file)) {
+      metadata_file <- alt_file
+      cat("Found metadata file:", metadata_file, "\n")
+      break
+    }
+  }
+}
+
+# Try to load and match external metadata
+if (file.exists(metadata_file)) {
+  metadata_result <- load_and_match_metadata(metadata_file, seqtab.nochim)
+  
+  if (!is.null(metadata_result)) {
+    sample_metadata <- metadata_result$metadata
+    cat("Successfully loaded external metadata\n")
+    
+    # Display metadata columns
+    cat("Metadata contains the following columns:\n")
+    print(colnames(sample_metadata))
+  } else {
+    # Fall back to extracting from filenames
+    cat("Falling back to metadata extraction from sample names\n")
+    sample_metadata <- data.frame(
+      SampleID = sample.names,
+      Group = sample.names,
+      row.names = sample.names
+    )
+    
+    # Try to extract groups from sample names
+    group_pattern <- ".*?_(.*?)_.*|.*?-(.*?)-.*"
+    group_matches <- regmatches(sample.names, regexec(group_pattern, sample.names))
+    
+    # Extract group information if the pattern matched
+    valid_matches <- sapply(group_matches, length) > 1
+    if (any(valid_matches)) {
+      for (i in which(valid_matches)) {
+        match <- group_matches[[i]]
+        # Use the first capturing group that matched
+        for (j in 2:length(match)) {
+          if (!is.na(match[j]) && match[j] != "") {
+            sample_metadata$Group[i] <- match[j]
+            break
+          }
+        }
+      }
+    }
+  }
+} else {
+  # No metadata file found, extract from sample names
+  cat("No metadata file found. Extracting metadata from sample names\n")
+  sample_metadata <- data.frame(
+    SampleID = sample.names,
+    Group = sample.names,
+    row.names = sample.names
+  )
+  
+  # Try to extract groups from sample names
+  group_pattern <- ".*?_(.*?)_.*|.*?-(.*?)-.*"
+  group_matches <- regmatches(sample.names, regexec(group_pattern, sample.names))
+  
+  # Extract group information if the pattern matched
+  valid_matches <- sapply(group_matches, length) > 1
+  if (any(valid_matches)) {
+    for (i in which(valid_matches)) {
+      match <- group_matches[[i]]
+      # Use the first capturing group that matched
+      for (j in 2:length(match)) {
+        if (!is.na(match[j]) && match[j] != "") {
+          sample_metadata$Group[i] <- match[j]
+          break
+        }
       }
     }
   }
 }
 
 # Count the number of samples in each group
-group_counts <- table(sample_metadata$Group)
-cat("Detected sample groups:\n")
-print(group_counts)
+if ("Group" %in% colnames(sample_metadata)) {
+  group_counts <- table(sample_metadata$Group)
+  cat("Detected sample groups:\n")
+  print(group_counts)
+}
 
 # Create phyloseq object
 ps <- phyloseq(
