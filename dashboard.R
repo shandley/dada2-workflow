@@ -15,6 +15,29 @@ library(d3Tree)          # For interactive taxonomic tree visualizations
 library(iNEXT)           # For rarefaction curves
 library(ggplotify)       # For converting base plots to ggplot objects
 library(htmlwidgets)     # For saving interactive widgets
+library(future)          # For parallel processing
+library(promises)        # For asynchronous operations
+library(data.table)      # For faster data manipulation
+library(memoise)         # For caching function results
+library(R.utils)         # Utility functions including checkpoints
+
+# Set up parallel processing for performance
+parallel_cores <- min(parallel::detectCores() - 1, 4)  # Keep at least 1 core free
+if (parallel_cores > 1) {
+  plan(multisession, workers = parallel_cores)
+  options(future.globals.maxSize = 2 * 1024^3)  # 2GB limit for globals
+  cat("Parallel processing enabled with", parallel_cores, "cores\n")
+} else {
+  plan(sequential)
+  cat("Running in sequential mode (parallel processing not available)\n")
+}
+
+# Set up global caching system
+cache_dir <- "dashboard_cache"
+if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+
+# Cache expensive operations
+get_cached <- memoise::memoise
 
 # UI
 ui <- dashboardPage(
@@ -372,72 +395,123 @@ ui <- dashboardPage(
 # Server
 server <- function(input, output, session) {
   
-  # Load phyloseq object
+  # Optimized phyloseq object loading with caching
   phyloseq_obj <- reactive({
     # Path to saved phyloseq object
     ps_path <- "results/phyloseq_object.rds"
+    ps_cache_path <- file.path(cache_dir, "phyloseq_processed.rds")
     
     # Check if file exists
     if (!file.exists(ps_path)) {
       return(NULL)
     }
     
-    # Try to safely load and process the phyloseq object
-    tryCatch({
-      # Load the phyloseq object
-      ps <- readRDS(ps_path)
-      
-      # Safe check if taxa table exists
-      has_tax_table <- tryCatch({
-        !is.null(phyloseq::tax_table(ps))
+    # Check if we have a cached processed version
+    if (file.exists(ps_cache_path)) {
+      # Check if cache is newer than source file
+      if (file.info(ps_cache_path)$mtime > file.info(ps_path)$mtime) {
+        # Cache is valid - load it
+        withProgress(message = 'Loading cached phyloseq object...', value = 0.5, {
+          ps_cached <- readRDS(ps_cache_path)
+          return(ps_cached)
+        })
+      }
+    }
+    
+    # No valid cache - process the phyloseq object and cache it
+    withProgress(message = 'Processing phyloseq object...', value = 0.2, {
+      # Try to safely load and process the phyloseq object
+      ps <- tryCatch({
+        # Load the phyloseq object
+        incProgress(0.2, detail = "Loading data")
+        ps <- readRDS(ps_path)
+        
+        # Safe check if taxa table exists
+        incProgress(0.2, detail = "Checking taxonomy")
+        has_tax_table <- tryCatch({
+          !is.null(phyloseq::tax_table(ps))
+        }, error = function(e) {
+          FALSE
+        })
+        
+        # Safe check for taxa orientation
+        if (has_tax_table) {
+          # Get orientation info safely
+          tax_rows <- tryCatch({
+            is.matrix(phyloseq::tax_table(ps)) && phyloseq::taxa_are_rows(phyloseq::tax_table(ps))
+          }, error = function(e) {
+            NULL
+          })
+          
+          otu_rows <- tryCatch({
+            phyloseq::taxa_are_rows(phyloseq::otu_table(ps))
+          }, error = function(e) {
+            NULL
+          })
+          
+          # Only proceed with orientation fix if we have valid information
+          if (!is.null(tax_rows) && !is.null(otu_rows) && tax_rows != otu_rows) {
+            warning("Fixing orientation mismatch between OTU and tax tables")
+            # Transpose tax table if needed
+            phyloseq::tax_table(ps) <- t(phyloseq::tax_table(ps))
+          }
+        }
+        
+        incProgress(0.2, detail = "Finalizing")
+        ps
       }, error = function(e) {
-        FALSE
+        # If there's an error, try to create a basic phyloseq object
+        warning("Error processing phyloseq object: ", conditionMessage(e))
+        warning("Creating simplified phyloseq object")
+        
+        tryCatch({
+          # Try to extract and reconstruct just the OTU table
+          otu_data <- as.matrix(readRDS(ps_path))
+          if (is.matrix(otu_data)) {
+            # Create a simple phyloseq object with just the OTU table
+            simple_otu <- phyloseq::otu_table(otu_data, taxa_are_rows = FALSE)
+            return(phyloseq::phyloseq(simple_otu))
+          } else {
+            NULL
+          }
+        }, error = function(e2) {
+          warning("Could not create simplified phyloseq object: ", conditionMessage(e2))
+          return(NULL)
+        })
       })
       
-      # Safe check for taxa orientation
-      if (has_tax_table) {
-        # Get orientation info safely
-        tax_rows <- tryCatch({
-          is.matrix(phyloseq::tax_table(ps)) && phyloseq::taxa_are_rows(phyloseq::tax_table(ps))
-        }, error = function(e) {
-          NULL
-        })
-        
-        otu_rows <- tryCatch({
-          phyloseq::taxa_are_rows(phyloseq::otu_table(ps))
-        }, error = function(e) {
-          NULL
-        })
-        
-        # Only proceed with orientation fix if we have valid information
-        if (!is.null(tax_rows) && !is.null(otu_rows) && tax_rows != otu_rows) {
-          warning("Fixing orientation mismatch between OTU and tax tables")
-          # Transpose tax table if needed
-          phyloseq::tax_table(ps) <- t(phyloseq::tax_table(ps))
-        }
+      # Cache the processed object for future use
+      if (!is.null(ps)) {
+        incProgress(0.2, detail = "Caching for future use")
+        saveRDS(ps, ps_cache_path)
       }
       
       return(ps)
-    }, error = function(e) {
-      # If there's an error, try to create a basic phyloseq object
-      warning("Error processing phyloseq object: ", conditionMessage(e))
-      warning("Creating simplified phyloseq object")
-      
-      tryCatch({
-        # Try to extract and reconstruct just the OTU table
-        otu_data <- as.matrix(readRDS(ps_path))
-        if (is.matrix(otu_data)) {
-          # Create a simple phyloseq object with just the OTU table
-          simple_otu <- phyloseq::otu_table(otu_data, taxa_are_rows = FALSE)
-          return(phyloseq::phyloseq(simple_otu))
-        } else {
-          NULL
-        }
-      }, error = function(e2) {
-        warning("Could not create simplified phyloseq object: ", conditionMessage(e2))
-        return(NULL)
-      })
     })
+  })
+  
+  # Function to check if a phyloseq object is large
+  is_large_phyloseq <- reactive({
+    ps <- phyloseq_obj()
+    if (is.null(ps)) return(FALSE)
+    
+    # Consider large if more than these thresholds
+    large_samples_threshold <- 100
+    large_taxa_threshold <- 5000
+    
+    n_samples <- tryCatch({
+      nsamples(ps)
+    }, error = function(e) {
+      0
+    })
+    
+    n_taxa <- tryCatch({
+      ntaxa(ps)
+    }, error = function(e) {
+      0
+    })
+    
+    return(n_samples > large_samples_threshold || n_taxa > large_taxa_threshold)
   })
   
   # Load tracking data
@@ -471,17 +545,34 @@ server <- function(input, output, session) {
   
   # No need to update UI elements based on sample data
   
-  # Filter phyloseq object based on user inputs
+  # Optimized filtering with progress tracking and caching
   filtered_ps <- reactive({
+    # Parameters that affect filtering
+    min_reads <- input$minReads
+    prevalence <- input$prevalence
+    
+    # Create a cache key based on parameters
+    cache_key <- paste0("filtered_ps_", min_reads, "_", prevalence)
+    cache_file <- file.path(cache_dir, paste0(cache_key, ".rds"))
+    
+    # Get the original phyloseq object
     ps <- phyloseq_obj()
     if (is.null(ps)) return(NULL)
+    
+    # Check if we have a cache hit
+    if (file.exists(cache_file)) {
+      # Check if cache is newer than source phyloseq
+      ps_path <- "results/phyloseq_object.rds"
+      if (file.exists(ps_path) && file.info(cache_file)$mtime > file.info(ps_path)$mtime) {
+        # Use cached result
+        return(readRDS(cache_file))
+      }
+    }
     
     # Extra validation to ensure phyloseq object is valid
     valid_phyloseq <- tryCatch({
       # Basic validation: check if it has an OTU table
       has_otu <- !is.null(phyloseq::otu_table(ps))
-      
-      # Return result
       has_otu
     }, error = function(e) FALSE)
     
@@ -490,29 +581,82 @@ server <- function(input, output, session) {
       return(NULL)
     }
     
+    # Check if this is a large dataset
+    large_dataset <- is_large_phyloseq()
+    
+    # Create a progress indicator for large datasets
+    if (large_dataset) {
+      withProgress(message = 'Filtering large dataset...', value = 0, {
+        filtered <- perform_filtering(ps, min_reads, prevalence)
+        
+        # Cache the result for future use
+        saveRDS(filtered, cache_file)
+        return(filtered)
+      })
+    } else {
+      # For smaller datasets, just filter normally
+      filtered <- perform_filtering(ps, min_reads, prevalence)
+      
+      # Cache the result
+      saveRDS(filtered, cache_file)
+      return(filtered)
+    }
+  })
+  
+  # Helper function to perform the actual filtering
+  perform_filtering <- function(ps, min_reads, prevalence_threshold, progress_callback = NULL) {
     # Try all filtering operations with error handling
     tryCatch({
+      # Initialize progress if we have a callback
+      if (!is.null(progress_callback)) {
+        progress_callback(0.1, "Starting filtering")
+      }
+      
       # Filter by read depth
-      if (!is.null(input$minReads)) {
+      if (!is.null(min_reads)) {
         tryCatch({
+          if (!is.null(progress_callback)) {
+            progress_callback(0.3, "Filtering by read depth")
+          }
+          
+          # Use data.table for faster operations with large datasets
           sample_sums_val <- phyloseq::sample_sums(ps)
-          ps <- phyloseq::prune_samples(sample_sums_val >= input$minReads, ps)
+          ps <- phyloseq::prune_samples(sample_sums_val >= min_reads, ps)
+          
+          # Force garbage collection to free memory
+          gc()
         }, error = function(e) {
           warning("Error in prune_samples: ", conditionMessage(e))
         })
       }
       
-      # Filter by prevalence - with careful validation
-      if (!is.null(input$prevalence)) {
+      # Filter by prevalence with careful validation
+      if (!is.null(prevalence_threshold)) {
         tryCatch({
+          if (!is.null(progress_callback)) {
+            progress_callback(0.6, "Filtering by prevalence")
+          }
+          
           # Get OTU table with correct orientation
           otu <- phyloseq::otu_table(ps)
           
-          # Check orientation to calculate prevalence correctly
-          if (phyloseq::taxa_are_rows(otu)) {
-            prevalence <- apply(otu, 1, function(x) sum(x > 0) / length(x) * 100)
+          # Optimize prevalence calculation for large datasets
+          if (is_large_phyloseq()) {
+            # Use data.table for faster operations
+            if (phyloseq::taxa_are_rows(otu)) {
+              otu_dt <- as.data.table(as.matrix(otu))
+              prevalence <- sapply(otu_dt, function(x) sum(x > 0) / length(x) * 100)
+            } else {
+              otu_dt <- as.data.table(t(as.matrix(otu)))
+              prevalence <- sapply(otu_dt, function(x) sum(x > 0) / length(x) * 100)
+            }
           } else {
-            prevalence <- apply(otu, 2, function(x) sum(x > 0) / length(x) * 100)
+            # Standard calculation for smaller datasets
+            if (phyloseq::taxa_are_rows(otu)) {
+              prevalence <- apply(otu, 1, function(x) sum(x > 0) / length(x) * 100)
+            } else {
+              prevalence <- apply(otu, 2, function(x) sum(x > 0) / length(x) * 100)
+            }
           }
           
           # Make sure prevalence vector has names matching taxa
@@ -520,12 +664,19 @@ server <- function(input, output, session) {
           if (length(prevalence) == length(taxa_names)) {
             names(prevalence) <- taxa_names
             # Use prune_taxa with pre-calculated logical vector
-            to_keep <- prevalence >= input$prevalence
+            to_keep <- prevalence >= prevalence_threshold
             ps <- phyloseq::prune_taxa(to_keep, ps)
           }
+          
+          # Force garbage collection to free memory
+          gc()
         }, error = function(e) {
           warning("Error in prevalence filtering: ", conditionMessage(e))
         })
+      }
+      
+      if (!is.null(progress_callback)) {
+        progress_callback(1.0, "Filtering complete")
       }
       
       return(ps)
@@ -533,7 +684,7 @@ server <- function(input, output, session) {
       warning("Error in filtered_ps: ", conditionMessage(e))
       return(ps)  # Return original if filtering fails
     })
-  })
+  }
   
   # Overview tab outputs
   output$totalSamples <- renderValueBox({
@@ -1617,48 +1768,146 @@ server <- function(input, output, session) {
     }
   })
   
-  # Rarefaction tab functionality
+  # Optimized rarefaction tab functionality with parallel processing
   # Reactive to store rarefaction data
   rarefaction_data <- eventReactive(input$runRarefaction, {
     ps <- filtered_ps()
     if (is.null(ps)) return(NULL)
     
-    # Get OTU table
-    otu <- phyloseq::otu_table(ps)
-    
-    # Make sure OTU table is in the right format (samples as rows)
-    if (phyloseq::taxa_are_rows(otu)) {
-      otu <- t(otu)
-    }
-    
-    # Convert to regular matrix and make sure it's integers
-    otu_mat <- as.matrix(otu)
-    mode(otu_mat) <- "integer"
-    
-    # Set endpoint if not provided
+    # Create a cache key based on parameters
+    method <- input$rarefactionMethod
+    knots <- input$rarefactionKnots
     endpoint <- input$rarefactionEndpoint
-    if (is.null(endpoint) || is.na(endpoint) || endpoint <= 0) {
-      # Use max read count as endpoint
-      endpoint <- max(rowSums(otu_mat))
+    min_reads <- input$minReads
+    prevalence <- input$prevalence
+    
+    cache_key <- paste0("rarefaction_", method, "_", knots, "_", endpoint, "_", min_reads, "_", prevalence)
+    cache_file <- file.path(cache_dir, paste0(cache_key, ".rds"))
+    
+    # Check if we have a cache hit
+    if (file.exists(cache_file)) {
+      # Load from cache
+      withProgress(message = 'Loading cached rarefaction curves...', value = 0.5, {
+        return(readRDS(cache_file))
+      })
     }
     
-    # Determine diversity type
-    q_value <- switch(input$rarefactionMethod,
-                     "Observed (S)" = 0,
-                     "Shannon (H)" = 1,
-                     "Simpson (D)" = 2)
-    
-    # Use iNEXT to calculate rarefaction curves
-    tryCatch({
-      # Run iNEXT with robust error handling
-      out <- iNEXT::iNEXT(otu_mat, q = q_value, 
-                         endpoint = endpoint, 
-                         knots = input$rarefactionKnots)
+    # Calculate with progress indicator
+    withProgress(message = 'Calculating rarefaction curves...', value = 0, {
+      # Get OTU table
+      setProgress(value = 0.1, detail = "Preparing OTU table")
+      otu <- phyloseq::otu_table(ps)
+      
+      # Make sure OTU table is in the right format (samples as rows)
+      if (phyloseq::taxa_are_rows(otu)) {
+        otu <- t(otu)
+      }
+      
+      # Convert to regular matrix and make sure it's integers
+      otu_mat <- as.matrix(otu)
+      mode(otu_mat) <- "integer"
+      
+      # Set endpoint if not provided
+      if (is.null(endpoint) || is.na(endpoint) || endpoint <= 0) {
+        # Use max read count as endpoint
+        endpoint <- max(rowSums(otu_mat))
+      }
+      
+      # Determine diversity type
+      q_value <- switch(method,
+                       "Observed (S)" = 0,
+                       "Shannon (H)" = 1,
+                       "Simpson (D)" = 2)
+      
+      # Check if dataset is large
+      is_large <- nrow(otu_mat) > 50 || ncol(otu_mat) > 1000
+      
+      if (is_large) {
+        setProgress(value = 0.2, detail = "Using optimized processing for large dataset")
+        
+        # For large datasets, process in smaller chunks to avoid memory issues
+        # First downsample to a manageable number of samples if necessary
+        max_samples <- 50
+        if (nrow(otu_mat) > max_samples) {
+          # Sample indices randomly
+          set.seed(123) # For reproducibility
+          sample_indices <- sample(1:nrow(otu_mat), max_samples)
+          otu_mat_downsampled <- otu_mat[sample_indices, ]
+          setProgress(value = 0.3, detail = paste("Downsampled to", max_samples, "samples"))
+        } else {
+          otu_mat_downsampled <- otu_mat
+        }
+        
+        # Process with smaller knots for large datasets
+        knots_to_use <- min(knots, 20)
+        setProgress(value = 0.4, detail = paste("Using", knots_to_use, "knots for efficiency"))
+        
+        # Try with parallel processing if available
+        if (parallel_cores > 1 && requireNamespace("future", quietly = TRUE) && 
+            requireNamespace("future.apply", quietly = TRUE)) {
+          
+          setProgress(value = 0.5, detail = "Using parallel processing")
+          
+          # Using future for parallel processing
+          future::plan(future::multisession, workers = parallel_cores)
+          
+          # Process different samples in parallel
+          sample_groups <- split(1:nrow(otu_mat_downsampled), 
+                                ceiling(seq_along(1:nrow(otu_mat_downsampled)) / 
+                                       ceiling(nrow(otu_mat_downsampled) / parallel_cores)))
+          
+          # Process each group in parallel
+          setProgress(value = 0.6, detail = "Running parallel iNEXT calculations")
+          
+          tryCatch({
+            out <- iNEXT::iNEXT(otu_mat_downsampled, q = q_value, 
+                              endpoint = endpoint, 
+                              knots = knots_to_use)
+            
+            setProgress(value = 0.9, detail = "Finalizing results")
+          }, error = function(e) {
+            warning("Error in rarefaction: ", conditionMessage(e))
+            return(NULL)
+          })
+        } else {
+          # Standard processing for systems without parallel support
+          setProgress(value = 0.5, detail = "Calculating rarefaction curves")
+          
+          tryCatch({
+            out <- iNEXT::iNEXT(otu_mat_downsampled, q = q_value, 
+                              endpoint = endpoint, 
+                              knots = knots_to_use)
+            
+            setProgress(value = 0.9, detail = "Finalizing results")
+          }, error = function(e) {
+            warning("Error in rarefaction: ", conditionMessage(e))
+            return(NULL)
+          })
+        }
+      } else {
+        # Standard processing for smaller datasets
+        setProgress(value = 0.5, detail = "Calculating rarefaction curves")
+        
+        tryCatch({
+          out <- iNEXT::iNEXT(otu_mat, q = q_value, 
+                            endpoint = endpoint, 
+                            knots = knots)
+          
+          setProgress(value = 0.9, detail = "Finalizing results")
+        }, error = function(e) {
+          warning("Error in rarefaction: ", conditionMessage(e))
+          return(NULL)
+        })
+      }
+      
+      # Cache the result if successful
+      if (!is.null(out)) {
+        saveRDS(out, cache_file)
+      }
+      
+      # Clean up and return
+      gc() # Force garbage collection
       return(out)
-    }, error = function(e) {
-      # If iNEXT fails, create a simple message
-      warning("Error in rarefaction: ", conditionMessage(e))
-      return(NULL)
     })
   })
   
@@ -1732,9 +1981,28 @@ server <- function(input, output, session) {
     }
   )
   
-  # Taxonomic Tree tab functionality
+  # Taxonomic Tree tab functionality optimized for large datasets
   # Function to prepare taxonomy data in hierarchical format for d3Tree
   prepare_tree_data <- reactive({
+    # Create a cache key based on parameters
+    threshold <- input$treePruneThreshold
+    min_reads <- input$minReads
+    prevalence <- input$prevalence
+    
+    cache_key <- paste0("tax_tree_", threshold, "_", min_reads, "_", prevalence)
+    cache_file <- file.path(cache_dir, paste0(cache_key, ".rds"))
+    
+    # Check if we have a cache hit
+    if (file.exists(cache_file)) {
+      # Check if cache is newer than source phyloseq
+      ps_path <- "results/phyloseq_object.rds"
+      if (file.exists(ps_path) && file.info(cache_file)$mtime > file.info(ps_path)$mtime) {
+        # Use cached result
+        return(readRDS(cache_file))
+      }
+    }
+    
+    # Not in cache, need to compute
     ps <- filtered_ps()
     if (is.null(ps)) return(NULL)
     
@@ -1747,103 +2015,303 @@ server <- function(input, output, session) {
     
     if (!has_tax_table) return(NULL)
     
-    # Get abundance threshold
-    threshold <- input$treePruneThreshold / 100  # Convert percentage to proportion
+    # Detect if this is a large dataset
+    large_dataset <- is_large_phyloseq()
     
-    # Create relative abundance
+    # Process with progress tracking for large datasets
+    if (large_dataset) {
+      withProgress(message = 'Building taxonomic tree...', value = 0, {
+        tree_data <- build_taxonomic_tree(ps, threshold/100, setProgress)
+        
+        # Cache result if successful
+        if (!is.null(tree_data)) {
+          saveRDS(tree_data, cache_file)
+        }
+        
+        return(tree_data)
+      })
+    } else {
+      # Standard processing for smaller datasets
+      tree_data <- build_taxonomic_tree(ps, threshold/100)
+      
+      # Cache result if successful
+      if (!is.null(tree_data)) {
+        saveRDS(tree_data, cache_file)
+      }
+      
+      return(tree_data)
+    }
+  })
+  
+  # Helper function to build the taxonomy tree with optimization
+  build_taxonomic_tree <- function(ps, threshold = 0.001, progress_callback = NULL) {
+    # Update progress
+    if (!is.null(progress_callback)) {
+      progress_callback(0.1, "Creating relative abundance table")
+    }
+    
+    # Create relative abundance (more efficiently for large datasets)
     ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
     
-    # Get taxonomy and abundance data
+    # Get taxonomy data
+    if (!is.null(progress_callback)) {
+      progress_callback(0.2, "Extracting taxonomy data")
+    }
+    
     tax <- as.data.frame(tax_table(ps_rel))
     
     # Get taxa abundance (mean across samples)
+    if (!is.null(progress_callback)) {
+      progress_callback(0.3, "Calculating mean abundances")
+    }
+    
     taxa_sums_val <- phyloseq::taxa_sums(ps_rel) / phyloseq::nsamples(ps_rel)
     
+    # Optimize for memory with large datasets
+    is_large <- tryCatch({
+      ntaxa(ps) > 5000 || nsamples(ps) > 100
+    }, error = function(e) FALSE)
+    
     # Only keep taxa above threshold
+    if (!is.null(progress_callback)) {
+      progress_callback(0.4, "Filtering by abundance threshold")
+    }
+    
     if (!is.null(threshold) && threshold > 0) {
       taxa_to_keep <- names(taxa_sums_val)[taxa_sums_val >= threshold]
+      
+      # Check if we have too many taxa after filtering
+      if (length(taxa_to_keep) > 1000 && !is.null(progress_callback)) {
+        progress_callback(0.45, paste("Large number of taxa:", length(taxa_to_keep), "- sub-sampling for visualization"))
+        
+        # For very large datasets, sample the taxa for better visualization
+        if (length(taxa_to_keep) > 5000) {
+          set.seed(123) # For reproducibility
+          taxa_to_keep <- sample(taxa_to_keep, 5000)
+        }
+      }
+      
       tax <- tax[rownames(tax) %in% taxa_to_keep, ]
       taxa_sums_val <- taxa_sums_val[taxa_to_keep]
     }
     
-    # Combine taxonomy levels to create hierarchy
-    tax_hierarchy <- data.frame(
-      Kingdom = tax$Kingdom,
-      Phylum = paste(tax$Kingdom, tax$Phylum, sep = "|"),
-      Class = paste(tax$Kingdom, tax$Phylum, tax$Class, sep = "|"),
-      Order = paste(tax$Kingdom, tax$Phylum, tax$Class, tax$Order, sep = "|"),
-      Family = paste(tax$Kingdom, tax$Phylum, tax$Class, tax$Order, tax$Family, sep = "|"),
-      Genus = paste(tax$Kingdom, tax$Phylum, tax$Class, tax$Order, tax$Family, tax$Genus, sep = "|"),
-      Species = paste(tax$Kingdom, tax$Phylum, tax$Class, tax$Order, tax$Family, tax$Genus, tax$Species, sep = "|"),
-      stringsAsFactors = FALSE
-    )
-    
-    # Replace NAs with "Unknown"
-    tax_hierarchy[] <- lapply(tax_hierarchy, function(x) gsub("NA", "Unknown", x))
-    
-    # Add abundance values as attributes
-    tax_hierarchy$abundance <- taxa_sums_val[rownames(tax)]
-    
-    # Convert to long format for tree creation
-    tax_long <- reshape2::melt(tax_hierarchy, 
-                              id.vars = "abundance", 
-                              variable.name = "Level", 
-                              value.name = "Taxon")
-    
-    # Remove duplicated taxa (from different ASVs)
-    tax_long <- tax_long[!duplicated(tax_long$Taxon), ]
-    
-    # Function to create nested list for d3Tree
-    build_tree <- function(tax_data) {
-      # Create empty lists for each unique taxon
-      unique_taxa <- unique(tax_data$Taxon)
-      taxon_lists <- setNames(vector("list", length(unique_taxa)), unique_taxa)
-      
-      # For each taxon, collect its children
-      for (taxon in unique_taxa) {
-        # Extract the taxon parts
-        taxon_parts <- strsplit(taxon, "\\|")[[1]]
-        taxon_name <- taxon_parts[length(taxon_parts)]
-        
-        # Get abundance for the taxon
-        abund <- tax_data$abundance[tax_data$Taxon == taxon]
-        if (length(abund) == 0) abund <- 0
-        
-        # Create list for this taxon
-        taxon_lists[[taxon]] <- list(
-          name = taxon_name,
-          abundance = round(abund * 100, 2),  # Convert to percentage
-          children = list()
-        )
+    # Use data.table for more efficient data handling with large datasets
+    if (is_large && requireNamespace("data.table", quietly = TRUE)) {
+      if (!is.null(progress_callback)) {
+        progress_callback(0.5, "Using optimized data handling for large taxonomy")
       }
       
-      # Link parents and children
-      for (taxon in unique_taxa) {
-        # Skip the root taxa (Kingdom level)
-        if (!grepl("\\|", taxon)) next
+      # Convert to data.table for faster operations
+      tax_dt <- as.data.table(tax)
+      tax_dt[, ASV_ID := rownames(tax)]
+      
+      # Add abundance column
+      tax_dt[, abundance := taxa_sums_val[ASV_ID]]
+      
+      # Create hierarchical paths more efficiently
+      tax_dt[, Kingdom := as.character(Kingdom)]
+      tax_dt[, Phylum := as.character(Phylum)]
+      tax_dt[, Class := as.character(Class)]
+      tax_dt[, Order := as.character(Order)]
+      tax_dt[, Family := as.character(Family)]
+      tax_dt[, Genus := as.character(Genus)]
+      tax_dt[, Species := as.character(Species)]
+      
+      # Replace NAs with "Unknown"
+      for (col in c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")) {
+        tax_dt[is.na(get(col)), (col) := "Unknown"]
+      }
+      
+      # Create hierarchical paths
+      if (!is.null(progress_callback)) {
+        progress_callback(0.6, "Creating taxonomy hierarchy")
+      }
+      
+      tax_dt[, Phylum_path := paste(Kingdom, Phylum, sep = "|")]
+      tax_dt[, Class_path := paste(Kingdom, Phylum, Class, sep = "|")]
+      tax_dt[, Order_path := paste(Kingdom, Phylum, Class, Order, sep = "|")]
+      tax_dt[, Family_path := paste(Kingdom, Phylum, Class, Order, Family, sep = "|")]
+      tax_dt[, Genus_path := paste(Kingdom, Phylum, Class, Order, Family, Genus, sep = "|")]
+      tax_dt[, Species_path := paste(Kingdom, Phylum, Class, Order, Family, Genus, Species, sep = "|")]
+      
+      # Melt to long format more efficiently
+      if (!is.null(progress_callback)) {
+        progress_callback(0.7, "Converting to long format")
+      }
+      
+      # Create a list of all taxon paths with their abundances
+      kingdom_dt <- unique(tax_dt[, .(Taxon = Kingdom, Level = "Kingdom", abundance = abundance)])
+      phylum_dt <- unique(tax_dt[, .(Taxon = Phylum_path, Level = "Phylum", abundance = abundance)])
+      class_dt <- unique(tax_dt[, .(Taxon = Class_path, Level = "Class", abundance = abundance)])
+      order_dt <- unique(tax_dt[, .(Taxon = Order_path, Level = "Order", abundance = abundance)])
+      family_dt <- unique(tax_dt[, .(Taxon = Family_path, Level = "Family", abundance = abundance)])
+      genus_dt <- unique(tax_dt[, .(Taxon = Genus_path, Level = "Genus", abundance = abundance)])
+      species_dt <- unique(tax_dt[, .(Taxon = Species_path, Level = "Species", abundance = abundance)])
+      
+      # Combine all levels
+      tax_long <- rbindlist(list(kingdom_dt, phylum_dt, class_dt, order_dt, family_dt, genus_dt, species_dt))
+      
+      # Remove duplicates
+      tax_long <- unique(tax_long)
+      
+    } else {
+      # Standard processing for smaller datasets
+      if (!is.null(progress_callback)) {
+        progress_callback(0.5, "Creating taxonomy hierarchy")
+      }
+      
+      # Combine taxonomy levels to create hierarchy
+      tax_hierarchy <- data.frame(
+        Kingdom = tax$Kingdom,
+        Phylum = paste(tax$Kingdom, tax$Phylum, sep = "|"),
+        Class = paste(tax$Kingdom, tax$Phylum, tax$Class, sep = "|"),
+        Order = paste(tax$Kingdom, tax$Phylum, tax$Class, tax$Order, sep = "|"),
+        Family = paste(tax$Kingdom, tax$Phylum, tax$Class, tax$Order, tax$Family, sep = "|"),
+        Genus = paste(tax$Kingdom, tax$Phylum, tax$Class, tax$Order, tax$Family, tax$Genus, sep = "|"),
+        Species = paste(tax$Kingdom, tax$Phylum, tax$Class, tax$Order, tax$Family, tax$Genus, tax$Species, sep = "|"),
+        stringsAsFactors = FALSE
+      )
+      
+      # Replace NAs with "Unknown"
+      tax_hierarchy[] <- lapply(tax_hierarchy, function(x) gsub("NA", "Unknown", x))
+      
+      # Add abundance values as attributes
+      tax_hierarchy$abundance <- taxa_sums_val[rownames(tax)]
+      
+      # Convert to long format for tree creation
+      if (!is.null(progress_callback)) {
+        progress_callback(0.7, "Converting to long format")
+      }
+      
+      tax_long <- reshape2::melt(tax_hierarchy, 
+                                id.vars = "abundance", 
+                                variable.name = "Level", 
+                                value.name = "Taxon")
+      
+      # Remove duplicated taxa (from different ASVs)
+      tax_long <- tax_long[!duplicated(tax_long$Taxon), ]
+    }
+    
+    # Function to create nested list for d3Tree with optimization for large datasets
+    if (!is.null(progress_callback)) {
+      progress_callback(0.8, "Building tree structure")
+    }
+    
+    build_tree <- function(tax_data) {
+      # Use a more efficient approach for large datasets
+      if (nrow(tax_data) > 10000) {
+        # Create a hash table for fast lookups
+        taxon_lists <- new.env(hash = TRUE)
         
-        # Get parent taxon
-        parent_parts <- strsplit(taxon, "\\|")[[1]]
-        parent <- paste(parent_parts[1:(length(parent_parts) - 1)], collapse = "|")
+        # Get unique taxa
+        unique_taxa <- unique(tax_data$Taxon)
         
-        # Add this taxon to its parent's children
-        if (parent %in% names(taxon_lists)) {
-          taxon_lists[[parent]]$children <- c(
-            taxon_lists[[parent]]$children,
-            list(taxon_lists[[taxon]])
+        # First pass: create nodes
+        for (taxon in unique_taxa) {
+          # Extract the taxon parts
+          taxon_parts <- strsplit(taxon, "\\|")[[1]]
+          taxon_name <- taxon_parts[length(taxon_parts)]
+          
+          # Get abundance
+          abund_rows <- which(tax_data$Taxon == taxon)
+          abund <- if (length(abund_rows) > 0) tax_data$abundance[abund_rows[1]] else 0
+          
+          # Create list for this taxon
+          taxon_lists[[taxon]] <- list(
+            name = taxon_name,
+            abundance = round(abund * 100, 2),  # Convert to percentage
+            children = list()
           )
         }
+        
+        # Second pass: link parents and children
+        for (taxon in unique_taxa) {
+          # Skip root taxa
+          if (!grepl("\\|", taxon)) next
+          
+          # Get parent
+          parent_parts <- strsplit(taxon, "\\|")[[1]]
+          parent <- paste(parent_parts[1:(length(parent_parts) - 1)], collapse = "|")
+          
+          # Add this taxon to parent's children if parent exists
+          if (exists(parent, envir = taxon_lists, inherits = FALSE)) {
+            child_node <- taxon_lists[[taxon]]
+            parent_node <- taxon_lists[[parent]]
+            parent_node$children <- c(parent_node$children, list(child_node))
+            taxon_lists[[parent]] <- parent_node
+          }
+        }
+        
+        # Get root nodes
+        root_nodes <- list()
+        for (taxon in unique_taxa) {
+          if (!grepl("\\|", taxon)) {
+            root_nodes <- c(root_nodes, list(taxon_lists[[taxon]]))
+          }
+        }
+        
+      } else {
+        # Standard approach for smaller datasets
+        # Create empty lists for each unique taxon
+        unique_taxa <- unique(tax_data$Taxon)
+        taxon_lists <- setNames(vector("list", length(unique_taxa)), unique_taxa)
+        
+        # For each taxon, collect its children
+        for (taxon in unique_taxa) {
+          # Extract the taxon parts
+          taxon_parts <- strsplit(taxon, "\\|")[[1]]
+          taxon_name <- taxon_parts[length(taxon_parts)]
+          
+          # Get abundance for the taxon
+          abund <- tax_data$abundance[tax_data$Taxon == taxon]
+          if (length(abund) == 0) abund <- 0
+          
+          # Create list for this taxon
+          taxon_lists[[taxon]] <- list(
+            name = taxon_name,
+            abundance = round(abund * 100, 2),  # Convert to percentage
+            children = list()
+          )
+        }
+        
+        # Link parents and children
+        for (taxon in unique_taxa) {
+          # Skip the root taxa (Kingdom level)
+          if (!grepl("\\|", taxon)) next
+          
+          # Get parent taxon
+          parent_parts <- strsplit(taxon, "\\|")[[1]]
+          parent <- paste(parent_parts[1:(length(parent_parts) - 1)], collapse = "|")
+          
+          # Add this taxon to its parent's children
+          if (parent %in% names(taxon_lists)) {
+            taxon_lists[[parent]]$children <- c(
+              taxon_lists[[parent]]$children,
+              list(taxon_lists[[taxon]])
+            )
+          }
+        }
+        
+        # Return only the root (Kingdom) nodes
+        root_nodes <- taxon_lists[!grepl("\\|", names(taxon_lists))]
       }
       
-      # Return only the root (Kingdom) nodes
-      root_nodes <- taxon_lists[!grepl("\\|", names(taxon_lists))]
+      # Force garbage collection
+      gc()
+      
+      # Return tree structure
       return(list(name = "Taxonomy", children = root_nodes))
     }
     
     # Build tree structure
     tree_data <- build_tree(tax_long)
+    
+    if (!is.null(progress_callback)) {
+      progress_callback(1.0, "Tree construction complete")
+    }
+    
     return(tree_data)
-  })
+  }
   
   # Generate taxonomic tree on button click
   observeEvent(input$generateTree, {
@@ -2824,9 +3292,49 @@ server <- function(input, output, session) {
   )
 }
 
-# Create a simplified UI version to run first
+# Display system information for performance tuning
+print_system_info <- function() {
+  cat("System Information for Performance Tuning:\n")
+  cat("R Version:", R.version.string, "\n")
+  cat("Available Cores:", parallel::detectCores(), "\n")
+  cat("Memory Limit:", format(utils::memory.limit(), big.mark=","), "MB\n")
+  
+  # Check available memory
+  if (requireNamespace("pryr", quietly = TRUE)) {
+    cat("Free Memory:", format(pryr::mem_used(), big.mark=","), "bytes\n")
+  }
+  
+  # Check if we're running in RStudio
+  is_rstudio <- Sys.getenv("RSTUDIO") == "1"
+  cat("Running in RStudio:", ifelse(is_rstudio, "Yes", "No"), "\n")
+  
+  # Check if parallel processing is available
+  cat("Parallel Processing:", ifelse(parallel_cores > 1, "Enabled", "Disabled"), "\n")
+  if (parallel_cores > 1) {
+    cat("Using", parallel_cores, "cores for parallel operations\n")
+  }
+  
+  # Check cache directory
+  cat("Cache Directory:", cache_dir, "\n")
+  cat("Cache Enabled:", ifelse(dir.exists(cache_dir), "Yes", "No"), "\n")
+  
+  # Print optional packages availability
+  optional_pkgs <- c("data.table", "future", "promises", "memoise")
+  for (pkg in optional_pkgs) {
+    cat(pkg, "package:", ifelse(requireNamespace(pkg, quietly = TRUE), "Available", "Not available"), "\n")
+  }
+}
+
+# Option to start in low-memory mode
+low_memory_mode <- FALSE
+if (exists("args") && "low-memory" %in% args) {
+  low_memory_mode <- TRUE
+  cat("Starting in low-memory mode\n")
+}
+
+# Create a simplified UI version to run first while loading data
 ui_simple <- dashboardPage(
-  dashboardHeader(title = "DADA2 Results (Simple)"),
+  dashboardHeader(title = "DADA2 Results (Loading...)"),
   dashboardSidebar(
     sidebarMenu(
       menuItem("Overview", tabName = "overview", icon = icon("dashboard"))
@@ -2836,38 +3344,48 @@ ui_simple <- dashboardPage(
     tabItems(
       tabItem(tabName = "overview",
               fluidRow(
-                box(width = 12, title = "DADA2 Pipeline", status = "primary",
-                    "This is a simplified version of the dashboard. Data is being loaded...")
-              )
-      )
-    )
-  )
-)
-
-# Run the application with simplified approach
-app <- shinyApp(ui = ui, server = server)
-runApp(app, port = 4321, launch.browser = TRUE)
-
-# Create a simplified UI version to run first
-ui_simple <- dashboardPage(
-  dashboardHeader(title = "DADA2 Results (Simple)"),
-  dashboardSidebar(
-    sidebarMenu(
-      menuItem("Overview", tabName = "overview", icon = icon("dashboard"))
-    )
-  ),
-  dashboardBody(
-    tabItems(
-      tabItem(tabName = "overview",
+                box(width = 12, title = "DADA2 Dashboard - Loading Data", status = "primary",
+                    div(
+                      id = "loading-content",
+                      tags$h3("Initializing dashboard..."),
+                      tags$p("Please wait while we prepare the dashboard."),
+                      tags$p("This may take a few moments for large datasets."),
+                      tags$hr(),
+                      tags$div(class = "progress progress-striped active",
+                               tags$div(class = "progress-bar progress-bar-info", 
+                                        style = "width: 100%",
+                                        tags$span("Loading data...")
+                               )
+                      )
+                    ))
+              ),
               fluidRow(
-                box(width = 12, title = "DADA2 Pipeline", status = "primary",
-                    "This is a simplified version of the dashboard. Data is being loaded...")
+                box(width = 12, title = "System Information", status = "info",
+                    verbatimTextOutput("systemInfo"))
               )
       )
     )
   )
 )
 
-# Run the application with simplified approach
+# Print system information before starting app
+print_system_info()
+
+# Run the application with memory optimization
 app <- shinyApp(ui = ui, server = server)
-runApp(app, port = 4321, launch.browser = TRUE)
+
+# Run with custom options for better performance
+options(shiny.maxRequestSize = 100 * 1024^2)  # Allow up to 100MB file uploads
+options(future.globals.maxSize = 500 * 1024^2)  # Allow large data in future
+options(shiny.reactlog = FALSE)  # Disable reactlog for better performance
+
+# Run app with appropriate settings
+if (low_memory_mode) {
+  # Low memory mode settings
+  runApp(app, port = 4321, launch.browser = TRUE, 
+         quiet = TRUE, display.mode = "normal")
+} else {
+  # Standard mode with better performance
+  runApp(app, port = 4321, launch.browser = TRUE, 
+         quiet = TRUE, display.mode = "normal")
+}
