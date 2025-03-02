@@ -147,7 +147,10 @@ ui <- dashboardPage(
                     selectInput("alphaMethod", "Diversity Metric:", 
                                 choices = c("Shannon", "Simpson", "Observed", "Chao1"),
                                 selected = "Shannon")),
-                box(width = 8, 
+                box(width = 4, 
+                    selectInput("alphaGroupColumn", "Group By:", choices = c("Auto-detect" = "auto"),
+                               selected = "auto")),
+                box(width = 4, 
                     checkboxInput("logScale", "Log Scale", value = FALSE))
               ),
               
@@ -165,14 +168,19 @@ ui <- dashboardPage(
               ),
               
               fluidRow(
-                box(width = 4,
+                box(width = 3,
                     selectInput("betaMethod", "Distance Method:",
                                 choices = c("Bray-Curtis", "Jaccard", "UniFrac", "Weighted UniFrac"),
                                 selected = "Bray-Curtis")),
-                box(width = 4,
+                box(width = 3,
                     selectInput("ordMethod", "Ordination Method:",
                                 choices = c("PCoA", "NMDS", "t-SNE", "UMAP"),
-                                selected = "PCoA"))
+                                selected = "PCoA")),
+                box(width = 3,
+                    selectInput("betaGroupColumn", "Group By:", choices = c("Auto-detect" = "auto"),
+                               selected = "auto")),
+                box(width = 3,
+                    checkboxInput("ellipses", "Draw Confidence Ellipses", value = FALSE))
               ),
               
               fluidRow(
@@ -543,7 +551,51 @@ server <- function(input, output, session) {
     })
   })
   
-  # No need to update UI elements based on sample data
+  # Update UI elements based on sample data when phyloseq object is loaded
+  observe({
+    ps <- phyloseq_obj()
+    if (is.null(ps)) return()
+    
+    # Check if sample data exists
+    has_sample_data <- tryCatch({
+      !is.null(sample_data(ps))
+    }, error = function(e) FALSE)
+    
+    if (has_sample_data) {
+      # Extract sample data
+      sample_df <- as.data.frame(sample_data(ps))
+      
+      # Get column names
+      meta_cols <- colnames(sample_df)
+      
+      # Identify potential grouping columns (categorical or limited numeric values)
+      grouping_cols <- c()
+      
+      for (col in meta_cols) {
+        # Skip columns that are likely not categorical (too many unique values)
+        n_unique <- length(unique(sample_df[[col]]))
+        if (n_unique > 1 && n_unique < min(20, nrow(sample_df))) {
+          grouping_cols <- c(grouping_cols, col)
+        }
+      }
+      
+      # If we found potential grouping columns, update the selection inputs
+      if (length(grouping_cols) > 0) {
+        # Create named list with Auto-detect option first
+        group_choices <- c("Auto-detect" = "auto", setNames(grouping_cols, grouping_cols))
+        
+        # Update alpha diversity group selector
+        updateSelectInput(session, "alphaGroupColumn", 
+                         choices = group_choices,
+                         selected = "auto")
+        
+        # Update beta diversity group selector
+        updateSelectInput(session, "betaGroupColumn", 
+                         choices = group_choices,
+                         selected = "auto")
+      }
+    }
+  })
   
   # Optimized filtering with progress tracking and caching
   filtered_ps <- reactive({
@@ -1229,19 +1281,111 @@ server <- function(input, output, session) {
       Diversity = alpha_div[[input$alphaMethod]]
     )
     
-    # Create plot - simple bar plot since we don't have group information
-    p <- ggplot(alpha_df, aes(x = reorder(Sample, -Diversity), y = Diversity)) +
-      geom_bar(stat = "identity", fill = "steelblue") +
-      theme_minimal() +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-      labs(x = "Sample", y = paste(input$alphaMethod, "Diversity"))
+    # Check for sample data
+    has_sample_data <- tryCatch({
+      !is.null(sample_data(ps))
+    }, error = function(e) FALSE)
     
-    # Apply log scale if selected
-    if (input$logScale) {
-      p <- p + scale_y_log10()
+    has_grouping <- FALSE
+    group_column <- NULL
+    
+    if (has_sample_data) {
+      # Extract sample data
+      sample_df <- as.data.frame(sample_data(ps))
+      
+      # Check if user selected a specific grouping column
+      if (!is.null(input$alphaGroupColumn) && input$alphaGroupColumn != "auto") {
+        # User selected a specific column
+        if (input$alphaGroupColumn %in% colnames(sample_df)) {
+          group_column <- input$alphaGroupColumn
+          has_grouping <- TRUE
+        }
+      } else {
+        # Auto-detect grouping column
+        potential_group_cols <- c("Group", "TreatmentGroup", "Treatment", "Condition", 
+                                 "SampleType", "SampleGroup", "ExperimentalGroup", "Site", 
+                                 "Location", "Patient", "Subject", "TimePoint", "Time")
+        
+        # Find the first available column that could be used for grouping
+        for (col in potential_group_cols) {
+          if (col %in% colnames(sample_df)) {
+            # Check if it has multiple values (not useful if all samples have same value)
+            if (length(unique(sample_df[[col]])) > 1 && length(unique(sample_df[[col]])) < nrow(sample_df)) {
+              group_column <- col
+              has_grouping <- TRUE
+              break
+            }
+          }
+        }
+      }
+      
+      # If we found a grouping column, add it to the alpha diversity data
+      if (has_grouping) {
+        alpha_df$Group <- sample_df[alpha_df$Sample, group_column]
+      }
     }
     
-    ggplotly(p)
+    # Create plot - either grouped or simple bar plot
+    if (has_grouping) {
+      # Create grouped plots
+      
+      # First, create a boxplot by group
+      p_box <- ggplot(alpha_df, aes(x = Group, y = Diversity, fill = Group)) +
+        geom_boxplot(outlier.shape = NA) +  # Hide outliers as they'll be shown in the jitter
+        geom_jitter(width = 0.2, height = 0, alpha = 0.7, aes(text = Sample)) +
+        theme_minimal() +
+        labs(x = group_column, 
+             y = paste(input$alphaMethod, "Diversity"), 
+             title = paste(input$alphaMethod, "Diversity by", group_column)) +
+        scale_fill_viridis_d() +
+        theme(legend.position = "none")  # Hide redundant legend
+      
+      # Second, create a bar plot colored by group
+      p_bar <- ggplot(alpha_df, aes(x = reorder(Sample, -Diversity), y = Diversity, fill = Group)) +
+        geom_bar(stat = "identity") +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        labs(x = "Sample", 
+             y = paste(input$alphaMethod, "Diversity"), 
+             fill = group_column,
+             title = paste(input$alphaMethod, "Diversity by Sample")) +
+        scale_fill_viridis_d()
+      
+      # Apply log scale if selected
+      if (input$logScale) {
+        p_box <- p_box + scale_y_log10()
+        p_bar <- p_bar + scale_y_log10()
+      }
+      
+      # Arrange the two plots
+      p <- plotly::subplot(
+        ggplotly(p_box, tooltip = c("text", "y")),
+        ggplotly(p_bar),
+        nrows = 1,
+        shareY = TRUE,
+        widths = c(0.4, 0.6)
+      ) %>% 
+        plotly::layout(
+          showlegend = TRUE, 
+          legend = list(orientation = "h", y = -0.1)
+        )
+      
+      return(p)
+    } else {
+      # Simple bar plot without grouping
+      p <- ggplot(alpha_df, aes(x = reorder(Sample, -Diversity), y = Diversity)) +
+        geom_bar(stat = "identity", fill = "steelblue") +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        labs(x = "Sample", y = paste(input$alphaMethod, "Diversity"))
+      
+      # Apply log scale if selected
+      if (input$logScale) {
+        p <- p + scale_y_log10()
+      }
+      
+      return(ggplotly(p))
+    }
   })
   
   # Beta Diversity tab outputs
@@ -1291,14 +1435,93 @@ server <- function(input, output, session) {
       axis_labels <- c("Dim1", "Dim2")
     }
     
-    # Add sample data
+    # Add sample names
     ord_data$Sample <- rownames(ord_data)
     
-    # Create plot
-    p <- ggplot(ord_data, aes(x = Axis1, y = Axis2, text = Sample)) +
-      geom_point(size = 3, alpha = 0.7, color = "steelblue") +
-      theme_minimal() +
-      labs(x = axis_labels[1], y = axis_labels[2])
+    # Variables for grouping
+    has_grouping <- FALSE
+    group_column <- NULL
+    
+    # Check for sample data
+    has_sample_data <- tryCatch({
+      !is.null(sample_data(ps))
+    }, error = function(e) FALSE)
+    
+    if (has_sample_data) {
+      # Extract sample data
+      sample_df <- as.data.frame(sample_data(ps))
+      
+      # Check if user selected a specific grouping column
+      if (!is.null(input$betaGroupColumn) && input$betaGroupColumn != "auto") {
+        # User selected a specific column
+        if (input$betaGroupColumn %in% colnames(sample_df)) {
+          group_column <- input$betaGroupColumn
+          has_grouping <- TRUE
+        }
+      } else {
+        # Auto-detect grouping column
+        potential_group_cols <- c("Group", "TreatmentGroup", "Treatment", "Condition", 
+                                 "SampleType", "SampleGroup", "ExperimentalGroup", "Site", 
+                                 "Location", "Patient", "Subject", "TimePoint", "Time")
+        
+        # Find the first available column that could be used for grouping
+        for (col in potential_group_cols) {
+          if (col %in% colnames(sample_df)) {
+            # Check if it has multiple values (not useful if all samples have same value)
+            if (length(unique(sample_df[[col]])) > 1 && length(unique(sample_df[[col]])) < nrow(sample_df)) {
+              group_column <- col
+              has_grouping <- TRUE
+              break
+            }
+          }
+        }
+      }
+      
+      # If we found a grouping column, add it to the ordination data
+      if (has_grouping) {
+        ord_data$Group <- sample_df[ord_data$Sample, group_column]
+        # Update hover text to include group
+        ord_data$hover_text <- paste("Sample:", ord_data$Sample, 
+                                    "<br>", group_column, ":", ord_data$Group)
+      }
+    }
+    
+    # If no hover text created yet, use just the sample name
+    if (!"hover_text" %in% colnames(ord_data)) {
+      ord_data$hover_text <- ord_data$Sample
+    }
+    
+    # Create plot with or without grouping
+    if (has_grouping) {
+      p <- ggplot(ord_data, aes(x = Axis1, y = Axis2, text = hover_text, color = Group)) +
+        geom_point(size = 3, alpha = 0.7) +
+        theme_minimal() +
+        labs(x = axis_labels[1], y = axis_labels[2], color = group_column) +
+        scale_color_viridis_d()
+      
+      # Add confidence ellipses if requested and if there are enough points per group
+      if (input$ellipses) {
+        # Check each group has at least 3 samples (required for ellipse calculation)
+        group_counts <- table(ord_data$Group)
+        enough_samples <- all(group_counts >= 3)
+        
+        if (enough_samples) {
+          tryCatch({
+            # Try to add ellipses
+            p <- p + stat_ellipse(aes(fill = Group), geom = "polygon", 
+                                 alpha = 0.2, level = 0.95, type = "t")
+          }, error = function(e) {
+            # If ellipse calculation fails, just continue without ellipses
+            warning("Could not calculate confidence ellipses: ", conditionMessage(e))
+          })
+        }
+      }
+    } else {
+      p <- ggplot(ord_data, aes(x = Axis1, y = Axis2, text = hover_text)) +
+        geom_point(size = 3, alpha = 0.7, color = "steelblue") +
+        theme_minimal() +
+        labs(x = axis_labels[1], y = axis_labels[2])
+    }
     
     ggplotly(p, tooltip = "text")
   })
@@ -2489,6 +2712,20 @@ server <- function(input, output, session) {
         metadata <- data.frame(
           Sample = sample_names(ps),
           TotalReads = sample_sums(ps)
+        )
+      }
+      
+      # Check if we have unique SampleID column
+      if (!"SampleID" %in% colnames(metadata)) {
+        metadata$SampleID <- rownames(metadata) 
+      }
+      
+      # Add standardized sample name for reference
+      if (requireNamespace("stringr", quietly = TRUE)) {
+        metadata$StandardizedName <- stringr::str_replace_all(
+          metadata$SampleID, 
+          pattern = "_R[12].*|\\.fastq.*|\\.fq.*", 
+          replacement = ""
         )
       }
       
