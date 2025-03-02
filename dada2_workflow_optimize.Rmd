@@ -1154,121 +1154,640 @@ if (dir.exists("results") && nrow(track_df) > 0) {
 }
 ```
 
-# Assign Taxonomy
+# Assign Taxonomy with Multiple Methods
 
-```{r taxonomy}
+```{r taxonomy-setup}
+# Load additional libraries for taxonomy assignment
+if (!requireNamespace("DECIPHER", quietly = TRUE)) {
+  cat("Installing DECIPHER package for IDTAXA method...\n")
+  if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+  }
+  BiocManager::install("DECIPHER", update = FALSE)
+}
+
+if (!requireNamespace("taxize", quietly = TRUE)) {
+  cat("Installing taxize package for taxonomic name resolution...\n")
+  install.packages("taxize")
+}
+
 # Create directory for reference databases if it doesn't exist
 if(!dir.exists("ref_db")) dir.create("ref_db")
 
-# Using Silva database for taxonomy assignment
-cat("Using Silva database for taxonomy assignment...\n")
-
-# Check if Silva files are available in the DADA2 package
-silva_train <- system.file("extdata", "silva_nr99_v138.1_train_set.fa.gz", package="dada2")
-silva_species <- system.file("extdata", "silva_species_assignment_v138.1.fa.gz", package="dada2")
-
-silva_files_in_package <- (file.exists(silva_train) && file.exists(silva_species))
-
-if(silva_files_in_package) {
-  cat("Using Silva database files from DADA2 package\n")
-} else {
-  cat("Silva files not found in DADA2 package, will download from Zenodo\n")
+# Function to download and manage reference databases
+download_ref_db <- function(db_name) {
+  cat("Setting up", db_name, "reference database...\n")
   
-  # URLs for Silva files from Zenodo
-  silva_url_base <- "https://zenodo.org/records/4587955/files/"
-  silva_train_url <- paste0(silva_url_base, "silva_nr99_v138.1_train_set.fa.gz")
-  silva_species_url <- paste0(silva_url_base, "silva_species_assignment_v138.1.fa.gz")
-  
-  # Local file paths for Silva files
-  silva_train <- file.path("ref_db", "silva_train_set.fa.gz")
-  silva_species <- file.path("ref_db", "silva_species.fa.gz")
-  
-  # Download training set if needed
-  if(!file.exists(silva_train)) {
-    cat("Downloading Silva taxonomy training file...\n")
-    # Set extended timeout
-    options(timeout = max(300, getOption("timeout")))
+  # Database-specific setup
+  if (db_name == "SILVA") {
+    # Check if Silva files are available in the DADA2 package
+    silva_train <- system.file("extdata", "silva_nr99_v138.1_train_set.fa.gz", package="dada2")
+    silva_species <- system.file("extdata", "silva_species_assignment_v138.1.fa.gz", package="dada2")
     
-    tryCatch({
-      download.file(silva_train_url, silva_train, method="auto", mode="wb")
-      cat("Download successful!\n")
-    }, error = function(e) {
-      cat("Error downloading Silva taxonomy file:", conditionMessage(e), "\n")
-      cat("Please try downloading it manually from:", silva_train_url, "\n")
-      cat("and save it to:", silva_train, "\n")
-      stop("Download failed. Please download files manually.")
-    })
+    silva_files_in_package <- (file.exists(silva_train) && file.exists(silva_species))
+    
+    if(silva_files_in_package) {
+      cat("Using Silva database files from DADA2 package\n")
+    } else {
+      cat("Silva files not found in DADA2 package, will download from Zenodo\n")
+      
+      # URLs for Silva files from Zenodo
+      silva_url_base <- "https://zenodo.org/records/4587955/files/"
+      silva_train_url <- paste0(silva_url_base, "silva_nr99_v138.1_train_set.fa.gz")
+      silva_species_url <- paste0(silva_url_base, "silva_species_assignment_v138.1.fa.gz")
+      
+      # Local file paths for Silva files
+      silva_train <- file.path("ref_db", "silva_train_set.fa.gz")
+      silva_species <- file.path("ref_db", "silva_species.fa.gz")
+      
+      # Download training set if needed
+      if(!file.exists(silva_train)) {
+        cat("Downloading Silva taxonomy training file...\n")
+        # Set extended timeout
+        options(timeout = max(300, getOption("timeout")))
+        
+        tryCatch({
+          download.file(silva_train_url, silva_train, method="auto", mode="wb")
+          cat("Download successful!\n")
+        }, error = function(e) {
+          cat("Error downloading Silva taxonomy file:", conditionMessage(e), "\n")
+          cat("Please try downloading it manually from:", silva_train_url, "\n")
+          cat("and save it to:", silva_train, "\n")
+          stop("Download failed. Please download files manually.")
+        })
+      }
+      
+      # Download species file if needed
+      if(!file.exists(silva_species)) {
+        cat("Downloading Silva species assignment file...\n")
+        
+        tryCatch({
+          download.file(silva_species_url, silva_species, method="auto", mode="wb")
+          cat("Download successful!\n")
+        }, error = function(e) {
+          cat("Error downloading Silva species file:", conditionMessage(e), "\n")
+          cat("Please try downloading it manually from:", silva_species_url, "\n")
+          cat("and save it to:", silva_species, "\n")
+          stop("Download failed. Please download files manually.")
+        })
+      }
+    }
+    
+    # Check if files exist before proceeding
+    if(!file.exists(silva_train) || !file.exists(silva_species)) {
+      stop("Required Silva files not available. Please download them manually as noted above.")
+    }
+    
+    return(list(
+      train = silva_train,
+      species = silva_species
+    ))
   }
   
-  # Download species file if needed
-  if(!file.exists(silva_species)) {
-    cat("Downloading Silva species assignment file...\n")
+  # Setup for IDTAXA/DECIPHER SILVA classifier
+  else if (db_name == "IDTAXA_SILVA") {
+    silva_idtaxa <- file.path("ref_db", "SILVA_SSU_r138_2019.RData")
     
-    tryCatch({
-      download.file(silva_species_url, silva_species, method="auto", mode="wb")
-      cat("Download successful!\n")
-    }, error = function(e) {
-      cat("Error downloading Silva species file:", conditionMessage(e), "\n")
-      cat("Please try downloading it manually from:", silva_species_url, "\n")
-      cat("and save it to:", silva_species, "\n")
-      stop("Download failed. Please download files manually.")
-    })
+    if (!file.exists(silva_idtaxa)) {
+      cat("Downloading SILVA SSU r138 for IDTAXA...\n")
+      
+      # Create temporary directory for download
+      temp_dir <- tempdir()
+      download_url <- "https://zenodo.org/records/3986799/files/SILVA_SSU_r138_2019.RData"
+      
+      tryCatch({
+        # Set extended timeout
+        options(timeout = max(600, getOption("timeout")))
+        download.file(download_url, silva_idtaxa, mode = "wb")
+        cat("Download successful!\n")
+      }, error = function(e) {
+        cat("Error downloading SILVA for IDTAXA:", conditionMessage(e), "\n")
+        cat("Please download it manually from:", download_url, "\n")
+        cat("and save it to:", silva_idtaxa, "\n")
+        stop("Download failed. Please download files manually.")
+      })
+    } else {
+      cat("Using existing SILVA IDTAXA training set\n")
+    }
+    
+    return(list(
+      train = silva_idtaxa
+    ))
+  }
+  
+  # Setup for RDP classifier/database
+  else if (db_name == "RDP") {
+    rdp_train <- file.path("ref_db", "rdp_train_set_18.fa.gz")
+    rdp_species <- file.path("ref_db", "rdp_species_assignment_18.fa.gz")
+    
+    if (!file.exists(rdp_train) || !file.exists(rdp_species)) {
+      cat("Downloading RDP training files...\n")
+      
+      # URLs for RDP files
+      rdp_base_url <- "https://zenodo.org/records/4587955/files/"
+      rdp_train_url <- paste0(rdp_base_url, "rdp_train_set_18.fa.gz")
+      rdp_species_url <- paste0(rdp_base_url, "rdp_species_assignment_18.fa.gz")
+      
+      # Download training files
+      options(timeout = max(300, getOption("timeout")))
+      
+      if (!file.exists(rdp_train)) {
+        tryCatch({
+          download.file(rdp_train_url, rdp_train, method = "auto", mode = "wb")
+          cat("RDP training set downloaded successfully!\n")
+        }, error = function(e) {
+          cat("Error downloading RDP training set:", conditionMessage(e), "\n")
+          stop("Download failed. Please download files manually.")
+        })
+      }
+      
+      if (!file.exists(rdp_species)) {
+        tryCatch({
+          download.file(rdp_species_url, rdp_species, method = "auto", mode = "wb")
+          cat("RDP species assignment file downloaded successfully!\n")
+        }, error = function(e) {
+          cat("Error downloading RDP species file:", conditionMessage(e), "\n")
+          stop("Download failed. Please download files manually.")
+        })
+      }
+    } else {
+      cat("Using existing RDP database files\n")
+    }
+    
+    return(list(
+      train = rdp_train,
+      species = rdp_species
+    ))
+  }
+  
+  # If unknown database is requested
+  else {
+    stop("Unknown database: ", db_name)
   }
 }
 
-# Check if files exist before proceeding
-if(!file.exists(silva_train) || !file.exists(silva_species)) {
-  stop("Required Silva files not available. Please download them manually as noted above.")
+# Get standard taxonomy names across databases
+standardize_taxonomy <- function(taxa_df, method) {
+  # Make all column names consistent
+  standard_cols <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+  
+  # IDTAXA specific standardization
+  if (method == "IDTAXA") {
+    if ("rootrank" %in% colnames(taxa_df)) {
+      colnames(taxa_df)[colnames(taxa_df) == "rootrank"] <- "Kingdom"
+    }
+    if ("domain" %in% colnames(taxa_df)) {
+      colnames(taxa_df)[colnames(taxa_df) == "domain"] <- "Kingdom"
+    }
+  }
+  
+  # RDP specific standardization
+  if (method == "RDP") {
+    # RDP sometimes uses Root instead of Kingdom
+    if ("Root" %in% colnames(taxa_df)) {
+      colnames(taxa_df)[colnames(taxa_df) == "Root"] <- "Kingdom"
+    }
+  }
+  
+  # Ensure all standard columns exist, filling with NA if missing
+  for (col in standard_cols) {
+    if (!col %in% colnames(taxa_df)) {
+      taxa_df[[col]] <- NA
+    }
+  }
+  
+  # Select only standard columns and in the right order
+  taxa_df <- taxa_df[, standard_cols]
+  
+  return(taxa_df)
 }
 
-# Assign taxonomy at the genus level
-cat("Assigning taxonomy using Silva database...\n")
-taxa <- assignTaxonomy(seqtab.nochim, silva_train, multithread=TRUE)
-
-# Add species-level assignments
-cat("Adding species-level assignments...\n")
-taxa <- addSpecies(taxa, silva_species)
-
-# View taxonomic assignments
-taxa.print <- taxa
-rownames(taxa.print) <- NULL
-head(taxa.print)
-
-# Create a taxonomy summary
-taxa_summary <- data.frame(
-  TaxonomicLevel = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
-  AssignmentCount = c(
-    sum(!is.na(taxa[, "Kingdom"])),
-    sum(!is.na(taxa[, "Phylum"])),
-    sum(!is.na(taxa[, "Class"])),
-    sum(!is.na(taxa[, "Order"])),
-    sum(!is.na(taxa[, "Family"])),
-    sum(!is.na(taxa[, "Genus"])),
-    sum(!is.na(taxa[, "Species"]))
-  ),
-  PercentAssigned = c(
-    round(sum(!is.na(taxa[, "Kingdom"])) / nrow(taxa) * 100, 1),
-    round(sum(!is.na(taxa[, "Phylum"])) / nrow(taxa) * 100, 1),
-    round(sum(!is.na(taxa[, "Class"])) / nrow(taxa) * 100, 1),
-    round(sum(!is.na(taxa[, "Order"])) / nrow(taxa) * 100, 1),
-    round(sum(!is.na(taxa[, "Family"])) / nrow(taxa) * 100, 1),
-    round(sum(!is.na(taxa[, "Genus"])) / nrow(taxa) * 100, 1),
-    round(sum(!is.na(taxa[, "Species"])) / nrow(taxa) * 100, 1)
+# This function will be used to summarize taxonomy assignment across methods
+summarize_taxonomy <- function(taxa_list) {
+  # Create a data frame to store summary
+  summary_df <- data.frame(
+    Method = character(),
+    Kingdom = numeric(),
+    Phylum = numeric(),
+    Class = numeric(),
+    Order = numeric(),
+    Family = numeric(),
+    Genus = numeric(),
+    Species = numeric()
   )
+  
+  # Calculate assignments for each method
+  for (method_name in names(taxa_list)) {
+    taxa_df <- taxa_list[[method_name]]
+    
+    # Calculate percentage assigned at each level
+    method_row <- c(method_name)
+    for (level in colnames(taxa_df)[-1]) { # Skip the ASV_ID column
+      percent <- round(sum(!is.na(taxa_df[[level]])) / nrow(taxa_df) * 100, 1)
+      method_row <- c(method_row, percent)
+    }
+    
+    # Add to summary data frame
+    summary_df <- rbind(summary_df, method_row)
+  }
+  
+  # Set column names
+  colnames(summary_df) <- c("Method", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+  
+  # Convert percentage columns to numeric
+  for (col in colnames(summary_df)[-1]) {
+    summary_df[[col]] <- as.numeric(summary_df[[col]])
+  }
+  
+  return(summary_df)
+}
+
+# Function to plot taxonomy assignment comparison
+plot_taxonomy_comparison <- function(summary_df) {
+  # Reshape data for plotting
+  summary_long <- tidyr::pivot_longer(
+    summary_df, 
+    cols = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
+    names_to = "TaxonomicLevel", 
+    values_to = "PercentAssigned"
+  )
+  
+  # Create the comparison plot
+  ggplot(summary_long, aes(x = TaxonomicLevel, y = PercentAssigned, fill = Method)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+    geom_text(aes(label = paste0(PercentAssigned, "%")), 
+              position = position_dodge(width = 0.9), 
+              vjust = -0.5, size = 3) +
+    theme_minimal() +
+    labs(title = "Taxonomic Assignment Comparison Across Methods",
+         x = "Taxonomic Level",
+         y = "Percent Assigned") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_fill_brewer(palette = "Set1")
+}
+
+# Choose which taxonomic classification methods to use
+# Set to TRUE/FALSE to enable/disable methods
+taxonomy_methods <- list(
+  SILVA_DADA2 = TRUE,      # DADA2's implementation with SILVA database
+  IDTAXA_SILVA = TRUE,     # IDTAXA classifier with SILVA
+  RDP_DADA2 = FALSE        # DADA2's implementation with RDP database
 )
 
-kable(taxa_summary, caption = "Taxonomic Assignment Summary")
+# Storage for taxonomy results
+taxa_results <- list()
+```
 
-# Create a bar plot of taxonomic assignment success
-taxa_plot <- ggplot(taxa_summary, aes(x = TaxonomicLevel, y = PercentAssigned)) +
-  geom_bar(stat = "identity", fill = "steelblue") +
-  geom_text(aes(label = paste0(PercentAssigned, "%")), vjust = -0.3) +
-  theme_minimal() +
-  labs(title = "Percentage of ASVs with Taxonomic Assignment",
-       x = "Taxonomic Level",
-       y = "Percent Assigned")
+```{r silva-taxonomy}
+# DADA2 with SILVA database (default method)
+if (taxonomy_methods$SILVA_DADA2) {
+  cat("\n=== Method 1: DADA2 with SILVA database ===\n")
+  
+  # Download/locate SILVA database
+  silva_files <- download_ref_db("SILVA")
+  
+  # Assign taxonomy at the genus level
+  cat("Assigning taxonomy using Silva database...\n")
+  taxa_silva <- assignTaxonomy(seqtab.nochim, silva_files$train, multithread=TRUE)
+  
+  # Add species-level assignments
+  cat("Adding species-level assignments...\n")
+  taxa_silva <- addSpecies(taxa_silva, silva_files$species)
+  
+  # View taxonomic assignments
+  cat("First few taxonomic assignments:\n")
+  print(head(taxa_silva))
+  
+  # Save to results list
+  taxa_results$SILVA_DADA2 <- taxa_silva
+  
+  # Create a taxonomy summary for SILVA
+  silva_summary <- data.frame(
+    TaxonomicLevel = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
+    AssignmentCount = c(
+      sum(!is.na(taxa_silva[, "Kingdom"])),
+      sum(!is.na(taxa_silva[, "Phylum"])),
+      sum(!is.na(taxa_silva[, "Class"])),
+      sum(!is.na(taxa_silva[, "Order"])),
+      sum(!is.na(taxa_silva[, "Family"])),
+      sum(!is.na(taxa_silva[, "Genus"])),
+      sum(!is.na(taxa_silva[, "Species"]))
+    ),
+    PercentAssigned = c(
+      round(sum(!is.na(taxa_silva[, "Kingdom"])) / nrow(taxa_silva) * 100, 1),
+      round(sum(!is.na(taxa_silva[, "Phylum"])) / nrow(taxa_silva) * 100, 1),
+      round(sum(!is.na(taxa_silva[, "Class"])) / nrow(taxa_silva) * 100, 1),
+      round(sum(!is.na(taxa_silva[, "Order"])) / nrow(taxa_silva) * 100, 1),
+      round(sum(!is.na(taxa_silva[, "Family"])) / nrow(taxa_silva) * 100, 1),
+      round(sum(!is.na(taxa_silva[, "Genus"])) / nrow(taxa_silva) * 100, 1),
+      round(sum(!is.na(taxa_silva[, "Species"])) / nrow(taxa_silva) * 100, 1)
+    )
+  )
+  
+  # Display SILVA summary table
+  kable(silva_summary, caption = "SILVA Taxonomic Assignment Summary")
+  
+  # Create a bar plot for SILVA results
+  # Order the data by percent assigned (descending)
+  silva_summary$TaxonomicLevel <- factor(silva_summary$TaxonomicLevel, 
+                                      levels = silva_summary$TaxonomicLevel[order(silva_summary$PercentAssigned, decreasing = TRUE)])
+  
+  # Create the plot
+  silva_plot <- ggplot(silva_summary, aes(x = TaxonomicLevel, y = PercentAssigned)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    geom_text(aes(label = paste0(PercentAssigned, "%")), vjust = -0.3) +
+    theme_minimal() +
+    labs(title = "SILVA: Percentage of ASVs with Taxonomic Assignment",
+         x = "Taxonomic Level",
+         y = "Percent Assigned") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_y_continuous(limits = c(0, max(silva_summary$PercentAssigned) * 1.1))
+  
+  print(silva_plot)
+}
+```
 
-print(taxa_plot)
+```{r idtaxa-taxonomy}
+# IDTAXA with SILVA database
+if (taxonomy_methods$IDTAXA_SILVA) {
+  cat("\n=== Method 2: IDTAXA with SILVA database ===\n")
+  
+  # Download/locate SILVA database for IDTAXA
+  idtaxa_files <- download_ref_db("IDTAXA_SILVA")
+  
+  # Load the training set
+  cat("Loading IDTAXA training set...\n")
+  load(idtaxa_files$train)
+  
+  # Convert ASV sequences to DNAStringSet
+  dna_seqs <- Biostrings::DNAStringSet(getSequences(seqtab.nochim))
+  names(dna_seqs) <- paste0("ASV", seq_along(dna_seqs))
+  
+  # Run IDTAXA classification
+  cat("Running IDTAXA classification...\n")
+  ids <- DECIPHER::IdTaxa(dna_seqs, trainingSet, strand = "both", 
+                        processors = NULL, threshold = 50)
+  
+  # Function to convert IDTAXA results to a taxonomy table similar to DADA2's format
+  convert_idtaxa_to_table <- function(ids) {
+    # Get all possible ranks
+    all_ranks <- unique(unlist(lapply(ids, function(x) names(x$taxon))))
+    
+    # Convert to data frame
+    taxa_df <- data.frame(matrix(NA, nrow = length(ids), ncol = length(all_ranks)))
+    colnames(taxa_df) <- all_ranks
+    rownames(taxa_df) <- names(ids)
+    
+    # Fill in the data frame
+    for (i in seq_along(ids)) {
+      id <- ids[[i]]
+      for (rank in names(id$taxon)) {
+        if (id$confidence[rank] >= 50) {  # Only keep assignments with ≥50% confidence
+          taxa_df[i, rank] <- id$taxon[rank]
+        }
+      }
+    }
+    
+    return(taxa_df)
+  }
+  
+  # Convert IDTAXA results to taxonomy table
+  taxa_idtaxa <- convert_idtaxa_to_table(ids)
+  
+  # Standardize taxonomy columns
+  taxa_idtaxa <- standardize_taxonomy(taxa_idtaxa, "IDTAXA")
+  
+  # View IDTAXA taxonomic assignments
+  cat("First few IDTAXA taxonomic assignments:\n")
+  print(head(taxa_idtaxa))
+  
+  # Save to results list
+  taxa_results$IDTAXA_SILVA <- taxa_idtaxa
+  
+  # Create a taxonomy summary for IDTAXA
+  idtaxa_summary <- data.frame(
+    TaxonomicLevel = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
+    AssignmentCount = c(
+      sum(!is.na(taxa_idtaxa[, "Kingdom"])),
+      sum(!is.na(taxa_idtaxa[, "Phylum"])),
+      sum(!is.na(taxa_idtaxa[, "Class"])),
+      sum(!is.na(taxa_idtaxa[, "Order"])),
+      sum(!is.na(taxa_idtaxa[, "Family"])),
+      sum(!is.na(taxa_idtaxa[, "Genus"])),
+      sum(!is.na(taxa_idtaxa[, "Species"]))
+    ),
+    PercentAssigned = c(
+      round(sum(!is.na(taxa_idtaxa[, "Kingdom"])) / nrow(taxa_idtaxa) * 100, 1),
+      round(sum(!is.na(taxa_idtaxa[, "Phylum"])) / nrow(taxa_idtaxa) * 100, 1),
+      round(sum(!is.na(taxa_idtaxa[, "Class"])) / nrow(taxa_idtaxa) * 100, 1),
+      round(sum(!is.na(taxa_idtaxa[, "Order"])) / nrow(taxa_idtaxa) * 100, 1),
+      round(sum(!is.na(taxa_idtaxa[, "Family"])) / nrow(taxa_idtaxa) * 100, 1),
+      round(sum(!is.na(taxa_idtaxa[, "Genus"])) / nrow(taxa_idtaxa) * 100, 1),
+      round(sum(!is.na(taxa_idtaxa[, "Species"])) / nrow(taxa_idtaxa) * 100, 1)
+    )
+  )
+  
+  # Display IDTAXA summary table
+  kable(idtaxa_summary, caption = "IDTAXA Taxonomic Assignment Summary")
+  
+  # Create a bar plot for IDTAXA results
+  idtaxa_summary$TaxonomicLevel <- factor(idtaxa_summary$TaxonomicLevel, 
+                                       levels = idtaxa_summary$TaxonomicLevel[order(idtaxa_summary$PercentAssigned, decreasing = TRUE)])
+  
+  idtaxa_plot <- ggplot(idtaxa_summary, aes(x = TaxonomicLevel, y = PercentAssigned)) +
+    geom_bar(stat = "identity", fill = "forestgreen") +
+    geom_text(aes(label = paste0(PercentAssigned, "%")), vjust = -0.3) +
+    theme_minimal() +
+    labs(title = "IDTAXA: Percentage of ASVs with Taxonomic Assignment",
+         x = "Taxonomic Level",
+         y = "Percent Assigned") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_y_continuous(limits = c(0, max(idtaxa_summary$PercentAssigned) * 1.1))
+  
+  print(idtaxa_plot)
+}
+```
+
+```{r rdp-taxonomy, eval=taxonomy_methods$RDP_DADA2}
+# DADA2 with RDP database (optional method)
+if (taxonomy_methods$RDP_DADA2) {
+  cat("\n=== Method 3: DADA2 with RDP database ===\n")
+  
+  # Download/locate RDP database
+  rdp_files <- download_ref_db("RDP")
+  
+  # Assign taxonomy with RDP
+  cat("Assigning taxonomy using RDP database...\n")
+  taxa_rdp <- assignTaxonomy(seqtab.nochim, rdp_files$train, multithread=TRUE)
+  
+  # Add species-level assignments
+  cat("Adding species-level assignments...\n")
+  taxa_rdp <- addSpecies(taxa_rdp, rdp_files$species)
+  
+  # View RDP taxonomic assignments
+  cat("First few RDP taxonomic assignments:\n")
+  print(head(taxa_rdp))
+  
+  # Save to results list
+  taxa_results$RDP_DADA2 <- taxa_rdp
+  
+  # Create a taxonomy summary for RDP
+  rdp_summary <- data.frame(
+    TaxonomicLevel = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
+    AssignmentCount = c(
+      sum(!is.na(taxa_rdp[, "Kingdom"])),
+      sum(!is.na(taxa_rdp[, "Phylum"])),
+      sum(!is.na(taxa_rdp[, "Class"])),
+      sum(!is.na(taxa_rdp[, "Order"])),
+      sum(!is.na(taxa_rdp[, "Family"])),
+      sum(!is.na(taxa_rdp[, "Genus"])),
+      sum(!is.na(taxa_rdp[, "Species"]))
+    ),
+    PercentAssigned = c(
+      round(sum(!is.na(taxa_rdp[, "Kingdom"])) / nrow(taxa_rdp) * 100, 1),
+      round(sum(!is.na(taxa_rdp[, "Phylum"])) / nrow(taxa_rdp) * 100, 1),
+      round(sum(!is.na(taxa_rdp[, "Class"])) / nrow(taxa_rdp) * 100, 1),
+      round(sum(!is.na(taxa_rdp[, "Order"])) / nrow(taxa_rdp) * 100, 1),
+      round(sum(!is.na(taxa_rdp[, "Family"])) / nrow(taxa_rdp) * 100, 1),
+      round(sum(!is.na(taxa_rdp[, "Genus"])) / nrow(taxa_rdp) * 100, 1),
+      round(sum(!is.na(taxa_rdp[, "Species"])) / nrow(taxa_rdp) * 100, 1)
+    )
+  )
+  
+  # Display RDP summary table
+  kable(rdp_summary, caption = "RDP Taxonomic Assignment Summary")
+}
+```
+
+```{r taxonomy-comparison}
+# Compare taxonomy assignments from different methods
+if (length(taxa_results) > 1) {
+  cat("\n=== Comparing Taxonomy Assignments Across Methods ===\n")
+  
+  # Create taxonomy assignment summary across methods
+  taxonomy_summary <- summarize_taxonomy(taxa_results)
+  
+  # Display taxonomy comparison table
+  kable(taxonomy_summary, caption = "Taxonomic Assignment Comparison Across Methods")
+  
+  # Create a comparative visualization
+  comparison_plot <- plot_taxonomy_comparison(taxonomy_summary)
+  print(comparison_plot)
+  
+  # Create a consensus taxonomy
+  cat("\nCreating consensus taxonomy from all methods...\n")
+  
+  # Function to create consensus taxonomy
+  create_consensus_taxonomy <- function(taxa_list, min_methods = 2) {
+    # Get all ASV identifiers
+    all_asvs <- rownames(taxa_list[[1]])
+    
+    # Initialize consensus taxonomy matrix
+    consensus <- matrix(NA, nrow = length(all_asvs), ncol = 7)
+    colnames(consensus) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+    rownames(consensus) <- all_asvs
+    
+    # For each taxonomic level and ASV
+    for (level in colnames(consensus)) {
+      for (asv in all_asvs) {
+        # Collect assignments from all methods
+        assignments <- sapply(taxa_list, function(x) x[asv, level])
+        
+        # Remove NAs
+        assignments <- assignments[!is.na(assignments)]
+        
+        # If we have enough assignments, find the most common one
+        if (length(assignments) >= min_methods) {
+          # Count occurrences of each assignment
+          counts <- table(assignments)
+          
+          # Get the most common assignment
+          most_common <- names(counts)[which.max(counts)]
+          
+          # Only use it if it appears in at least min_methods
+          if (counts[most_common] >= min_methods) {
+            consensus[asv, level] <- most_common
+          }
+        }
+      }
+    }
+    
+    return(as.data.frame(consensus))
+  }
+  
+  # Create consensus taxonomy
+  min_methods <- min(2, length(taxa_results))  # At least 2 methods must agree, or all if fewer than 2
+  taxa_consensus <- create_consensus_taxonomy(taxa_results, min_methods)
+  
+  # Summarize consensus taxonomy
+  consensus_summary <- data.frame(
+    TaxonomicLevel = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
+    AssignmentCount = c(
+      sum(!is.na(taxa_consensus[, "Kingdom"])),
+      sum(!is.na(taxa_consensus[, "Phylum"])),
+      sum(!is.na(taxa_consensus[, "Class"])),
+      sum(!is.na(taxa_consensus[, "Order"])),
+      sum(!is.na(taxa_consensus[, "Family"])),
+      sum(!is.na(taxa_consensus[, "Genus"])),
+      sum(!is.na(taxa_consensus[, "Species"]))
+    ),
+    PercentAssigned = c(
+      round(sum(!is.na(taxa_consensus[, "Kingdom"])) / nrow(taxa_consensus) * 100, 1),
+      round(sum(!is.na(taxa_consensus[, "Phylum"])) / nrow(taxa_consensus) * 100, 1),
+      round(sum(!is.na(taxa_consensus[, "Class"])) / nrow(taxa_consensus) * 100, 1),
+      round(sum(!is.na(taxa_consensus[, "Order"])) / nrow(taxa_consensus) * 100, 1),
+      round(sum(!is.na(taxa_consensus[, "Family"])) / nrow(taxa_consensus) * 100, 1),
+      round(sum(!is.na(taxa_consensus[, "Genus"])) / nrow(taxa_consensus) * 100, 1),
+      round(sum(!is.na(taxa_consensus[, "Species"])) / nrow(taxa_consensus) * 100, 1)
+    )
+  )
+  
+  # Display consensus summary table
+  kable(consensus_summary, caption = paste0("Consensus Taxonomy (Minimum ", min_methods, " Methods Agreement)"))
+  
+  # Create a bar plot for consensus results
+  consensus_summary$TaxonomicLevel <- factor(consensus_summary$TaxonomicLevel, 
+                                          levels = consensus_summary$TaxonomicLevel[order(consensus_summary$PercentAssigned, decreasing = TRUE)])
+  
+  consensus_plot <- ggplot(consensus_summary, aes(x = TaxonomicLevel, y = PercentAssigned)) +
+    geom_bar(stat = "identity", fill = "purple") +
+    geom_text(aes(label = paste0(PercentAssigned, "%")), vjust = -0.3) +
+    theme_minimal() +
+    labs(title = "Consensus: Percentage of ASVs with Taxonomic Assignment",
+         subtitle = paste0("Minimum ", min_methods, " methods must agree"),
+         x = "Taxonomic Level",
+         y = "Percent Assigned") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_y_continuous(limits = c(0, max(consensus_summary$PercentAssigned) * 1.1))
+  
+  print(consensus_plot)
+  
+  # Use the consensus taxonomy as the final result if it exists
+  if (nrow(taxa_consensus) > 0) {
+    taxa <- as.matrix(taxa_consensus)
+    cat("Using consensus taxonomy for final results\n")
+  } else {
+    # Use the first method as backup
+    taxa <- taxa_results[[1]]
+    cat("Using", names(taxa_results)[1], "for final results (consensus not available)\n")
+  }
+} else if (length(taxa_results) == 1) {
+  # If only one method was used, use its results
+  taxa <- taxa_results[[1]]
+  cat("Using", names(taxa_results)[1], "for final results\n")
+} else {
+  # Error if no taxonomy method was successful
+  stop("No taxonomy assignment method was successful!")
+}
+
+# Save all taxonomy results
+if(!dir.exists("results")) dir.create("results")
+saveRDS(taxa_results, "results/all_taxonomy_results.rds")
+cat("Saved all taxonomy results to results/all_taxonomy_results.rds\n")
+
+# Save the final consensus taxonomy as CSV
+write.csv(taxa, "results/taxonomy.csv")
+cat("Saved final taxonomy to results/taxonomy.csv\n")
 ```
 
 # Create Phyloseq Object
