@@ -15,6 +15,10 @@ show_usage <- function() {
   cat("  --format FORMAT             Report format: html, pdf_document, word_document (default: html)\n")
   cat("  --output-dir DIR            Directory for report output (default: reports)\n")
   cat("  --output-file FILENAME      Base filename for report (default: dada2_workflow_report)\n")
+  cat("\nMulti-Run Analysis Options:\n")
+  cat("  --multi-run                 Enable multi-run analysis in the report/dashboard\n")
+  cat("  --run-pattern PATTERN       Pattern to extract run IDs from sample names (regex)\n")
+  cat("  --run-column COLUMN         Column in sample metadata containing run information\n")
   cat("\nPerformance Options:\n")
   cat("  --optimize                  Enable all performance optimizations\n")
   cat("  --low-memory                Enable memory-saving mode for large datasets\n")
@@ -25,6 +29,7 @@ show_usage <- function() {
   cat("\nExample:\n")
   cat("  Rscript run_dashboard.R --optimize --cores 4\n")
   cat("  Rscript run_dashboard.R --generate-report --format pdf_document\n")
+  cat("  Rscript run_dashboard.R --multi-run --run-pattern \"run\\d+\"\n")
 }
 
 # Check for help request
@@ -50,6 +55,23 @@ if (!is.na(cores_idx) && cores_idx < length(args)) {
 cache_size_idx <- match("--cache-size", args)
 if (!is.na(cache_size_idx) && cache_size_idx < length(args)) {
   performance_options$cache_size <- as.integer(args[cache_size_idx + 1])
+}
+
+# Parse multi-run options
+multi_run_options <- list(
+  multi_run = "--multi-run" %in% args
+)
+
+# Parse run pattern option
+run_pattern_idx <- match("--run-pattern", args)
+if (!is.na(run_pattern_idx) && run_pattern_idx < length(args)) {
+  multi_run_options$run_pattern <- args[run_pattern_idx + 1]
+}
+
+# Parse run column option
+run_column_idx <- match("--run-column", args)
+if (!is.na(run_column_idx) && run_column_idx < length(args)) {
+  multi_run_options$run_column <- args[run_column_idx + 1]
 }
 
 # Check if report generation was requested
@@ -104,7 +126,8 @@ if ("--generate-report" %in% args) {
         output_format = output_format,
         output_dir = output_dir,
         output_file = output_file,
-        performance_options = performance_options
+        performance_options = performance_options,
+        multi_run_options = multi_run_options
       )
     )
     
@@ -123,7 +146,14 @@ required_packages <- c(
   "tidyverse",      # Collection of packages for data manipulation and visualization
   "vegan",          # Community ecology package for diversity analysis
   "ggplot2",        # Data visualization package for creating graphics
-  "viridis"         # Colorblind-friendly color palettes for visualizations
+  "viridis",        # Colorblind-friendly color palettes for visualizations
+  "d3Tree",         # For interactive taxonomic tree visualizations
+  "UpSetR",         # For visualizing set intersections (ASV overlaps between runs)
+  "reshape2",       # For reshaping data (wide to long format)
+  "ape",            # For phylogenetic analysis
+  "future",         # For parallel processing
+  "promises",       # For async operations
+  "memoise"         # For caching expensive operations
 )
 
 new_packages <- required_packages[!sapply(required_packages, requireNamespace, quietly = TRUE)]
@@ -366,15 +396,41 @@ setup_dashboard_environment <- function(performance_options) {
     cat("Cache: Enabled with default settings\n")
   }
   
+  # Log multi-run status
+  if (multi_run_options$multi_run) {
+    cat("Multi-run analysis mode: ENABLED\n")
+    if (!is.null(multi_run_options$run_pattern)) {
+      cat("Run pattern:", multi_run_options$run_pattern, "\n")
+    }
+    if (!is.null(multi_run_options$run_column)) {
+      cat("Run column:", multi_run_options$run_column, "\n")
+    }
+  } else {
+    cat("Multi-run analysis mode: Auto-detect\n")
+  }
+
   # Display final instructions
   cat("\nPress Escape or Ctrl+C in the terminal to stop the dashboard\n\n")
 }
 
 # Create demo data if needed
-create_demo_data <- function(low_memory = FALSE) {
+create_demo_data <- function(low_memory = FALSE, multi_run = FALSE) {
   if (!file.exists("results/phyloseq_object.rds")) {
     cat("No results found. Creating sample data for demonstration...\n")
     
+    # Check if we should use multi-run demo data
+    if (multi_run || multi_run_options$multi_run) {
+      # Try to use our multi-run demo data script
+      if (file.exists("create_demo_data.R")) {
+        cat("Creating multi-run demo data...\n")
+        # Source the multi-run demo data script
+        source("create_demo_data.R")
+        create_multi_run_demo_data()
+        return()
+      }
+    }
+    
+    # Fallback to simple demo data if multi-run not requested or script not found
     # Try loading necessary packages
     if (requireNamespace("phyloseq", quietly = TRUE)) {
       # Create a simple demonstration phyloseq object
@@ -455,12 +511,24 @@ create_demo_data <- function(low_memory = FALSE) {
 setup_dashboard_environment(performance_options)
 
 # Create demo data if needed
-create_demo_data(low_memory = performance_options$low_memory)
+create_demo_data(low_memory = performance_options$low_memory, multi_run = multi_run_options$multi_run)
 
 # Export performance options as environment variables for dashboard.R
 for (name in names(performance_options)) {
   if (!is.null(performance_options[[name]])) {
     value <- performance_options[[name]]
+    # Convert logical to string for environment variables
+    if (is.logical(value)) {
+      value <- ifelse(value, "TRUE", "FALSE")
+    }
+    Sys.setenv(paste0("DADA2_", toupper(name)) = value)
+  }
+}
+
+# Export multi-run options as environment variables for dashboard.R
+for (name in names(multi_run_options)) {
+  if (!is.null(multi_run_options[[name]])) {
+    value <- multi_run_options[[name]]
     # Convert logical to string for environment variables
     if (is.logical(value)) {
       value <- ifelse(value, "TRUE", "FALSE")
@@ -501,6 +569,8 @@ tryCatch({
           shiny::verbatimTextOutput("error_message"),
           shiny::h4("System Information:"),
           shiny::verbatimTextOutput("system_info"),
+          shiny::h4("Multi-Run Options:"),
+          shiny::verbatimTextOutput("multi_run_options"),
           shiny::h4("Data Files Available:"),
           shiny::verbatimTextOutput("available_files")
         )
@@ -513,6 +583,17 @@ tryCatch({
           paste("R Version:", R.version.string, "\n",
                 "Memory Limit:", utils::memory.limit(), "MB\n",
                 "Available Cores:", parallel::detectCores())
+        })
+        output$multi_run_options <- shiny::renderText({
+          if (length(multi_run_options) == 0) {
+            "No multi-run options specified"
+          } else {
+            paste0(
+              "Multi-run enabled: ", multi_run_options$multi_run, "\n",
+              "Run pattern: ", if(is.null(multi_run_options$run_pattern)) "Not specified" else multi_run_options$run_pattern, "\n",
+              "Run column: ", if(is.null(multi_run_options$run_column)) "Not specified" else multi_run_options$run_column
+            )
+          }
         })
         output$available_files <- shiny::renderText({
           files <- list.files("results", full.names = TRUE)

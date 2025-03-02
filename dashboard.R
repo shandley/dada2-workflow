@@ -39,6 +39,26 @@ if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
 # Cache expensive operations
 get_cached <- memoise::memoise
 
+# Get multi-run options from environment variables
+multi_run_options <- list(
+  multi_run = as.logical(Sys.getenv("DADA2_MULTI_RUN", "FALSE")),
+  run_pattern = Sys.getenv("DADA2_RUN_PATTERN", ""),
+  run_column = Sys.getenv("DADA2_RUN_COLUMN", "")
+)
+
+# Only keep non-empty values
+if (multi_run_options$run_pattern == "") multi_run_options$run_pattern <- NULL
+if (multi_run_options$run_column == "") multi_run_options$run_column <- NULL
+
+# Auto-detection of multi-run status if not explicitly specified
+if (!multi_run_options$multi_run) {
+  # Check if we can infer multi-run from sample names or metadata
+  auto_detect_multi_run <- FALSE
+  
+  # Will be set to TRUE if we find evidence of multiple runs
+  # This happens in the phyloseq_obj reactive function
+}
+
 # UI
 ui <- dashboardPage(
   dashboardHeader(title = "DADA2 Results Dashboard"),
@@ -49,6 +69,7 @@ ui <- dashboardPage(
       menuItem("Sample Quality", tabName = "quality", icon = icon("chart-line")),
       menuItem("Alpha Diversity", tabName = "alpha", icon = icon("chart-bar")),
       menuItem("Beta Diversity", tabName = "beta", icon = icon("project-diagram")),
+      menuItem("Multi-Run Analysis", tabName = "multirun", icon = icon("layer-group")),
       menuItem("Rarefaction", tabName = "rarefaction", icon = icon("area-chart")),
       menuItem("Taxonomy", tabName = "taxonomy", icon = icon("sitemap")),
       menuItem("Taxonomic Tree", tabName = "taxtree", icon = icon("tree")),
@@ -60,7 +81,7 @@ ui <- dashboardPage(
     
     # Filtering controls
     conditionalPanel(
-      condition = "input.tab == 'alpha' || input.tab == 'beta' || input.tab == 'taxonomy' || input.tab == 'rarefaction' || input.tab == 'taxtree' || input.tab == 'asv'",
+      condition = "input.tab == 'alpha' || input.tab == 'beta' || input.tab == 'taxonomy' || input.tab == 'rarefaction' || input.tab == 'taxtree' || input.tab == 'asv' || input.tab == 'multirun'",
       sliderInput("minReads", "Minimum Read Depth:", 
                   min = 1, max = 10000, value = 1000),
       sliderInput("prevalence", "ASV Prevalence (%):", 
@@ -310,6 +331,196 @@ ui <- dashboardPage(
               )
       ),
       
+      # Multi-Run Analysis tab
+      tabItem(tabName = "multirun",
+              fluidRow(
+                box(width = 12, title = "Multi-Run Analysis", status = "primary",
+                    "This tab provides tools for analyzing batch effects and comparing results across multiple sequencing runs.")
+              ),
+              
+              fluidRow(
+                box(width = 6, title = "Run Detection", status = "info",
+                    selectInput("runIdentifier", "Run identification method:",
+                               choices = c("Auto-detect from sample names" = "auto", 
+                                          "Use sample metadata column" = "metadata"),
+                               selected = "auto"),
+                    conditionalPanel(
+                      condition = "input.runIdentifier == 'metadata'",
+                      selectInput("runColumn", "Select run column from metadata:", choices = c("Auto-detect" = "auto"))
+                    ),
+                    conditionalPanel(
+                      condition = "input.runIdentifier == 'auto'",
+                      textInput("runPattern", "Run ID pattern in sample names (regex):", value = "run\\d+|R\\d+|Run\\d+|batch\\d+|Batch\\d+")
+                    ),
+                    actionButton("detectRuns", "Detect Runs", icon = icon("search")),
+                    hr(),
+                    h4("Detected Runs:"),
+                    verbatimTextOutput("detectedRuns")
+                ),
+                
+                box(width = 6, title = "Run Quality Metrics", status = "info",
+                    plotlyOutput("runQualityMetrics")
+                )
+              ),
+              
+              fluidRow(
+                tabBox(width = 12, 
+                       tabPanel("Run Comparison",
+                                fluidRow(
+                                  column(3,
+                                         selectInput("runCompareMethod", "Comparison Method:", 
+                                                    choices = c("PCoA" = "pcoa", 
+                                                               "NMDS" = "nmds", 
+                                                               "t-SNE" = "tsne"),
+                                                    selected = "pcoa")
+                                  ),
+                                  column(3,
+                                         selectInput("runDistMethod", "Distance Metric:", 
+                                                    choices = c("Bray-Curtis" = "bray", 
+                                                               "Jaccard" = "jaccard", 
+                                                               "UniFrac" = "unifrac", 
+                                                               "Weighted UniFrac" = "wunifrac"),
+                                                    selected = "bray")
+                                  ),
+                                  column(3,
+                                         selectInput("runColorBy", "Color by:", 
+                                                    choices = c("Run" = "run", 
+                                                               "Sample Metadata" = "metadata"),
+                                                    selected = "run")
+                                  ),
+                                  column(3,
+                                         conditionalPanel(
+                                           condition = "input.runColorBy == 'metadata'",
+                                           selectInput("runColorMetadata", "Select metadata column:",
+                                                      choices = c("Auto-detect" = "auto"))
+                                         )
+                                  )
+                                ),
+                                plotlyOutput("runBetaDiversity", height = "500px")
+                       ),
+                       
+                       tabPanel("ASV Overlap",
+                                fluidRow(
+                                  column(4,
+                                         selectInput("asvOverlapMethod", "Visualization Method:", 
+                                                    choices = c("UpSet Plot" = "upset",
+                                                               "Venn Diagram (up to 5 runs)" = "venn",
+                                                               "Presence/Absence Heatmap" = "heatmap"),
+                                                    selected = "upset")
+                                  ),
+                                  column(4,
+                                         checkboxInput("showPrevalentASVsOnly", "Show only prevalent ASVs", value = TRUE),
+                                         conditionalPanel(
+                                           condition = "input.showPrevalentASVsOnly == true",
+                                           sliderInput("asvPrevalenceThreshold", "Minimum prevalence (% of samples):",
+                                                      min = 0, max = 100, value = 10)
+                                         )
+                                  ),
+                                  column(4,
+                                         checkboxInput("filterRunsForOverlap", "Filter specific runs", value = FALSE),
+                                         conditionalPanel(
+                                           condition = "input.filterRunsForOverlap == true",
+                                           uiOutput("runSelectionCheckboxes")
+                                         )
+                                  )
+                                ),
+                                plotOutput("asvOverlapPlot", height = "500px")
+                       ),
+                       
+                       tabPanel("Taxonomy by Run",
+                                fluidRow(
+                                  column(3,
+                                         selectInput("taxRunLevel", "Taxonomic Level:", 
+                                                    choices = c("Phylum", "Class", "Order", "Family", "Genus"),
+                                                    selected = "Phylum")
+                                  ),
+                                  column(3,
+                                         selectInput("taxRunVizType", "Visualization Type:", 
+                                                    choices = c("Stacked Bar" = "bar", 
+                                                               "Heatmap" = "heatmap", 
+                                                               "PCoA" = "pcoa"),
+                                                    selected = "bar")
+                                  ),
+                                  column(3,
+                                         sliderInput("taxRunTopN", "Top N Taxa:", 
+                                                    min = 5, max = 30, value = 10)
+                                  ),
+                                  column(3,
+                                         conditionalPanel(
+                                           condition = "input.taxRunVizType == 'heatmap' || input.taxRunVizType == 'pcoa'",
+                                           selectInput("taxRunClusterMethod", "Clustering Method:",
+                                                      choices = c("None" = "none", 
+                                                                 "Ward.D2" = "ward.D2", 
+                                                                 "Complete" = "complete", 
+                                                                 "Average" = "average"),
+                                                      selected = "ward.D2")
+                                         )
+                                  )
+                                ),
+                                plotlyOutput("taxonomyRunPlot", height = "500px")
+                       ),
+                       
+                       tabPanel("Run Batch Effects",
+                                fluidRow(
+                                  column(3,
+                                         selectInput("batchEffectMethod", "Analysis Method:", 
+                                                    choices = c("Beta Dispersion" = "betadisper",
+                                                               "PERMANOVA" = "adonis",
+                                                               "Run vs. Sample Type" = "interaction"),
+                                                    selected = "betadisper")
+                                  ),
+                                  column(3,
+                                         conditionalPanel(
+                                           condition = "input.batchEffectMethod == 'interaction'",
+                                           selectInput("interactionFactor", "Sample Type Factor:",
+                                                      choices = c("Auto-detect" = "auto"))
+                                         )
+                                  ),
+                                  column(3,
+                                         selectInput("batchDistMethod", "Distance Metric:", 
+                                                    choices = c("Bray-Curtis" = "bray", 
+                                                               "Jaccard" = "jaccard"),
+                                                    selected = "bray")
+                                  ),
+                                  column(3,
+                                         actionButton("runBatchTest", "Run Analysis", icon = icon("calculator"))
+                                  )
+                                ),
+                                hr(),
+                                h4("Batch Effect Test Results:"),
+                                verbatimTextOutput("batchTestResults"),
+                                plotlyOutput("batchEffectPlot", height = "400px")
+                       ),
+                       
+                       tabPanel("Run Normalization Options",
+                                fluidRow(
+                                  column(4,
+                                         selectInput("runNormMethod", "Normalization Method:", 
+                                                    choices = c("None" = "none",
+                                                               "Relative Abundance" = "relative",
+                                                               "CSS (cumulative sum scaling)" = "css",
+                                                               "RLE (DESeq2)" = "rle",
+                                                               "TMM (edgeR)" = "tmm"),
+                                                    selected = "relative")
+                                  ),
+                                  column(4,
+                                         checkboxInput("applyRunNormalization", "Apply normalization to all analyses", value = FALSE)
+                                  ),
+                                  column(4,
+                                         conditionalPanel(
+                                           condition = "input.runNormMethod != 'none' && input.runNormMethod != 'relative'",
+                                           actionButton("computeNormalization", "Compute Normalization", icon = icon("sync"))
+                                         )
+                                  )
+                                ),
+                                hr(),
+                                plotlyOutput("normalizationComparisonPlot", height = "400px"),
+                                verbatimTextOutput("normalizationSummary")
+                       )
+                )
+              )
+      ),
+      
       # Export Data tab
       tabItem(tabName = "export",
               fluidRow(
@@ -421,6 +632,57 @@ server <- function(input, output, session) {
         # Cache is valid - load it
         withProgress(message = 'Loading cached phyloseq object...', value = 0.5, {
           ps_cached <- readRDS(ps_cache_path)
+          
+          # Auto-detect multi-run if not specified
+          if (!multi_run_options$multi_run && exists("auto_detect_multi_run")) {
+            # Check sample names for run patterns
+            sample_names <- sample_names(ps_cached)
+            
+            # Look for common run patterns in sample names
+            run_patterns <- c("run\\d+", "batch\\d+", "seq\\d+", "lane\\d+", "flow\\d+")
+            
+            for (pattern in run_patterns) {
+              matches <- grep(pattern, sample_names, ignore.case = TRUE)
+              if (length(matches) > 0) {
+                # Found potential run indicators
+                run_ids <- regmatches(sample_names[matches], 
+                                     regexpr(pattern, sample_names[matches], ignore.case = TRUE))
+                
+                # If we have multiple distinct run IDs, enable multi-run mode
+                if (length(unique(run_ids)) > 1) {
+                  auto_detect_multi_run <<- TRUE
+                  cat("Auto-detected multiple runs in sample names!\n")
+                  cat("Enabling multi-run analysis mode.\n")
+                  break
+                }
+              }
+            }
+            
+            # Also check metadata if available
+            if (!auto_detect_multi_run) {
+              has_sample_data <- tryCatch({
+                !is.null(sample_data(ps_cached))
+              }, error = function(e) FALSE)
+              
+              if (has_sample_data) {
+                sample_df <- as.data.frame(sample_data(ps_cached))
+                
+                # Look for columns that might indicate runs
+                run_cols <- grep("run|batch|seq|lane|flow", 
+                                colnames(sample_df), ignore.case = TRUE, value = TRUE)
+                
+                for (col in run_cols) {
+                  if (length(unique(sample_df[[col]])) > 1) {
+                    auto_detect_multi_run <<- TRUE
+                    cat("Auto-detected multiple runs in sample metadata column:", col, "\n")
+                    cat("Enabling multi-run analysis mode.\n")
+                    break
+                  }
+                }
+              }
+            }
+          }
+          
           return(ps_cached)
         })
       }
@@ -492,6 +754,57 @@ server <- function(input, output, session) {
       if (!is.null(ps)) {
         incProgress(0.2, detail = "Caching for future use")
         saveRDS(ps, ps_cache_path)
+        
+        # Also do multi-run auto-detection here
+        if (!multi_run_options$multi_run && exists("auto_detect_multi_run")) {
+          # Similar code as above for the uncached path
+          # Check sample names for run patterns
+          sample_names <- sample_names(ps)
+          
+          # Look for common run patterns in sample names
+          run_patterns <- c("run\\d+", "batch\\d+", "seq\\d+", "lane\\d+", "flow\\d+")
+          
+          for (pattern in run_patterns) {
+            matches <- grep(pattern, sample_names, ignore.case = TRUE)
+            if (length(matches) > 0) {
+              # Found potential run indicators
+              run_ids <- regmatches(sample_names[matches], 
+                                   regexpr(pattern, sample_names[matches], ignore.case = TRUE))
+              
+              # If we have multiple distinct run IDs, enable multi-run mode
+              if (length(unique(run_ids)) > 1) {
+                auto_detect_multi_run <<- TRUE
+                cat("Auto-detected multiple runs in sample names!\n")
+                cat("Enabling multi-run analysis mode.\n")
+                break
+              }
+            }
+          }
+          
+          # Also check metadata if available
+          if (!auto_detect_multi_run) {
+            has_sample_data <- tryCatch({
+              !is.null(sample_data(ps))
+            }, error = function(e) FALSE)
+            
+            if (has_sample_data) {
+              sample_df <- as.data.frame(sample_data(ps))
+              
+              # Look for columns that might indicate runs
+              run_cols <- grep("run|batch|seq|lane|flow", 
+                              colnames(sample_df), ignore.case = TRUE, value = TRUE)
+              
+              for (col in run_cols) {
+                if (length(unique(sample_df[[col]])) > 1) {
+                  auto_detect_multi_run <<- TRUE
+                  cat("Auto-detected multiple runs in sample metadata column:", col, "\n")
+                  cat("Enabling multi-run analysis mode.\n")
+                  break
+                }
+              }
+            }
+          }
+        }
       }
       
       return(ps)
@@ -2984,6 +3297,1692 @@ server <- function(input, output, session) {
       }
     }
   )
+  
+  # ===== MULTI-RUN ANALYSIS FUNCTIONALITY =====
+  
+  # Reactive value to store detected runs
+  detected_runs <- reactiveVal(NULL)
+  run_assignments <- reactiveVal(NULL)
+  
+  # Reactive to detect run identifiers
+  detect_run_identifiers <- function() {
+    ps <- phyloseq_obj()
+    if (is.null(ps)) return(NULL)
+    
+    # Get sample names
+    sample_ids <- sample_names(ps)
+    run_ids <- NULL
+    
+    # Detection method based on user selection
+    if (input$runIdentifier == "auto") {
+      # Auto-detect based on sample name pattern
+      pattern <- input$runPattern
+      
+      # Extract run information from sample names
+      run_matches <- regmatches(sample_ids, regexpr(pattern, sample_ids, ignore.case = TRUE))
+      
+      # Count unique matches
+      unique_runs <- unique(run_matches[run_matches != ""])
+      
+      if (length(unique_runs) >= 2) {
+        # Create run mapping
+        run_ids <- rep(NA, length(sample_ids))
+        names(run_ids) <- sample_ids
+        
+        for (i in seq_along(sample_ids)) {
+          match <- regmatches(sample_ids[i], regexpr(pattern, sample_ids[i], ignore.case = TRUE))
+          if (length(match) > 0 && match != "") {
+            run_ids[i] <- match
+          }
+        }
+      }
+    } else if (input$runIdentifier == "metadata") {
+      # Use a metadata column
+      if (input$runColumn != "auto") {
+        # Check if we have sample data
+        has_sample_data <- !is.null(sample_data(ps))
+        
+        if (has_sample_data) {
+          # Extract sample data
+          sample_df <- as.data.frame(sample_data(ps))
+          
+          # Use the specified column
+          if (input$runColumn %in% colnames(sample_df)) {
+            run_col_values <- sample_df[[input$runColumn]]
+            names(run_col_values) <- rownames(sample_df)
+            
+            # Check if we have at least 2 different runs
+            if (length(unique(run_col_values)) >= 2) {
+              run_ids <- run_col_values
+            }
+          }
+        }
+      }
+    }
+    
+    return(run_ids)
+  }
+  
+  # Update run ID when the detect button is clicked
+  observeEvent(input$detectRuns, {
+    run_ids <- detect_run_identifiers()
+    detected_runs(run_ids)
+    
+    # If we have run IDs, create a mapping of samples to runs
+    if (!is.null(run_ids) && length(run_ids) > 0) {
+      # Create run assignments for samples
+      assignments <- data.frame(
+        Sample = names(run_ids),
+        Run = as.character(run_ids),
+        stringsAsFactors = FALSE
+      )
+      
+      # Remove rows with NA runs
+      assignments <- assignments[!is.na(assignments$Run), ]
+      
+      if (nrow(assignments) > 0) {
+        run_assignments(assignments)
+      }
+    }
+  })
+  
+  # Display detected runs
+  output$detectedRuns <- renderPrint({
+    runs <- detected_runs()
+    assignments <- run_assignments()
+    
+    if (is.null(runs) || length(runs) == 0) {
+      cat("No runs detected. Please adjust the run identification method and try again.\n")
+    } else {
+      unique_runs <- unique(runs[!is.na(runs)])
+      
+      cat("Detected", length(unique_runs), "runs:\n")
+      
+      # Count samples per run
+      run_counts <- table(runs)
+      for (run in unique_runs) {
+        cat("- ", run, ": ", run_counts[run], " samples\n", sep = "")
+      }
+      
+      # Report samples without run assignment
+      n_unassigned <- sum(is.na(runs))
+      if (n_unassigned > 0) {
+        cat("\n", n_unassigned, " samples could not be assigned to any run\n", sep = "")
+      }
+    }
+  })
+  
+  # Update metadata column selection based on available sample data
+  observe({
+    ps <- phyloseq_obj()
+    if (is.null(ps)) return()
+    
+    # Check if sample data exists
+    has_sample_data <- tryCatch({
+      !is.null(sample_data(ps))
+    }, error = function(e) FALSE)
+    
+    if (has_sample_data) {
+      # Extract sample data
+      sample_df <- as.data.frame(sample_data(ps))
+      
+      # Get column names for potential run identifiers
+      meta_cols <- colnames(sample_df)
+      
+      # Filter to columns that might contain run information
+      run_cols <- meta_cols[grepl("run|batch|seq|plate", meta_cols, ignore.case = TRUE)]
+      
+      if (length(run_cols) > 0) {
+        # Create choices with auto-detect first
+        choices <- c("Auto-detect" = "auto", setNames(run_cols, run_cols))
+        
+        # Update the run column selector
+        updateSelectInput(session, "runColumn", choices = choices)
+        
+        # Also update the metadata columns for coloring
+        updateSelectInput(session, "runColorMetadata", choices = c("Auto-detect" = "auto", setNames(meta_cols, meta_cols)))
+        
+        # Update interaction factor options
+        updateSelectInput(session, "interactionFactor", choices = c("Auto-detect" = "auto", setNames(meta_cols, meta_cols)))
+      }
+    }
+  })
+  
+  # Generate checkboxes for run selection dynamically
+  output$runSelectionCheckboxes <- renderUI({
+    runs <- detected_runs()
+    
+    if (!is.null(runs)) {
+      unique_runs <- unique(runs[!is.na(runs)])
+      
+      checkboxGroupInput("selectedRuns", "Select runs to include:",
+                        choices = setNames(unique_runs, unique_runs),
+                        selected = unique_runs)
+    } else {
+      helpText("No runs detected. Click 'Detect Runs' first.")
+    }
+  })
+  
+  # Run Quality Metrics plot
+  output$runQualityMetrics <- renderPlotly({
+    runs <- detected_runs()
+    assignments <- run_assignments()
+    
+    if (is.null(runs) || is.null(assignments) || nrow(assignments) == 0) {
+      # Return empty plot with message
+      return(plot_ly() %>% 
+              layout(title = "No run data available",
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = "Click 'Detect Runs' to identify sequencing runs", 
+                      showarrow = FALSE
+                    )))
+    }
+    
+    # Get phyloseq object
+    ps <- filtered_ps()
+    if (is.null(ps)) {
+      return(plot_ly() %>% 
+              layout(title = "No data available",
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = "Phyloseq object not loaded", 
+                      showarrow = FALSE
+                    )))
+    }
+    
+    # Calculate quality metrics per run
+    tryCatch({
+      # Get read counts for each sample
+      read_counts <- sample_sums(ps)
+      
+      # Get alpha diversity for each sample
+      alpha_div <- estimate_richness(ps, measures = c("Observed", "Shannon"))
+      
+      # Combine with run assignments
+      metrics_df <- data.frame(
+        Sample = sample_names(ps),
+        ReadCount = read_counts,
+        Observed = alpha_div$Observed,
+        Shannon = alpha_div$Shannon,
+        stringsAsFactors = FALSE
+      )
+      
+      # Merge with run assignments
+      metrics_df <- merge(metrics_df, assignments, by = "Sample", all.x = TRUE)
+      
+      # Replace NA runs with "Unassigned"
+      metrics_df$Run[is.na(metrics_df$Run)] <- "Unassigned"
+      
+      # Create long format for plotting
+      metrics_long <- reshape2::melt(metrics_df, 
+                                   id.vars = c("Sample", "Run"),
+                                   measure.vars = c("ReadCount", "Observed", "Shannon"),
+                                   variable.name = "Metric", 
+                                   value.name = "Value")
+      
+      # Create plot
+      p <- ggplot(metrics_long, aes(x = Run, y = Value, fill = Run)) +
+        geom_boxplot(outlier.shape = NA) +
+        geom_jitter(width = 0.2, alpha = 0.6, aes(text = Sample)) +
+        facet_wrap(~Metric, scales = "free_y") +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        labs(title = "Quality Metrics by Run") +
+        scale_fill_viridis_d()
+      
+      ggplotly(p, tooltip = c("text", "y"))
+    }, error = function(e) {
+      # Return error plot
+      return(plot_ly() %>% 
+              layout(title = "Error calculating run metrics",
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = paste("Error:", conditionMessage(e)), 
+                      showarrow = FALSE
+                    )))
+    })
+  })
+  
+  # Run Beta Diversity Comparison
+  output$runBetaDiversity <- renderPlotly({
+    runs <- detected_runs()
+    assignments <- run_assignments()
+    
+    if (is.null(runs) || is.null(assignments) || nrow(assignments) == 0) {
+      # Return empty plot with message
+      return(plot_ly() %>% 
+              layout(title = "No run data available",
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = "Click 'Detect Runs' to identify sequencing runs", 
+                      showarrow = FALSE
+                    )))
+    }
+    
+    # Get phyloseq object
+    ps <- filtered_ps()
+    if (is.null(ps)) {
+      return(plot_ly() %>% 
+              layout(title = "No data available",
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = "Phyloseq object not loaded", 
+                      showarrow = FALSE
+                    )))
+    }
+    
+    # Calculate ordination
+    tryCatch({
+      # Transform to relative abundance
+      ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+      
+      # Calculate distance matrix
+      dist_method <- input$runDistMethod
+      dist_matrix <- phyloseq::distance(ps_rel, method = dist_method)
+      
+      # Perform ordination
+      ord_method <- input$runCompareMethod
+      
+      if (ord_method == "pcoa") {
+        ord <- ordinate(ps_rel, method = "PCoA", distance = dist_matrix)
+        
+        # Get ordination coordinates
+        ord_data <- data.frame(ord$vectors[,1:2])
+        colnames(ord_data) <- c("Axis1", "Axis2")
+        var_explained <- round(ord$values$Relative_eig[1:2] * 100, 1)
+        axis_labels <- paste0("Axis ", 1:2, " (", var_explained, "%)")
+      } else if (ord_method == "nmds") {
+        ord <- ordinate(ps_rel, method = "NMDS", distance = dist_matrix)
+        ord_data <- data.frame(scores(ord)[,1:2])
+        colnames(ord_data) <- c("Axis1", "Axis2")
+        axis_labels <- c("NMDS1", "NMDS2")
+      } else if (ord_method == "tsne") {
+        # Try to use Rtsne package
+        if (!requireNamespace("Rtsne", quietly = TRUE)) {
+          return(plot_ly() %>% 
+                  layout(title = "Rtsne package not available",
+                        annotations = list(
+                          x = 0.5, y = 0.5, 
+                          text = "Please install Rtsne package: install.packages('Rtsne')", 
+                          showarrow = FALSE
+                        )))
+        }
+        
+        # Convert distance matrix to Rtsne input format
+        dist_mat <- as.matrix(dist_matrix)
+        
+        # Run t-SNE
+        tsne_result <- Rtsne::Rtsne(dist_mat, is_distance = TRUE, perplexity = min(30, nrow(dist_mat) - 1))
+        
+        # Create data frame with the results
+        ord_data <- data.frame(
+          Axis1 = tsne_result$Y[,1],
+          Axis2 = tsne_result$Y[,2]
+        )
+        rownames(ord_data) <- rownames(dist_mat)
+        axis_labels <- c("t-SNE 1", "t-SNE 2")
+      }
+      
+      # Add sample names
+      ord_data$Sample <- rownames(ord_data)
+      
+      # Merge with run assignments
+      ord_data <- merge(ord_data, assignments, by = "Sample", all.x = TRUE)
+      
+      # Replace NA runs with "Unassigned"
+      ord_data$Run[is.na(ord_data$Run)] <- "Unassigned"
+      
+      # Create hover text
+      ord_data$hover_text <- paste("Sample:", ord_data$Sample, "<br>Run:", ord_data$Run)
+      
+      # Add color based on selection
+      if (input$runColorBy == "run") {
+        # Color by run
+        p <- ggplot(ord_data, aes(x = Axis1, y = Axis2, color = Run, text = hover_text)) +
+          geom_point(size = 3, alpha = 0.7) +
+          theme_minimal() +
+          labs(x = axis_labels[1], y = axis_labels[2],
+               title = paste(toupper(ord_method), "Ordination of", dist_method, "Distances by Run")) +
+          scale_color_viridis_d() +
+          stat_ellipse(aes(color = Run), type = "t")
+      } else {
+        # Color by metadata
+        meta_column <- input$runColorMetadata
+        
+        if (meta_column != "auto") {
+          # Get sample data
+          has_sample_data <- !is.null(sample_data(ps))
+          
+          if (has_sample_data) {
+            # Extract sample data and merge
+            sample_df <- as.data.frame(sample_data(ps))
+            if (meta_column %in% colnames(sample_df)) {
+              sample_df$Sample <- rownames(sample_df)
+              ord_data <- merge(ord_data, sample_df[, c("Sample", meta_column)], by = "Sample", all.x = TRUE)
+              
+              # Create better hover text
+              ord_data$hover_text <- paste("Sample:", ord_data$Sample, 
+                                         "<br>Run:", ord_data$Run,
+                                         "<br>", meta_column, ":", ord_data[[meta_column]])
+              
+              # Plot with metadata coloring
+              p <- ggplot(ord_data, aes_string(x = "Axis1", y = "Axis2", color = meta_column, text = "hover_text")) +
+                geom_point(size = 3, alpha = 0.7) +
+                theme_minimal() +
+                labs(x = axis_labels[1], y = axis_labels[2],
+                     title = paste(toupper(ord_method), "Ordination of", dist_method, "Distances by", meta_column)) +
+                scale_color_viridis_d()
+              
+              # Add run ellipses to still show run clustering
+              p <- p + stat_ellipse(aes(color = Run, group = Run), type = "t", linetype = "dashed", alpha = 0.5)
+            } else {
+              # Fallback to run coloring
+              p <- ggplot(ord_data, aes(x = Axis1, y = Axis2, color = Run, text = hover_text)) +
+                geom_point(size = 3, alpha = 0.7) +
+                theme_minimal() +
+                labs(x = axis_labels[1], y = axis_labels[2],
+                     title = paste(toupper(ord_method), "Ordination of", dist_method, "Distances by Run")) +
+                scale_color_viridis_d() +
+                stat_ellipse(aes(color = Run), type = "t")
+            }
+          } else {
+            # Fallback to run coloring
+            p <- ggplot(ord_data, aes(x = Axis1, y = Axis2, color = Run, text = hover_text)) +
+              geom_point(size = 3, alpha = 0.7) +
+              theme_minimal() +
+              labs(x = axis_labels[1], y = axis_labels[2],
+                   title = paste(toupper(ord_method), "Ordination of", dist_method, "Distances by Run")) +
+              scale_color_viridis_d() +
+              stat_ellipse(aes(color = Run), type = "t")
+          }
+        } else {
+          # Auto-detect a good metadata column for coloring
+          has_sample_data <- !is.null(sample_data(ps))
+          
+          if (has_sample_data) {
+            # Extract sample data
+            sample_df <- as.data.frame(sample_data(ps))
+            
+            # Look for good categorical columns
+            potential_cols <- c("Group", "Treatment", "Condition", "SampleType", "SampleGroup")
+            
+            color_col <- NULL
+            for (col in potential_cols) {
+              if (col %in% colnames(sample_df)) {
+                n_unique <- length(unique(sample_df[[col]]))
+                if (n_unique > 1 && n_unique < 10) {
+                  color_col <- col
+                  break
+                }
+              }
+            }
+            
+            if (!is.null(color_col)) {
+              # Merge metadata
+              sample_df$Sample <- rownames(sample_df)
+              ord_data <- merge(ord_data, sample_df[, c("Sample", color_col)], by = "Sample", all.x = TRUE)
+              
+              # Create better hover text
+              ord_data$hover_text <- paste("Sample:", ord_data$Sample, 
+                                         "<br>Run:", ord_data$Run,
+                                         "<br>", color_col, ":", ord_data[[color_col]])
+              
+              # Plot with metadata coloring
+              p <- ggplot(ord_data, aes_string(x = "Axis1", y = "Axis2", color = color_col, text = "hover_text")) +
+                geom_point(size = 3, alpha = 0.7) +
+                theme_minimal() +
+                labs(x = axis_labels[1], y = axis_labels[2],
+                     title = paste(toupper(ord_method), "Ordination of", dist_method, "Distances by", color_col)) +
+                scale_color_viridis_d()
+              
+              # Add run ellipses to still show run clustering
+              p <- p + stat_ellipse(aes(color = Run, group = Run), type = "t", linetype = "dashed", alpha = 0.5)
+            } else {
+              # Fallback to run coloring
+              p <- ggplot(ord_data, aes(x = Axis1, y = Axis2, color = Run, text = hover_text)) +
+                geom_point(size = 3, alpha = 0.7) +
+                theme_minimal() +
+                labs(x = axis_labels[1], y = axis_labels[2],
+                     title = paste(toupper(ord_method), "Ordination of", dist_method, "Distances by Run")) +
+                scale_color_viridis_d() +
+                stat_ellipse(aes(color = Run), type = "t")
+            }
+          } else {
+            # Fallback to run coloring
+            p <- ggplot(ord_data, aes(x = Axis1, y = Axis2, color = Run, text = hover_text)) +
+              geom_point(size = 3, alpha = 0.7) +
+              theme_minimal() +
+              labs(x = axis_labels[1], y = axis_labels[2],
+                   title = paste(toupper(ord_method), "Ordination of", dist_method, "Distances by Run")) +
+              scale_color_viridis_d() +
+              stat_ellipse(aes(color = Run), type = "t")
+          }
+        }
+      }
+      
+      ggplotly(p, tooltip = "text")
+    }, error = function(e) {
+      # Return error plot
+      return(plot_ly() %>% 
+              layout(title = "Error calculating ordination",
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = paste("Error:", conditionMessage(e)), 
+                      showarrow = FALSE
+                    )))
+    })
+  })
+  
+  # ASV Overlap Plot
+  output$asvOverlapPlot <- renderPlot({
+    runs <- detected_runs()
+    assignments <- run_assignments()
+    
+    if (is.null(runs) || is.null(assignments) || nrow(assignments) == 0) {
+      # Return empty plot with message
+      return(ggplot() + 
+               annotate("text", x = 0.5, y = 0.5, 
+                       label = "No run data available. Click 'Detect Runs' to identify runs.") +
+               theme_void())
+    }
+    
+    # Get phyloseq object
+    ps <- filtered_ps()
+    if (is.null(ps)) {
+      return(ggplot() + 
+               annotate("text", x = 0.5, y = 0.5, 
+                       label = "Phyloseq object not loaded") +
+               theme_void())
+    }
+    
+    # Filter runs if requested
+    if (input$filterRunsForOverlap && !is.null(input$selectedRuns)) {
+      # Filter to only include selected runs
+      assignments <- assignments[assignments$Run %in% input$selectedRuns, ]
+      
+      if (nrow(assignments) == 0) {
+        return(ggplot() + 
+                 annotate("text", x = 0.5, y = 0.5, 
+                         label = "No samples match the selected runs") +
+                 theme_void())
+      }
+    }
+    
+    # Generate the overlap visualization
+    tryCatch({
+      # Get OTU table
+      otu <- otu_table(ps)
+      
+      if (taxa_are_rows(otu)) {
+        otu_mat <- as.matrix(otu)
+      } else {
+        otu_mat <- t(as.matrix(otu))
+      }
+      
+      # Create presence/absence matrix
+      if (input$showPrevalentASVsOnly) {
+        # Filter by prevalence
+        threshold <- input$asvPrevalenceThreshold / 100
+        prevalence <- rowSums(otu_mat > 0) / ncol(otu_mat)
+        otu_mat <- otu_mat[prevalence >= threshold, ]
+      }
+      
+      # Create binary presence/absence matrix
+      binary_mat <- otu_mat > 0
+      
+      # Create a mapping of samples to runs
+      sample_to_run <- assignments$Run
+      names(sample_to_run) <- assignments$Sample
+      
+      # Get list of sample names in the matrix
+      sample_names <- colnames(binary_mat)
+      
+      # Get run for each sample, defaulting to "Unassigned" for missing values
+      sample_runs <- sample_to_run[sample_names]
+      sample_runs[is.na(sample_runs)] <- "Unassigned"
+      
+      if (input$asvOverlapMethod == "upset") {
+        # Check if UpSetR package is available
+        if (!requireNamespace("UpSetR", quietly = TRUE)) {
+          return(ggplot() + 
+                   annotate("text", x = 0.5, y = 0.5, 
+                           label = "UpSetR package not available. Please install: install.packages('UpSetR')") +
+                   theme_void())
+        }
+        
+        # Calculate run-specific ASV presence
+        run_asv_presence <- list()
+        unique_runs <- unique(sample_runs)
+        
+        for (run in unique_runs) {
+          if (run != "Unassigned") {
+            run_samples <- sample_names[sample_runs == run]
+            if (length(run_samples) > 0) {
+              run_asv_presence[[run]] <- which(rowSums(binary_mat[, run_samples, drop = FALSE]) > 0)
+            }
+          }
+        }
+        
+        # Only include runs with detected ASVs
+        run_asv_presence <- run_asv_presence[sapply(run_asv_presence, length) > 0]
+        
+        # Create UpSet plot
+        if (length(run_asv_presence) >= 2) {
+          UpSetR::upset(UpSetR::fromList(run_asv_presence), 
+                      nsets = length(run_asv_presence),
+                      order.by = "freq",
+                      main.bar.color = "steelblue",
+                      sets.bar.color = "darkgreen",
+                      sets.x.label = "ASVs per Run",
+                      mainbar.y.label = "Shared ASVs",
+                      text.scale = 1.5)
+        } else {
+          return(ggplot() + 
+                   annotate("text", x = 0.5, y = 0.5, 
+                           label = "At least 2 runs with ASVs are required for UpSet plot") +
+                   theme_void())
+        }
+        
+      } else if (input$asvOverlapMethod == "venn") {
+        # Check if we have a reasonable number of runs for Venn diagram
+        unique_runs <- unique(sample_runs)
+        unique_runs <- unique_runs[unique_runs != "Unassigned"]
+        
+        if (length(unique_runs) < 2) {
+          return(ggplot() + 
+                   annotate("text", x = 0.5, y = 0.5, 
+                           label = "At least 2 runs are required for Venn diagram") +
+                   theme_void())
+        }
+        
+        if (length(unique_runs) > 5) {
+          return(ggplot() + 
+                   annotate("text", x = 0.5, y = 0.5, 
+                           label = "Venn diagrams only support up to 5 sets. Use UpSet plot for more runs.") +
+                   theme_void())
+        }
+        
+        # Check if VennDiagram package is available
+        if (!requireNamespace("VennDiagram", quietly = TRUE)) {
+          return(ggplot() + 
+                   annotate("text", x = 0.5, y = 0.5, 
+                           label = "VennDiagram package not available. Please install: install.packages('VennDiagram')") +
+                   theme_void())
+        }
+        
+        # Calculate run-specific ASV presence
+        run_asv_presence <- list()
+        
+        for (run in unique_runs) {
+          run_samples <- sample_names[sample_runs == run]
+          if (length(run_samples) > 0) {
+            run_asv_presence[[run]] <- which(rowSums(binary_mat[, run_samples, drop = FALSE]) > 0)
+          }
+        }
+        
+        # Get a nice color palette
+        run_colors <- viridis::viridis(length(unique_runs))
+        
+        # Generate Venn diagram
+        venn_plot <- VennDiagram::venn.diagram(
+          x = run_asv_presence,
+          filename = NULL,
+          fill = run_colors,
+          alpha = 0.5,
+          cex = 2,
+          cat.cex = 1.5,
+          cat.col = run_colors,
+          main = "ASV Overlap Between Runs",
+          main.cex = 2
+        )
+        
+        # Convert to a grob (graphics object)
+        grid::grid.newpage()
+        grid::grid.draw(venn_plot)
+        
+      } else if (input$asvOverlapMethod == "heatmap") {
+        # Calculate ASV presence by run
+        unique_runs <- unique(sample_runs)
+        
+        # Calculate the presence/absence of each ASV in each run
+        asv_run_matrix <- matrix(0, nrow = nrow(binary_mat), ncol = length(unique_runs))
+        rownames(asv_run_matrix) <- rownames(binary_mat)
+        colnames(asv_run_matrix) <- unique_runs
+        
+        for (i in seq_along(unique_runs)) {
+          run <- unique_runs[i]
+          run_samples <- sample_names[sample_runs == run]
+          if (length(run_samples) > 0) {
+            asv_run_matrix[, i] <- rowSums(binary_mat[, run_samples, drop = FALSE]) > 0
+          }
+        }
+        
+        # Convert to a data frame for ggplot
+        asv_run_df <- reshape2::melt(asv_run_matrix, 
+                                   varnames = c("ASV", "Run"), 
+                                   value.name = "Present")
+        
+        # Add taxonomy information if available
+        has_taxonomy <- !is.null(tax_table(ps))
+        if (has_taxonomy) {
+          tax_df <- as.data.frame(tax_table(ps))
+          
+          # Add taxonomy columns to the data frame
+          asv_run_df$Phylum <- tax_df[asv_run_df$ASV, "Phylum"]
+          asv_run_df$Class <- tax_df[asv_run_df$ASV, "Class"]
+          asv_run_df$Order <- tax_df[asv_run_df$ASV, "Order"]
+          asv_run_df$Family <- tax_df[asv_run_df$ASV, "Family"]
+          asv_run_df$Genus <- tax_df[asv_run_df$ASV, "Genus"]
+          
+          # Handle NAs
+          for (col in c("Phylum", "Class", "Order", "Family", "Genus")) {
+            asv_run_df[[col]][is.na(asv_run_df[[col]])] <- "Unknown"
+          }
+          
+          # Create taxonomy label
+          asv_run_df$TaxLabel <- paste(asv_run_df$Phylum, asv_run_df$Family, asv_run_df$Genus, sep = "; ")
+        } else {
+          asv_run_df$TaxLabel <- asv_run_df$ASV
+        }
+        
+        # Create a more informative ASV label with taxonomy
+        asv_run_df$ASVLabel <- paste0(asv_run_df$ASV, " (", asv_run_df$TaxLabel, ")")
+        
+        # Create the heatmap
+        p <- ggplot(asv_run_df, aes(x = Run, y = ASVLabel, fill = Present)) +
+          geom_tile() +
+          scale_fill_manual(values = c("white", "steelblue"), 
+                          labels = c("Absent", "Present")) +
+          theme_minimal() +
+          theme(axis.text.y = element_text(size = 8),
+                axis.text.x = element_text(angle = 45, hjust = 1)) +
+          labs(x = "Run", y = "ASV", fill = "Presence",
+               title = "ASV Presence/Absence Across Runs")
+        
+        p
+      }
+    }, error = function(e) {
+      # Return error plot
+      return(ggplot() + 
+               annotate("text", x = 0.5, y = 0.5, 
+                       label = paste("Error:", conditionMessage(e))) +
+               theme_void())
+    })
+  })
+  
+  # Taxonomy by Run Plot
+  output$taxonomyRunPlot <- renderPlotly({
+    runs <- detected_runs()
+    assignments <- run_assignments()
+    
+    if (is.null(runs) || is.null(assignments) || nrow(assignments) == 0) {
+      # Return empty plot with message
+      return(plot_ly() %>% 
+              layout(title = "No run data available",
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = "Click 'Detect Runs' to identify sequencing runs", 
+                      showarrow = FALSE
+                    )))
+    }
+    
+    # Get phyloseq object
+    ps <- filtered_ps()
+    if (is.null(ps)) {
+      return(plot_ly() %>% 
+              layout(title = "No data available",
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = "Phyloseq object not loaded", 
+                      showarrow = FALSE
+                    )))
+    }
+    
+    # Check if taxonomy table exists
+    has_tax_table <- tryCatch({
+      tt <- phyloseq::tax_table(ps)
+      !is.null(tt) && ncol(tt) > 0 && nrow(tt) > 0
+    }, error = function(e) FALSE)
+    
+    if (!has_tax_table || !input$taxRunLevel %in% colnames(phyloseq::tax_table(ps))) {
+      return(plot_ly() %>% 
+              layout(title = paste("No", input$taxRunLevel, "data available"),
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = paste("Taxonomy table does not contain", input$taxRunLevel), 
+                      showarrow = FALSE
+                    )))
+    }
+    
+    # Generate the taxonomy by run visualization
+    tryCatch({
+      # Get run for each sample
+      sample_to_run <- assignments$Run
+      names(sample_to_run) <- assignments$Sample
+      
+      # Create a new sample_data with run information
+      sample_df <- as.data.frame(sample_data(ps))
+      sample_df$Run <- sample_to_run[rownames(sample_df)]
+      sample_df$Run[is.na(sample_df$Run)] <- "Unassigned"
+      
+      # Update the phyloseq object with run information
+      sample_data(ps) <- sample_data(sample_df)
+      
+      # Agglomerate at the selected taxonomic level
+      ps_glom <- tax_glom(ps, taxrank = input$taxRunLevel)
+      
+      # Transform to relative abundance
+      ps_rel <- transform_sample_counts(ps_glom, function(x) x / sum(x))
+      
+      # Get the top N taxa
+      top_n <- input$taxRunTopN
+      top_taxa <- names(sort(taxa_sums(ps_rel), decreasing = TRUE)[1:top_n])
+      
+      # Subset to top taxa
+      ps_rel_top <- prune_taxa(top_taxa, ps_rel)
+      
+      if (input$taxRunVizType == "bar") {
+        # Melt for plotting
+        tax_data <- psmelt(ps_rel_top)
+        
+        # Aggregate by run and taxa
+        tax_by_run <- tax_data %>%
+          dplyr::group_by(Run, .data[[input$taxRunLevel]]) %>%
+          dplyr::summarize(MeanAbundance = mean(Abundance), .groups = "drop")
+        
+        # Handle NA values
+        tax_by_run[[input$taxRunLevel]] <- as.character(tax_by_run[[input$taxRunLevel]])
+        tax_by_run[[input$taxRunLevel]][is.na(tax_by_run[[input$taxRunLevel]])] <- "Unknown"
+        
+        # Create stacked bar plot
+        p <- ggplot(tax_by_run, aes_string(x = "Run", y = "MeanAbundance", fill = input$taxRunLevel)) +
+          geom_bar(stat = "identity") +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+          labs(x = "Run", y = "Mean Relative Abundance", fill = input$taxRunLevel,
+               title = paste("Mean Taxonomic Composition at", input$taxRunLevel, "Level by Run")) +
+          scale_fill_viridis_d()
+        
+        ggplotly(p)
+        
+      } else if (input$taxRunVizType == "heatmap") {
+        # Melt for analysis
+        tax_data <- psmelt(ps_rel_top)
+        
+        # Aggregate by run and taxa
+        tax_by_run <- tax_data %>%
+          dplyr::group_by(Run, .data[[input$taxRunLevel]]) %>%
+          dplyr::summarize(MeanAbundance = mean(Abundance), .groups = "drop")
+        
+        # Handle NA values
+        tax_by_run[[input$taxRunLevel]] <- as.character(tax_by_run[[input$taxRunLevel]])
+        tax_by_run[[input$taxRunLevel]][is.na(tax_by_run[[input$taxRunLevel]])] <- "Unknown"
+        
+        # Reshape to wide format for heatmap
+        tax_wide <- reshape2::dcast(tax_by_run, Run ~ .data[[input$taxRunLevel]], value.var = "MeanAbundance")
+        row.names(tax_wide) <- tax_wide$Run
+        tax_wide$Run <- NULL
+        
+        # Handle clustering if requested
+        if (input$taxRunClusterMethod != "none") {
+          # Cluster the runs
+          run_dist <- dist(tax_wide)
+          run_hclust <- hclust(run_dist, method = input$taxRunClusterMethod)
+          run_order <- row.names(tax_wide)[run_hclust$order]
+          
+          # Cluster the taxa
+          taxa_dist <- dist(t(tax_wide))
+          taxa_hclust <- hclust(taxa_dist, method = input$taxRunClusterMethod)
+          taxa_order <- colnames(tax_wide)[taxa_hclust$order]
+          
+          # Create heatmap with ordered rows and columns
+          tax_wide_ordered <- tax_wide[run_order, taxa_order]
+          
+          # Convert to long format for ggplot
+          tax_long <- reshape2::melt(as.matrix(tax_wide_ordered), 
+                                   varnames = c("Run", input$taxRunLevel), 
+                                   value.name = "Abundance")
+          
+          # Make sure Run and taxa are ordered factors for ggplot
+          tax_long$Run <- factor(tax_long$Run, levels = run_order)
+          tax_long[[input$taxRunLevel]] <- factor(tax_long[[input$taxRunLevel]], levels = taxa_order)
+        } else {
+          # Convert to long format without clustering
+          tax_long <- reshape2::melt(as.matrix(tax_wide),
+                                   varnames = c("Run", input$taxRunLevel),
+                                   value.name = "Abundance")
+        }
+        
+        # Create heatmap
+        p <- ggplot(tax_long, aes_string(x = input$taxRunLevel, y = "Run", fill = "Abundance")) +
+          geom_tile() +
+          scale_fill_viridis_c() +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+          labs(x = input$taxRunLevel, y = "Run", fill = "Abundance",
+               title = paste("Heatmap of", input$taxRunLevel, "Abundance by Run"))
+        
+        ggplotly(p)
+        
+      } else if (input$taxRunVizType == "pcoa") {
+        # Melt for analysis
+        tax_data <- psmelt(ps_rel_top)
+        
+        # Aggregate by run and taxa
+        tax_by_run <- tax_data %>%
+          dplyr::group_by(Run, .data[[input$taxRunLevel]]) %>%
+          dplyr::summarize(MeanAbundance = mean(Abundance), .groups = "drop")
+        
+        # Handle NA values
+        tax_by_run[[input$taxRunLevel]] <- as.character(tax_by_run[[input$taxRunLevel]])
+        tax_by_run[[input$taxRunLevel]][is.na(tax_by_run[[input$taxRunLevel]])] <- "Unknown"
+        
+        # Reshape to wide format for ordination
+        tax_wide <- reshape2::dcast(tax_by_run, Run ~ .data[[input$taxRunLevel]], value.var = "MeanAbundance")
+        row.names(tax_wide) <- tax_wide$Run
+        tax_wide$Run <- NULL
+        
+        # Replace NAs with zeros
+        tax_wide[is.na(tax_wide)] <- 0
+        
+        # Calculate distance matrix
+        dist_mat <- vegdist(tax_wide, method = "bray")
+        
+        # Perform PCoA ordination
+        pcoa_result <- ape::pcoa(dist_mat)
+        
+        # Create data frame for plotting
+        pcoa_df <- data.frame(
+          Run = rownames(tax_wide),
+          Axis1 = pcoa_result$vectors[,1],
+          Axis2 = pcoa_result$vectors[,2]
+        )
+        
+        # Calculate variance explained
+        var_explained <- round(pcoa_result$values$Relative_eig[1:2] * 100, 1)
+        
+        # Create PCoA plot
+        p <- ggplot(pcoa_df, aes(x = Axis1, y = Axis2, label = Run, color = Run)) +
+          geom_point(size = 4) +
+          geom_text(hjust = 0, vjust = 0, nudge_x = 0.01, nudge_y = 0.01) +
+          theme_minimal() +
+          labs(x = paste0("PCoA 1 (", var_explained[1], "%)"), 
+               y = paste0("PCoA 2 (", var_explained[2], "%)"),
+               title = paste("PCoA of", input$taxRunLevel, "Composition by Run")) +
+          scale_color_viridis_d()
+        
+        ggplotly(p)
+      }
+    }, error = function(e) {
+      # Return error plot
+      return(plot_ly() %>% 
+              layout(title = "Error in taxonomy visualization",
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = paste("Error:", conditionMessage(e)), 
+                      showarrow = FALSE
+                    )))
+    })
+  })
+  
+  # Run Batch Effect Analysis
+  # Store batch effect test results
+  batch_effect_results <- reactiveVal(NULL)
+  
+  # Run batch effect analysis when button is clicked
+  observeEvent(input$runBatchTest, {
+    runs <- detected_runs()
+    assignments <- run_assignments()
+    
+    if (is.null(runs) || is.null(assignments) || nrow(assignments) == 0) {
+      batch_effect_results(data.frame(
+        Test = input$batchEffectMethod,
+        Result = "No run data available. Click 'Detect Runs' to identify runs.",
+        p_value = NA,
+        statistic = NA
+      ))
+      return()
+    }
+    
+    # Get phyloseq object
+    ps <- filtered_ps()
+    if (is.null(ps)) {
+      batch_effect_results(data.frame(
+        Test = input$batchEffectMethod,
+        Result = "Phyloseq object not loaded",
+        p_value = NA,
+        statistic = NA
+      ))
+      return()
+    }
+    
+    # Run the selected batch effect analysis
+    tryCatch({
+      # Get run for each sample
+      sample_to_run <- assignments$Run
+      names(sample_to_run) <- assignments$Sample
+      
+      # Create a new sample_data with run information
+      sample_df <- as.data.frame(sample_data(ps))
+      sample_df$Run <- sample_to_run[rownames(sample_df)]
+      sample_df$Run[is.na(sample_df$Run)] <- "Unassigned"
+      
+      # Update the phyloseq object with run information
+      sample_data(ps) <- sample_data(sample_df)
+      
+      # Transform to relative abundance
+      ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+      
+      # Calculate distance matrix
+      dist_method <- input$batchDistMethod
+      dist_matrix <- phyloseq::distance(ps_rel, method = dist_method)
+      
+      # Run the appropriate batch effect test
+      if (input$batchEffectMethod == "betadisper") {
+        # Check if we have more than one run group
+        run_groups <- unique(sample_df$Run)
+        if (length(run_groups) < 2) {
+          batch_effect_results(data.frame(
+            Test = "Beta Dispersion",
+            Result = "At least 2 runs required for beta dispersion test",
+            p_value = NA,
+            statistic = NA
+          ))
+          return()
+        }
+        
+        # Run beta dispersion test (test of homogeneity of multivariate dispersions)
+        bd <- vegan::betadisper(dist_matrix, sample_df$Run)
+        anova_result <- anova(bd)
+        perm_result <- vegan::permutest(bd, permutations = 999)
+        
+        # Store results
+        batch_effect_results(data.frame(
+          Test = "Beta Dispersion",
+          Result = ifelse(perm_result$tab$`Pr(>F)`[1] < 0.05, 
+                         "Significant dispersion differences between runs (p < 0.05)", 
+                         "No significant dispersion differences between runs (p ≥ 0.05)"),
+          p_value = perm_result$tab$`Pr(>F)`[1],
+          statistic = perm_result$tab$F[1]
+        ))
+        
+        # Store BD object for plotting
+        bd_object <- bd
+        
+      } else if (input$batchEffectMethod == "adonis") {
+        # Run PERMANOVA test
+        adonis_result <- vegan::adonis2(dist_matrix ~ Run, data = sample_df)
+        
+        # Store results
+        batch_effect_results(data.frame(
+          Test = "PERMANOVA (adonis2)",
+          Result = ifelse(adonis_result$`Pr(>F)`[1] < 0.05, 
+                         "Significant differences in community composition between runs (p < 0.05)", 
+                         "No significant differences in community composition between runs (p ≥ 0.05)"),
+          p_value = adonis_result$`Pr(>F)`[1],
+          statistic = adonis_result$F[1]
+        ))
+        
+      } else if (input$batchEffectMethod == "interaction") {
+        # Run vs. Sample Type interaction test
+        interaction_factor <- input$interactionFactor
+        
+        if (interaction_factor == "auto") {
+          # Try to find a good factor automatically
+          potential_cols <- c("Group", "Treatment", "Condition", "SampleType", "SampleGroup")
+          
+          # Find the first column that works
+          for (col in potential_cols) {
+            if (col %in% colnames(sample_df)) {
+              unique_vals <- unique(sample_df[[col]])
+              if (!is.numeric(unique_vals) && length(unique_vals) > 1 && length(unique_vals) < 10) {
+                interaction_factor <- col
+                break
+              }
+            }
+          }
+        }
+        
+        if (interaction_factor != "auto" && interaction_factor %in% colnames(sample_df)) {
+          # Run PERMANOVA with interaction term
+          adonis_formula <- as.formula(paste("dist_matrix ~", interaction_factor, "* Run"))
+          adonis_result <- vegan::adonis2(adonis_formula, data = sample_df)
+          
+          # Extract interaction term
+          interaction_row <- which(rownames(adonis_result) == paste0(interaction_factor, ":Run"))
+          
+          if (length(interaction_row) > 0) {
+            # Store results focusing on the interaction term
+            batch_effect_results(data.frame(
+              Test = paste("Interaction:", interaction_factor, "x Run"),
+              Result = ifelse(adonis_result$`Pr(>F)`[interaction_row] < 0.05, 
+                             paste0("Significant interaction between ", interaction_factor, " and Run (p < 0.05)\n",
+                                  "This indicates that run effects differ across ", interaction_factor, " groups."), 
+                             paste0("No significant interaction between ", interaction_factor, " and Run (p ≥ 0.05)\n",
+                                  "This suggests batch effects are consistent across ", interaction_factor, " groups.")),
+              p_value = adonis_result$`Pr(>F)`[interaction_row],
+              statistic = adonis_result$F[interaction_row]
+            ))
+          } else {
+            # If interaction term wasn't found, store the main effect of Run
+            run_row <- which(rownames(adonis_result) == "Run")
+            
+            batch_effect_results(data.frame(
+              Test = paste("Main effect of Run with", interaction_factor),
+              Result = ifelse(adonis_result$`Pr(>F)`[run_row] < 0.05, 
+                             "Significant effect of Run after accounting for sample type (p < 0.05)", 
+                             "No significant effect of Run after accounting for sample type (p ≥ 0.05)"),
+              p_value = adonis_result$`Pr(>F)`[run_row],
+              statistic = adonis_result$F[run_row]
+            ))
+          }
+        } else {
+          # No suitable factor found
+          batch_effect_results(data.frame(
+            Test = "Interaction test",
+            Result = "No suitable sample type factor found for interaction test",
+            p_value = NA,
+            statistic = NA
+          ))
+        }
+      }
+      
+    }, error = function(e) {
+      # Store error result
+      batch_effect_results(data.frame(
+        Test = input$batchEffectMethod,
+        Result = paste("Error:", conditionMessage(e)),
+        p_value = NA,
+        statistic = NA
+      ))
+    })
+  })
+  
+  # Display batch effect test results
+  output$batchTestResults <- renderPrint({
+    results <- batch_effect_results()
+    
+    if (is.null(results)) {
+      cat("No analysis run yet. Click 'Run Analysis' to perform batch effect testing.\n")
+    } else {
+      cat("BATCH EFFECT ANALYSIS:", results$Test, "\n\n")
+      cat("RESULT:", results$Result, "\n\n")
+      
+      if (!is.na(results$p_value)) {
+        cat("p-value:", format(results$p_value, digits = 4), "\n")
+      }
+      
+      if (!is.na(results$statistic)) {
+        if (results$Test == "Beta Dispersion") {
+          cat("F-statistic:", format(results$statistic, digits = 4), "\n")
+        } else if (grepl("PERMANOVA", results$Test)) {
+          cat("pseudo F-statistic:", format(results$statistic, digits = 4), "\n")
+        }
+      }
+    }
+  })
+  
+  # Batch effect visualization
+  output$batchEffectPlot <- renderPlotly({
+    results <- batch_effect_results()
+    
+    if (is.null(results)) {
+      # Return empty plot with message
+      return(plot_ly() %>% 
+              layout(title = "No analysis run yet",
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = "Click 'Run Analysis' to perform batch effect testing", 
+                      showarrow = FALSE
+                    )))
+    }
+    
+    # Visualization depends on the test used
+    if (results$Test == "Beta Dispersion") {
+      # Get phyloseq object
+      ps <- filtered_ps()
+      if (is.null(ps)) return(NULL)
+      
+      # Get run assignments
+      runs <- detected_runs()
+      assignments <- run_assignments()
+      
+      if (is.null(runs) || is.null(assignments)) return(NULL)
+      
+      # Create a PCoA plot with ellipses showing dispersion
+      tryCatch({
+        # Get run for each sample
+        sample_to_run <- assignments$Run
+        names(sample_to_run) <- assignments$Sample
+        
+        # Create a new sample_data with run information
+        sample_df <- as.data.frame(sample_data(ps))
+        sample_df$Run <- sample_to_run[rownames(sample_df)]
+        sample_df$Run[is.na(sample_df$Run)] <- "Unassigned"
+        
+        # Update the phyloseq object with run information
+        sample_data(ps) <- sample_data(sample_df)
+        
+        # Transform to relative abundance
+        ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+        
+        # Calculate distance matrix
+        dist_method <- input$batchDistMethod
+        dist_matrix <- phyloseq::distance(ps_rel, method = dist_method)
+        
+        # Run beta dispersion analysis
+        bd <- vegan::betadisper(dist_matrix, sample_df$Run)
+        
+        # Extract PCoA scores
+        bd_data <- data.frame(
+          Sample = rownames(bd$vectors),
+          PC1 = bd$vectors[,1],
+          PC2 = bd$vectors[,2],
+          Run = sample_df$Run
+        )
+        
+        # Get centroids
+        centroids <- data.frame(
+          Run = rownames(bd$centroids),
+          PC1 = bd$centroids[,1],
+          PC2 = bd$centroids[,2]
+        )
+        
+        # Create PCoA plot with dispersion visualization
+        p <- ggplot(bd_data, aes(x = PC1, y = PC2, color = Run, text = Sample)) +
+          geom_point(size = 3, alpha = 0.7) +
+          stat_ellipse(aes(group = Run, color = Run), type = "t") +
+          geom_point(data = centroids, aes(x = PC1, y = PC2, color = Run), 
+                    size = 5, shape = 8) +
+          theme_minimal() +
+          labs(x = paste0("PCoA 1"), y = paste0("PCoA 2"),
+               title = "Beta Dispersion Analysis - Multivariate Homogeneity of Group Dispersions") +
+          scale_color_viridis_d()
+        
+        ggplotly(p, tooltip = c("text", "color"))
+        
+      }, error = function(e) {
+        # Return error plot
+        return(plot_ly() %>% 
+                layout(title = "Error in beta dispersion plot",
+                      annotations = list(
+                        x = 0.5, y = 0.5, 
+                        text = paste("Error:", conditionMessage(e)), 
+                        showarrow = FALSE
+                      )))
+      })
+    } else if (grepl("PERMANOVA|adonis", results$Test) || grepl("Main effect", results$Test)) {
+      # For PERMANOVA, show NMDS plot
+      ps <- filtered_ps()
+      if (is.null(ps)) return(NULL)
+      
+      # Get run assignments
+      runs <- detected_runs()
+      assignments <- run_assignments()
+      
+      if (is.null(runs) || is.null(assignments)) return(NULL)
+      
+      # Create a NMDS/PCoA plot
+      tryCatch({
+        # Get run for each sample
+        sample_to_run <- assignments$Run
+        names(sample_to_run) <- assignments$Sample
+        
+        # Create a new sample_data with run information
+        sample_df <- as.data.frame(sample_data(ps))
+        sample_df$Run <- sample_to_run[rownames(sample_df)]
+        sample_df$Run[is.na(sample_df$Run)] <- "Unassigned"
+        
+        # Update the phyloseq object with run information
+        sample_data(ps) <- sample_data(sample_df)
+        
+        # Transform to relative abundance
+        ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+        
+        # Calculate distance matrix
+        dist_method <- input$batchDistMethod
+        dist_matrix <- phyloseq::distance(ps_rel, method = dist_method)
+        
+        # Perform PCoA ordination (usually more stable than NMDS)
+        ord <- ordinate(ps_rel, method = "PCoA", distance = dist_matrix)
+        
+        # Create data frame for plotting
+        ord_data <- data.frame(
+          Sample = rownames(ord$vectors),
+          Axis1 = ord$vectors[,1],
+          Axis2 = ord$vectors[,2],
+          Run = sample_df$Run
+        )
+        
+        # Get variance explained
+        var_explained <- round(ord$values$Relative_eig[1:2] * 100, 1)
+        
+        # Create PCoA plot
+        p <- ggplot(ord_data, aes(x = Axis1, y = Axis2, color = Run, text = Sample)) +
+          geom_point(size = 3, alpha = 0.7) +
+          stat_ellipse(aes(group = Run), type = "t") +
+          theme_minimal() +
+          labs(x = paste0("PCoA 1 (", var_explained[1], "%)"), 
+               y = paste0("PCoA 2 (", var_explained[2], "%)"),
+               title = paste("PCoA showing batch differences (PERMANOVA:", 
+                            format(results$p_value, digits = 3), ")")) +
+          scale_color_viridis_d()
+        
+        ggplotly(p, tooltip = c("text", "color"))
+        
+      }, error = function(e) {
+        # Return error plot
+        return(plot_ly() %>% 
+                layout(title = "Error in PERMANOVA plot",
+                      annotations = list(
+                        x = 0.5, y = 0.5, 
+                        text = paste("Error:", conditionMessage(e)), 
+                        showarrow = FALSE
+                      )))
+      })
+    } else if (grepl("Interaction", results$Test)) {
+      # For interaction test, create a grouped PCoA plot
+      ps <- filtered_ps()
+      if (is.null(ps)) return(NULL)
+      
+      # Get run assignments
+      runs <- detected_runs()
+      assignments <- run_assignments()
+      
+      if (is.null(runs) || is.null(assignments)) return(NULL)
+      
+      # Extract the interaction factor
+      interaction_factor <- gsub("Interaction: ([^ ]+) x Run.*", "\\1", results$Test)
+      
+      # Create plot showing interaction
+      tryCatch({
+        # Get run for each sample
+        sample_to_run <- assignments$Run
+        names(sample_to_run) <- assignments$Sample
+        
+        # Create a new sample_data with run information
+        sample_df <- as.data.frame(sample_data(ps))
+        sample_df$Run <- sample_to_run[rownames(sample_df)]
+        sample_df$Run[is.na(sample_df$Run)] <- "Unassigned"
+        
+        # Check if we have the interaction factor
+        if (interaction_factor != "Run" && interaction_factor %in% colnames(sample_df)) {
+          # Update the phyloseq object with run information
+          sample_data(ps) <- sample_data(sample_df)
+          
+          # Transform to relative abundance
+          ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+          
+          # Calculate distance matrix
+          dist_method <- input$batchDistMethod
+          dist_matrix <- phyloseq::distance(ps_rel, method = dist_method)
+          
+          # Perform PCoA ordination
+          ord <- ordinate(ps_rel, method = "PCoA", distance = dist_matrix)
+          
+          # Create data frame for plotting
+          ord_data <- data.frame(
+            Sample = rownames(ord$vectors),
+            Axis1 = ord$vectors[,1],
+            Axis2 = ord$vectors[,2],
+            Run = sample_df$Run
+          )
+          
+          # Add the interaction factor
+          ord_data[[interaction_factor]] <- sample_df[ord_data$Sample, interaction_factor]
+          
+          # Get variance explained
+          var_explained <- round(ord$values$Relative_eig[1:2] * 100, 1)
+          
+          # Create a faceted plot to show the interaction
+          p <- ggplot(ord_data, aes(x = Axis1, y = Axis2, color = Run, 
+                                    text = paste("Sample:", Sample, 
+                                               "<br>Run:", Run, 
+                                               "<br>", interaction_factor, ":", ord_data[[interaction_factor]]))) +
+            geom_point(size = 3, alpha = 0.7) +
+            facet_wrap(as.formula(paste("~", interaction_factor))) +
+            theme_minimal() +
+            labs(x = paste0("PCoA 1 (", var_explained[1], "%)"), 
+                 y = paste0("PCoA 2 (", var_explained[2], "%)"),
+                 title = paste("PCoA by", interaction_factor, "and Run (interaction p =", 
+                              format(results$p_value, digits = 3), ")")) +
+            scale_color_viridis_d()
+          
+          ggplotly(p, tooltip = "text")
+        } else {
+          # Fallback to showing a message
+          return(plot_ly() %>% 
+                  layout(title = paste("Could not find", interaction_factor, "in sample data"),
+                        annotations = list(
+                          x = 0.5, y = 0.5, 
+                          text = "Interaction factor not available for visualization", 
+                          showarrow = FALSE
+                        )))
+        }
+      }, error = function(e) {
+        # Return error plot
+        return(plot_ly() %>% 
+                layout(title = "Error in interaction plot",
+                      annotations = list(
+                        x = 0.5, y = 0.5, 
+                        text = paste("Error:", conditionMessage(e)), 
+                        showarrow = FALSE
+                      )))
+      })
+    } else {
+      # Default visualization for other tests
+      return(plot_ly() %>% 
+              layout(title = results$Test,
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = results$Result, 
+                      showarrow = FALSE
+                    )))
+    }
+  })
+  
+  # Normalization-related functionality
+  normalized_ps <- reactiveVal(NULL)
+  
+  # Compute normalization when requested
+  observeEvent(input$computeNormalization, {
+    ps <- filtered_ps()
+    if (is.null(ps)) {
+      return()
+    }
+    
+    # Apply the selected normalization method
+    tryCatch({
+      # Start with relative abundance transformation as baseline
+      ps_norm <- transform_sample_counts(ps, function(x) x / sum(x))
+      method_desc <- "Relative Abundance"
+      
+      if (input$runNormMethod == "css") {
+        # CSS normalization (requires metagenomeSeq)
+        if (requireNamespace("metagenomeSeq", quietly = TRUE)) {
+          # Convert to metagenomeSeq format
+          otu_mat <- as.matrix(otu_table(ps))
+          if (!taxa_are_rows(otu_table(ps))) {
+            otu_mat <- t(otu_mat)
+          }
+          
+          # Create metagenomeSeq object
+          mgs_obj <- metagenomeSeq::newMRexperiment(otu_mat)
+          
+          # Apply CSS normalization
+          mgs_norm <- metagenomeSeq::cumNorm(mgs_obj)
+          
+          # Get normalized counts
+          css_counts <- metagenomeSeq::MRcounts(mgs_norm, normalized = TRUE)
+          
+          # Create new otu_table
+          otu_norm <- otu_table(css_counts, taxa_are_rows = TRUE)
+          
+          # Replace the otu_table in the phyloseq object
+          ps_norm <- phyloseq(otu_norm, 
+                             tax_table(ps), 
+                             sample_data(ps), 
+                             phy_tree(ps))
+          
+          method_desc <- "CSS (Cumulative Sum Scaling)"
+        } else {
+          method_desc <- "CSS (failed - metagenomeSeq package not available)"
+        }
+      } else if (input$runNormMethod == "rle") {
+        # RLE normalization (requires DESeq2)
+        if (requireNamespace("DESeq2", quietly = TRUE)) {
+          # Convert to DESeq2 format - needs to handle zeros
+          # Get OTU table
+          otu_mat <- as.matrix(otu_table(ps))
+          if (!taxa_are_rows(otu_table(ps))) {
+            otu_mat <- t(otu_mat)
+          }
+          
+          # Add pseudocount to handle zeros
+          otu_mat_pseudo <- otu_mat + 1
+          
+          # Create DESeq2 object
+          sample_df <- as.data.frame(sample_data(ps))
+          
+          # Need a design formula - use a column from sample data or create one
+          design_col <- "group"
+          if (!"group" %in% colnames(sample_df)) {
+            # Create a dummy grouping variable
+            sample_df$group <- factor(rep("A", nrow(sample_df)))
+          }
+          
+          # Create DESeq2 object
+          dds <- DESeq2::DESeqDataSetFromMatrix(
+            countData = otu_mat_pseudo,
+            colData = sample_df,
+            design = as.formula(paste("~", design_col))
+          )
+          
+          # Estimate size factors
+          dds <- DESeq2::estimateSizeFactors(dds)
+          
+          # Get normalized counts
+          norm_counts <- DESeq2::counts(dds, normalized = TRUE)
+          
+          # Create new otu_table
+          otu_norm <- otu_table(norm_counts, taxa_are_rows = TRUE)
+          
+          # Replace the otu_table in the phyloseq object
+          ps_norm <- phyloseq(otu_norm, 
+                             tax_table(ps), 
+                             sample_data(ps), 
+                             phy_tree(ps))
+          
+          method_desc <- "RLE (Relative Log Expression from DESeq2)"
+        } else {
+          method_desc <- "RLE (failed - DESeq2 package not available)"
+        }
+      } else if (input$runNormMethod == "tmm") {
+        # TMM normalization (requires edgeR)
+        if (requireNamespace("edgeR", quietly = TRUE)) {
+          # Get OTU table
+          otu_mat <- as.matrix(otu_table(ps))
+          if (!taxa_are_rows(otu_table(ps))) {
+            otu_mat <- t(otu_mat)
+          }
+          
+          # Create DGEList object
+          dge <- edgeR::DGEList(counts = otu_mat)
+          
+          # Calculate normalization factors
+          dge <- edgeR::calcNormFactors(dge, method = "TMM")
+          
+          # Get normalized counts
+          norm_counts <- edgeR::cpm(dge)
+          
+          # Create new otu_table
+          otu_norm <- otu_table(norm_counts, taxa_are_rows = TRUE)
+          
+          # Replace the otu_table in the phyloseq object
+          ps_norm <- phyloseq(otu_norm, 
+                             tax_table(ps), 
+                             sample_data(ps), 
+                             phy_tree(ps))
+          
+          method_desc <- "TMM (Trimmed Mean of M-values from edgeR)"
+        } else {
+          method_desc <- "TMM (failed - edgeR package not available)"
+        }
+      }
+      
+      # Store the normalized phyloseq object
+      normalized_ps(list(ps = ps_norm, method = method_desc))
+      
+    }, error = function(e) {
+      # Return error information
+      normalized_ps(list(
+        ps = NULL, 
+        method = paste("Error:", conditionMessage(e))
+      ))
+    })
+  })
+  
+  # Display normalization summary
+  output$normalizationSummary <- renderPrint({
+    norm <- normalized_ps()
+    
+    if (is.null(norm)) {
+      if (input$runNormMethod == "none" || input$runNormMethod == "relative") {
+        cat("Using", ifelse(input$runNormMethod == "none", "raw counts", "relative abundance"), "for analysis.\n")
+        cat("This is applied automatically to all analyses.\n")
+      } else {
+        cat("Normalization not yet computed. Click 'Compute Normalization' to apply the selected method.\n")
+      }
+    } else {
+      cat("Normalization method:", norm$method, "\n\n")
+      
+      if (!is.null(norm$ps)) {
+        # Print summary statistics for the normalized data
+        cat("Summary of normalized abundance values:\n")
+        otu <- otu_table(norm$ps)
+        otu_mat <- as.matrix(otu)
+        
+        cat("Min:", format(min(otu_mat), digits = 4), "\n")
+        cat("Max:", format(max(otu_mat), digits = 4), "\n")
+        cat("Mean:", format(mean(otu_mat), digits = 4), "\n")
+        cat("Median:", format(median(otu_mat), digits = 4), "\n")
+        
+        if (input$applyRunNormalization) {
+          cat("\nThis normalization is now being applied to all analyses in the dashboard.\n")
+        } else {
+          cat("\nTo use this normalization in other analyses, check 'Apply normalization to all analyses'.\n")
+        }
+      }
+    }
+  })
+  
+  # Normalization comparison plot
+  output$normalizationComparisonPlot <- renderPlotly({
+    norm <- normalized_ps()
+    ps <- filtered_ps()
+    
+    if (is.null(ps)) {
+      return(plot_ly() %>% 
+              layout(title = "No data available",
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = "Phyloseq object not loaded", 
+                      showarrow = FALSE
+                    )))
+    }
+    
+    # Get run assignments for coloring
+    runs <- detected_runs()
+    assignments <- run_assignments()
+    
+    # Create comparison visualization
+    tryCatch({
+      # Create a comparison plot showing raw, relative, and normalized abundances
+      # Start with raw counts
+      raw_sums <- sample_sums(ps)
+      raw_df <- data.frame(
+        Sample = names(raw_sums),
+        Value = raw_sums,
+        Type = "Raw counts"
+      )
+      
+      # Add relative abundance
+      rel_ps <- transform_sample_counts(ps, function(x) x / sum(x) * mean(raw_sums))
+      rel_sums <- sample_sums(rel_ps)
+      rel_df <- data.frame(
+        Sample = names(rel_sums),
+        Value = rel_sums,
+        Type = "Relative abundance (scaled)"
+      )
+      
+      # Create combined data frame
+      plot_df <- rbind(raw_df, rel_df)
+      
+      # Add normalized counts if available
+      if (!is.null(norm) && !is.null(norm$ps)) {
+        # Get normalized counts and scale to same range
+        norm_sums <- sample_sums(norm$ps)
+        scaling_factor <- mean(raw_sums) / mean(norm_sums)
+        norm_sums_scaled <- norm_sums * scaling_factor
+        
+        norm_df <- data.frame(
+          Sample = names(norm_sums),
+          Value = norm_sums_scaled,
+          Type = paste(norm$method, "(scaled)")
+        )
+        
+        # Add to plot data
+        plot_df <- rbind(plot_df, norm_df)
+      }
+      
+      # Add run information if available
+      if (!is.null(assignments) && nrow(assignments) > 0) {
+        # Create sample to run mapping
+        sample_to_run <- assignments$Run
+        names(sample_to_run) <- assignments$Sample
+        
+        # Add run column to plotting data
+        plot_df$Run <- sample_to_run[plot_df$Sample]
+        plot_df$Run[is.na(plot_df$Run)] <- "Unassigned"
+        
+        # Create comparison box plots by run
+        p <- ggplot(plot_df, aes(x = Run, y = Value, fill = Type, text = Sample)) +
+          geom_boxplot(position = position_dodge(width = 0.8)) +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+          labs(x = "Run", y = "Scaled Read Count", fill = "Normalization",
+               title = "Comparison of Normalization Methods Across Runs") +
+          scale_y_continuous(labels = scales::comma)
+      } else {
+        # Create simple boxplot comparison without runs
+        p <- ggplot(plot_df, aes(x = Type, y = Value, fill = Type, text = Sample)) +
+          geom_boxplot() +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+          labs(x = "Normalization Method", y = "Scaled Read Count", fill = "Normalization",
+               title = "Comparison of Normalization Methods") +
+          scale_y_continuous(labels = scales::comma)
+      }
+      
+      ggplotly(p, tooltip = c("text", "y", "fill"))
+      
+    }, error = function(e) {
+      # Return error plot
+      return(plot_ly() %>% 
+              layout(title = "Error in normalization comparison",
+                    annotations = list(
+                      x = 0.5, y = 0.5, 
+                      text = paste("Error:", conditionMessage(e)), 
+                      showarrow = FALSE
+                    )))
+    })
+  })
+  
+  # Override filtered_ps to use normalized version if requested
+  filtered_ps_orig <- filtered_ps
+  filtered_ps <- reactive({
+    # Check if normalization should be applied
+    if (input$applyRunNormalization && input$runNormMethod != "none") {
+      norm <- normalized_ps()
+      
+      if (!is.null(norm) && !is.null(norm$ps)) {
+        # Return the normalized version
+        return(norm$ps)
+      }
+      
+      # If normalization is requested but not computed, apply relative abundance
+      if (input$runNormMethod == "relative") {
+        ps <- filtered_ps_orig()
+        if (!is.null(ps)) {
+          return(transform_sample_counts(ps, function(x) x / sum(x)))
+        }
+      }
+    }
+    
+    # Return the original filtered phyloseq
+    return(filtered_ps_orig())
+  })
   
   output$downloadBiom <- downloadHandler(
     filename = function() {
