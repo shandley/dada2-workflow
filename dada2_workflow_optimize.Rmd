@@ -13,6 +13,296 @@ output:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Checkpointing functions
+checkpoint_dir <- "checkpoints"
+
+# Create a checkpoint
+save_checkpoint <- function(checkpoint_name, object_list, overwrite = FALSE) {
+  # Validate inputs
+  if(!is.character(checkpoint_name) || length(checkpoint_name) != 1) {
+    warning("Invalid checkpoint name. Must be a single character string.")
+    return(FALSE)
+  }
+  
+  if(!is.character(object_list) || length(object_list) < 1) {
+    warning("Invalid object list. Must be a character vector with at least one item.")
+    return(FALSE)
+  }
+  
+  # Create checkpoints directory if it doesn't exist
+  tryCatch({
+    if(!dir.exists(checkpoint_dir)) {
+      dir.create(checkpoint_dir, recursive = TRUE)
+      cat("Created checkpoints directory:", checkpoint_dir, "\n")
+    }
+  }, error = function(e) {
+    warning("Failed to create checkpoint directory: ", conditionMessage(e))
+    return(FALSE)
+  })
+  
+  # Construct the filename
+  filename <- file.path(checkpoint_dir, paste0(checkpoint_name, ".rds"))
+  
+  # Check if file exists and handle overwrite option
+  if(file.exists(filename) && !overwrite) {
+    cat("Checkpoint file already exists. Use overwrite = TRUE to overwrite.\n")
+    return(FALSE)
+  }
+  
+  # Create a list of objects to save
+  checkpoint_data <- list()
+  missing_objects <- character(0)
+  
+  for(obj_name in object_list) {
+    if(exists(obj_name, envir = .GlobalEnv)) {
+      tryCatch({
+        checkpoint_data[[obj_name]] <- get(obj_name, envir = .GlobalEnv)
+      }, error = function(e) {
+        missing_objects <- c(missing_objects, obj_name)
+        warning("Error retrieving object '", obj_name, "': ", conditionMessage(e))
+      })
+    } else {
+      missing_objects <- c(missing_objects, obj_name)
+      cat("Warning: Object", obj_name, "not found and not included in checkpoint.\n")
+    }
+  }
+  
+  # Report missing objects
+  if(length(missing_objects) > 0) {
+    cat("The following objects were not included in the checkpoint:", 
+        paste(missing_objects, collapse = ", "), "\n")
+    
+    # If all objects are missing, return an error
+    if(length(missing_objects) == length(object_list)) {
+      warning("No objects could be saved. Checkpoint creation failed.")
+      return(FALSE)
+    }
+  }
+  
+  # Add metadata
+  checkpoint_data$timestamp <- Sys.time()
+  checkpoint_data$object_names <- setdiff(object_list, missing_objects)
+  checkpoint_data$missing_objects <- missing_objects
+  
+  # Calculate approximate size of data to be saved
+  approx_size_mb <- utils::object.size(checkpoint_data) / (1024^2)
+  cat("Approximate checkpoint size:", round(approx_size_mb, 2), "MB\n")
+  
+  # Save the checkpoint
+  tryCatch({
+    saveRDS(checkpoint_data, filename)
+    cat("Checkpoint saved:", filename, "\n")
+    return(TRUE)
+  }, error = function(e) {
+    warning("Failed to save checkpoint: ", conditionMessage(e))
+    
+    # Check for disk space issues
+    if(grepl("cannot open|No space left", conditionMessage(e))) {
+      df <- system("df -h .", intern = TRUE)
+      cat("Disk space information:\n", paste(df, collapse = "\n"), "\n")
+    }
+    
+    return(FALSE)
+  })
+}
+
+# Load a checkpoint
+load_checkpoint <- function(checkpoint_name, confirm = TRUE) {
+  # Validate input
+  if(!is.character(checkpoint_name) || length(checkpoint_name) != 1) {
+    warning("Invalid checkpoint name. Must be a single character string.")
+    return(FALSE)
+  }
+  
+  # Construct the filename
+  filename <- file.path(checkpoint_dir, paste0(checkpoint_name, ".rds"))
+  
+  # Check if file exists
+  if(!file.exists(filename)) {
+    cat("Checkpoint file not found:", filename, "\n")
+    available <- list.files(checkpoint_dir, pattern = "\\.rds$")
+    if(length(available) > 0) {
+      cat("Available checkpoints:", paste(gsub("\\.rds$", "", available), collapse = ", "), "\n")
+    }
+    return(FALSE)
+  }
+  
+  # Load the checkpoint data
+  tryCatch({
+    checkpoint_data <- readRDS(filename)
+    
+    # Verify that loaded checkpoint has the expected structure
+    if(!is.list(checkpoint_data) || 
+       !all(c("timestamp", "object_names") %in% names(checkpoint_data))) {
+      warning("Invalid checkpoint file: missing required metadata.")
+      return(FALSE)
+    }
+    
+    # Calculate checkpoint file size
+    filesize_mb <- round(file.info(filename)$size / (1024^2), 2)
+    
+    # Display checkpoint info
+    cat("Checkpoint:", checkpoint_name, "\n")
+    cat("Created:", format(checkpoint_data$timestamp), "\n")
+    cat("File size:", filesize_mb, "MB\n")
+    cat("Contains", length(checkpoint_data$object_names), "objects:", 
+        paste(checkpoint_data$object_names, collapse = ", "), "\n")
+    
+    # Show missing objects if any
+    if("missing_objects" %in% names(checkpoint_data) && 
+       length(checkpoint_data$missing_objects) > 0) {
+      cat("Note: The following objects were missing when this checkpoint was created:\n",
+          paste(checkpoint_data$missing_objects, collapse = ", "), "\n")
+    }
+    
+    # Confirm before loading
+    if(confirm) {
+      response <- readline("Load this checkpoint? (y/n): ")
+      if(tolower(response) != "y") {
+        cat("Checkpoint loading cancelled.\n")
+        return(FALSE)
+      }
+    }
+    
+    # Check for potential conflicts
+    conflicts <- character(0)
+    for(obj_name in checkpoint_data$object_names) {
+      if(exists(obj_name, envir = .GlobalEnv)) {
+        conflicts <- c(conflicts, obj_name)
+      }
+    }
+    
+    if(length(conflicts) > 0) {
+      cat("Warning: The following objects already exist in your environment and will be overwritten:\n",
+          paste(conflicts, collapse = ", "), "\n")
+      
+      if(confirm) {
+        response <- readline("Continue and overwrite these objects? (y/n): ")
+        if(tolower(response) != "y") {
+          cat("Checkpoint loading cancelled.\n")
+          return(FALSE)
+        }
+      }
+    }
+    
+    # Load objects into global environment
+    loaded_objects <- character(0)
+    for(obj_name in checkpoint_data$object_names) {
+      if(obj_name %in% names(checkpoint_data)) {
+        tryCatch({
+          assign(obj_name, checkpoint_data[[obj_name]], envir = .GlobalEnv)
+          loaded_objects <- c(loaded_objects, obj_name)
+        }, error = function(e) {
+          warning("Error loading object '", obj_name, "': ", conditionMessage(e))
+        })
+      }
+    }
+    
+    # Report outcome
+    if(length(loaded_objects) == 0) {
+      warning("No objects were loaded from the checkpoint.")
+      return(FALSE)
+    } else if(length(loaded_objects) < length(checkpoint_data$object_names)) {
+      cat("Partially loaded checkpoint. Loaded", length(loaded_objects), "of", 
+          length(checkpoint_data$object_names), "objects.\n")
+    } else {
+      cat("Checkpoint loaded successfully!\n")
+    }
+    
+    return(TRUE)
+  }, error = function(e) {
+    warning("Error loading checkpoint: ", conditionMessage(e))
+    
+    # Check file corruption
+    if(grepl("unexpected|corrupt|read error", conditionMessage(e))) {
+      cat("The checkpoint file appears to be corrupted or unreadable.\n")
+    }
+    
+    return(FALSE)
+  })
+}
+
+# List all available checkpoints
+list_checkpoints <- function() {
+  # Check if checkpoint directory exists
+  if(!dir.exists(checkpoint_dir)) {
+    cat("No checkpoints directory found.\n")
+    return(NULL)
+  }
+  
+  # Get list of checkpoint files
+  tryCatch({
+    checkpoint_files <- list.files(checkpoint_dir, pattern = "\\.rds$")
+    
+    if(length(checkpoint_files) == 0) {
+      cat("No checkpoints found in", checkpoint_dir, "\n")
+      return(NULL)
+    }
+    
+    # Create info dataframe
+    checkpoint_info <- data.frame(
+      checkpoint = gsub("\\.rds$", "", checkpoint_files),
+      file = checkpoint_files,
+      timestamp = NA,
+      size_mb = NA,
+      objects_count = NA,
+      objects = NA,
+      status = NA,
+      stringsAsFactors = FALSE
+    )
+    
+    # Loop through files and extract info
+    for(i in 1:nrow(checkpoint_info)) {
+      filename <- file.path(checkpoint_dir, checkpoint_info$file[i])
+      
+      # Get file size
+      file_info <- file.info(filename)
+      checkpoint_info$size_mb[i] <- round(file_info$size / (1024^2), 2)
+      
+      # Try to read checkpoint data
+      tryCatch({
+        checkpoint_data <- readRDS(filename)
+        
+        # Basic validation of checkpoint structure
+        if(!is.list(checkpoint_data) || 
+           !all(c("timestamp", "object_names") %in% names(checkpoint_data))) {
+          checkpoint_info$timestamp[i] <- as.character(file_info$mtime)
+          checkpoint_info$objects_count[i] <- NA
+          checkpoint_info$objects[i] <- NA
+          checkpoint_info$status[i] <- "Invalid format"
+        } else {
+          # Extract metadata
+          checkpoint_info$timestamp[i] <- as.character(checkpoint_data$timestamp)
+          checkpoint_info$objects_count[i] <- length(checkpoint_data$object_names)
+          checkpoint_info$objects[i] <- paste(checkpoint_data$object_names, collapse = ", ")
+          checkpoint_info$status[i] <- "Valid"
+          
+          # Check for missing objects
+          if("missing_objects" %in% names(checkpoint_data) && 
+             length(checkpoint_data$missing_objects) > 0) {
+            checkpoint_info$status[i] <- paste0("Valid (", 
+                                             length(checkpoint_data$missing_objects), 
+                                             " missing objects)")
+          }
+        }
+      }, error = function(e) {
+        checkpoint_info$timestamp[i] <- as.character(file_info$mtime)
+        checkpoint_info$objects_count[i] <- NA
+        checkpoint_info$objects[i] <- "Unknown"
+        checkpoint_info$status[i] <- paste0("Error: ", conditionMessage(e))
+      })
+    }
+    
+    # Sort by timestamp (most recent first)
+    checkpoint_info <- checkpoint_info[order(checkpoint_info$timestamp, decreasing = TRUE), ]
+    
+    return(checkpoint_info)
+  }, error = function(e) {
+    warning("Error listing checkpoints: ", conditionMessage(e))
+    return(NULL)
+  })
+}
 ```
 
 # Introduction
@@ -51,6 +341,55 @@ plan(multisession, workers = min(parallel::detectCores() - 1, 4))
 
 # Set the random seed for reproducibility
 set.seed(100)
+
+# Check for existing checkpoints and allow recovery
+tryCatch({
+  if(dir.exists("checkpoints")) {
+    cat("Checking for available checkpoints...\n")
+    checkpoint_table <- list_checkpoints()
+    
+    if(!is.null(checkpoint_table) && nrow(checkpoint_table) > 0) {
+      # Display checkpoint information in a readable format
+      display_table <- checkpoint_table[, c("checkpoint", "timestamp", "size_mb", "objects_count", "status")]
+      colnames(display_table) <- c("Checkpoint", "Created", "Size (MB)", "Objects", "Status")
+      
+      # Print formatted table
+      cat("Available checkpoints:\n")
+      print(display_table)
+      
+      # Prompt user to restore from checkpoint
+      cat("\nWould you like to restore from a checkpoint? If so, enter the checkpoint name, or press Enter to start fresh: ")
+      checkpoint_to_load <- readline()
+      
+      if(checkpoint_to_load != "") {
+        # Check if entered checkpoint exists
+        if(checkpoint_to_load %in% checkpoint_table$checkpoint) {
+          # Try to load the specified checkpoint
+          load_result <- load_checkpoint(checkpoint_to_load, confirm = TRUE)
+          
+          if(load_result) {
+            cat("Workflow will continue from checkpoint", checkpoint_to_load, "\n")
+          } else {
+            cat("Starting fresh workflow run\n")
+          }
+        } else {
+          cat("Checkpoint '", checkpoint_to_load, "' not found. Available checkpoints are:\n", 
+              paste(checkpoint_table$checkpoint, collapse = ", "), "\n")
+          cat("Starting fresh workflow run\n")
+        }
+      } else {
+        cat("Starting fresh workflow run\n")
+      }
+    } else {
+      cat("No valid checkpoints found. Starting fresh workflow run.\n")
+    }
+  } else {
+    cat("No checkpoint directory found. Starting fresh workflow run.\n")
+  }
+}, error = function(e) {
+  warning("Error checking for checkpoints: ", conditionMessage(e))
+  cat("Starting fresh workflow run due to error in checkpoint system.\n")
+})
 ```
 
 # Set Working Directory and Locate Files
@@ -596,6 +935,14 @@ filter_summary$PercentRetained <- round(filter_summary$reads.out / filter_summar
 filter_summary <- filter_summary[, c("SampleName", "reads.in", "reads.out", "PercentRetained")]
 colnames(filter_summary) <- c("Sample", "Input Reads", "Filtered Reads", "% Retained")
 
+# Create checkpoint after filter and trim step
+save_checkpoint("after_filter_trim", 
+               c("fnFs", "fnRs", "filtFs", "filtRs", "out", "sample.names", 
+                 "truncLen_forward", "truncLen_reverse", "maxEE_forward", "maxEE_reverse",
+                 "truncation_lengths", "maxEE_params", "expected_amplicon_size"),
+               overwrite = TRUE)
+cat("Checkpoint saved after filter and trim step\n")
+
 # View filtering statistics
 kable(filter_summary, caption = "Filtering Statistics", row.names = FALSE)
 
@@ -685,6 +1032,13 @@ errR_plot <- plotErrors(errR, nominalQ = TRUE) +
 
 # Create a side-by-side plot
 grid.arrange(errF_plot, errR_plot, ncol = 2)
+
+# Create checkpoint after learning error rates
+save_checkpoint("after_error_learning", 
+               c("filtFs", "filtRs", "errF", "errR", "sample.names",
+                 "truncLen_forward", "truncLen_reverse", "maxEE_forward", "maxEE_reverse"),
+               overwrite = TRUE)
+cat("Checkpoint saved after error learning step\n")
 ```
 
 # Dereplication
@@ -715,6 +1069,12 @@ kable(head(derep_summary, 10), caption = "Dereplication Summary (First 10 Sample
 avg_compression <- mean(derep_summary$CompressionRatio)
 cat("Average compression ratio:", round(avg_compression, 1), 
     "reads per unique sequence\n")
+    
+# Create checkpoint after dereplication step
+save_checkpoint("after_dereplication", 
+               c("filtFs", "filtRs", "errF", "errR", "derepFs", "derepRs", "sample.names"),
+               overwrite = TRUE)
+cat("Checkpoint saved after dereplication step\n")
 ```
 
 # Sample Inference
@@ -750,6 +1110,12 @@ avg_denoised_pct <- mean(denoise_summary$PercentRetained)
 total_asvs_forward <- sum(sapply(dadaFs, function(x) length(x$denoised)))
 cat("Average percentage of reads retained after denoising:", round(avg_denoised_pct, 1), "%\n")
 cat("Total ASVs identified in forward reads:", total_asvs_forward, "\n")
+
+# Create checkpoint after sample inference step
+save_checkpoint("after_sample_inference", 
+               c("derepFs", "derepRs", "errF", "errR", "dadaFs", "dadaRs", "sample.names"),
+               overwrite = TRUE)
+cat("Checkpoint saved after sample inference step\n")
 ```
 
 # Merge Paired Reads
@@ -789,6 +1155,13 @@ if (nrow(low_merge_samples) > 0) {
   cat("WARNING:", nrow(low_merge_samples), "samples have low merging rates (<50%):\n")
   print(low_merge_samples)
 }
+
+# Create checkpoint after merging reads step
+save_checkpoint("after_merge_reads", 
+               c("derepFs", "derepRs", "dadaFs", "dadaRs", "mergers", "sample.names",
+                 "truncation_lengths"),
+               overwrite = TRUE)
+cat("Checkpoint saved after merging paired reads step\n")
 ```
 
 # Construct ASV Table
@@ -848,6 +1221,12 @@ cat("Removed", original_reads - filtered_reads, "reads (",
 
 # Use filtered sequence table for further analysis
 seqtab <- seqtab_filtered
+
+# Create checkpoint after ASV table construction step
+save_checkpoint("after_asv_table", 
+               c("mergers", "seqtab", "sample.names", "seqtab_filtered", "expected_amplicon_size"),
+               overwrite = TRUE)
+cat("Checkpoint saved after ASV table construction step\n")
 ```
 
 # Remove Chimeras
@@ -883,6 +1262,12 @@ if (chimera_pct < 50) {
   cat("This could indicate poor read merging or excessive chimera removal.\n")
   cat("Consider revisiting the truncation lengths and quality filtering parameters.\n")
 }
+
+# Create checkpoint after chimera removal step
+save_checkpoint("after_chimera_removal", 
+               c("seqtab", "seqtab.nochim", "sample.names", "chimera_pct"),
+               overwrite = TRUE)
+cat("Checkpoint saved after chimera removal step\n")
 ```
 
 # Track Reads Through the Pipeline
@@ -1788,6 +2173,12 @@ cat("Saved all taxonomy results to results/all_taxonomy_results.rds\n")
 # Save the final consensus taxonomy as CSV
 write.csv(taxa, "results/taxonomy.csv")
 cat("Saved final taxonomy to results/taxonomy.csv\n")
+
+# Create checkpoint after taxonomy assignment step
+save_checkpoint("after_taxonomy", 
+               c("seqtab.nochim", "taxa", "taxa_results", "sample.names", "track_df"),
+               overwrite = TRUE)
+cat("Checkpoint saved after taxonomy assignment step\n")
 ```
 
 # Create Phyloseq Object
@@ -1870,6 +2261,12 @@ ps_counts <- tibble(
   arrange(desc(ReadCount))
 
 kable(head(ps_counts, 10), caption = "Sample Read Counts (Top 10)")
+
+# Create checkpoint after phyloseq creation step
+save_checkpoint("after_phyloseq", 
+               c("seqtab.nochim", "taxa", "ps", "sample_metadata", "track_df"),
+               overwrite = TRUE)
+cat("Checkpoint saved after phyloseq creation step\n")
 ```
 
 # Save Results
@@ -1947,6 +2344,32 @@ Key enhancements in this optimized workflow:
 5. **Extensive quality control** throughout the pipeline
 6. **Detailed visualization** of results at each step
 7. **Comprehensive results export** for downstream analysis
+
+## Checkpointing System
+
+This workflow includes a robust checkpointing system that saves intermediate results after each computationally intensive step. Checkpoints provide several benefits:
+
+1. **Workflow Resilience**: If a long-running analysis is interrupted, you can restart from the last successful checkpoint instead of beginning again
+2. **Parameter Experimentation**: Run parts of the workflow with different parameters without rerunning earlier steps
+3. **Saving Time**: Skip time-consuming steps when you're just making changes to later parts of the analysis
+4. **Memory Management**: Break a large analysis into manageable chunks that fit within available memory
+
+Checkpoints are saved in the `checkpoints/` directory and can be loaded at the start of a workflow run. To work with checkpoints:
+
+- At the beginning of a workflow, you will be prompted to load an existing checkpoint if any are available
+- To manually load a checkpoint, use `load_checkpoint("checkpoint_name")`
+- To list all available checkpoints, use `list_checkpoints()`
+
+This optimized workflow creates checkpoints after each major processing step:
+- After filtering and trimming
+- After error learning
+- After dereplication
+- After sample inference
+- After read merging
+- After ASV table construction
+- After chimera removal
+- After taxonomy assignment
+- After phyloseq object creation
 
 To visualize and explore your results interactively, you can use the companion dashboard:
 
