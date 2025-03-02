@@ -547,6 +547,21 @@ tryCatch({
 
 # Set Working Directory and Configure for Single or Multi-Run Processing
 
+The following chunk configures the workflow for either single-run or multi-run processing. The workflow can handle:
+
+1. **Single-run mode**: All FASTQ files in the `data/` directory are processed together
+2. **Multi-run mode**: Multiple sequencing runs in separate subdirectories are processed with run-specific error models
+   - Each run is processed independently through the denoising step
+   - Results are combined for downstream analysis
+   - Run information is preserved for batch effect analysis
+
+The configuration automatically:
+- Detects if multi-run mode is enabled via parameters
+- Locates the appropriate data directories
+- Finds FASTQ files with flexible naming pattern detection
+- Configures memory management for big datasets
+- Sets up appropriate data structures for tracking run information
+
 ```{r run-configuration}
 # Check for multi-run mode specified in parameters
 is_multi_run <- params$multi_run
