@@ -58,52 +58,83 @@ checkpoint_dir <- "checkpoints"
 
 # Enhanced package checking and loading function
 check_and_load_packages <- function() {
-  required_packages <- c(
-    "dada2", "ggplot2", "phyloseq", "Biostrings", "ShortRead", 
-    "tidyverse", "gridExtra", "knitr", "future", "future.apply"
+  # Set CRAN mirror to avoid "no mirror selected" errors
+  if (is.null(getOption("repos")) || getOption("repos") == "@CRAN@") {
+    options(repos = c(CRAN = "https://cloud.r-project.org"))
+  }
+
+  # Packages from CRAN
+  cran_required_packages <- c(
+    "ggplot2", "tidyverse", "gridExtra", "knitr", "future", "future.apply", "taxize"
   )
   
-  optional_packages <- c(
-    "DECIPHER", "phangorn", "msa", "taxize"
+  # Packages from Bioconductor
+  bioc_required_packages <- c(
+    "dada2", "phyloseq", "Biostrings", "ShortRead"
   )
   
-  missing_required <- required_packages[!sapply(required_packages, requireNamespace, quietly = TRUE)]
-  missing_optional <- optional_packages[!sapply(optional_packages, requireNamespace, quietly = TRUE)]
+  # Combined required packages
+  required_packages <- c(cran_required_packages, bioc_required_packages)
   
-  # Alert about missing required packages
-  if (length(missing_required) > 0) {
-    message("Installing required packages: ", paste(missing_required, collapse = ", "))
-    for (pkg in missing_required) {
-      if (pkg %in% c("dada2", "DECIPHER", "phyloseq", "ShortRead", "Biostrings")) {
-        if (!requireNamespace("BiocManager", quietly = TRUE)) {
-          install.packages("BiocManager")
-        }
-        BiocManager::install(pkg, update = FALSE)
-      } else {
-        install.packages(pkg)
-      }
+  # Optional packages - split by source
+  cran_optional_packages <- c("vegan")
+  bioc_optional_packages <- c("DECIPHER", "phangorn", "msa")
+  
+  # Combined optional packages
+  optional_packages <- c(cran_optional_packages, bioc_optional_packages)
+  
+  # Check which packages are missing
+  missing_cran_required <- cran_required_packages[!sapply(cran_required_packages, requireNamespace, quietly = TRUE)]
+  missing_bioc_required <- bioc_required_packages[!sapply(bioc_required_packages, requireNamespace, quietly = TRUE)]
+  missing_cran_optional <- cran_optional_packages[!sapply(cran_optional_packages, requireNamespace, quietly = TRUE)]
+  missing_bioc_optional <- bioc_optional_packages[!sapply(bioc_optional_packages, requireNamespace, quietly = TRUE)]
+  
+  # Install BiocManager if needed
+  if ((length(missing_bioc_required) > 0 || length(missing_bioc_optional) > 0) && 
+      !requireNamespace("BiocManager", quietly = TRUE)) {
+    message("Installing BiocManager...")
+    install.packages("BiocManager")
+  }
+  
+  # Install missing required packages
+  if (length(missing_cran_required) > 0) {
+    message("Installing required CRAN packages: ", paste(missing_cran_required, collapse = ", "))
+    install.packages(missing_cran_required)
+  }
+  
+  if (length(missing_bioc_required) > 0) {
+    message("Installing required Bioconductor packages: ", paste(missing_bioc_required, collapse = ", "))
+    for (pkg in missing_bioc_required) {
+      BiocManager::install(pkg, update = FALSE)
     }
   }
   
   # Alert about missing optional packages but don't install automatically
-  if (length(missing_optional) > 0) {
+  if (length(missing_cran_optional) > 0 || length(missing_bioc_optional) > 0) {
+    missing_optional <- c(missing_cran_optional, missing_bioc_optional)
     message("NOTE: The following optional packages are not installed: ", 
             paste(missing_optional, collapse = ", "))
-    message("These packages enable additional functionality like phylogenetic tree building.")
+    message("These packages enable additional functionality like phylogenetic tree building and diversity analysis.")
     message("You can install them with:")
     
-    for (pkg in missing_optional) {
-      if (pkg %in% c("DECIPHER", "phangorn")) {
-        message("  BiocManager::install('", pkg, "')")
-      } else {
-        message("  install.packages('", pkg, "')")
-      }
+    if (length(missing_cran_optional) > 0) {
+      message("  # From CRAN:")
+      message("  install.packages(c('", paste(missing_cran_optional, collapse = "', '"), "'))")
+    }
+    
+    if (length(missing_bioc_optional) > 0) {
+      message("  # From Bioconductor:")
+      message("  BiocManager::install(c('", paste(missing_bioc_optional, collapse = "', '"), "'))")
     }
   }
   
   # Load all required packages
   for (pkg in required_packages) {
-    suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+    if (requireNamespace(pkg, quietly = TRUE)) {
+      suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+    } else {
+      warning("Required package '", pkg, "' could not be loaded.")
+    }
   }
   
   # Load available optional packages
@@ -113,11 +144,15 @@ check_and_load_packages <- function() {
     }
   }
   
+  # Create a comprehensive list of all Bioconductor packages
+  all_bioc_packages <- c(bioc_required_packages, bioc_optional_packages)
+  
   return(list(
     required = required_packages,
     optional = intersect(optional_packages, 
                         optional_packages[sapply(optional_packages, requireNamespace, quietly = TRUE)]),
-    missing = missing_optional
+    missing = c(missing_cran_optional, missing_bioc_optional),
+    bioconductor_packages = all_bioc_packages
   ))
 }
 
