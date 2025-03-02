@@ -3,6 +3,69 @@
 # Run the DADA2 Results Dashboard
 # This script helps launch the interactive dashboard for visualizing DADA2 results
 
+# Command line arguments support for headless report generation
+args <- commandArgs(trailingOnly = TRUE)
+
+# Check if report generation was requested
+generate_report <- FALSE
+if (length(args) > 0 && "--generate-report" %in% args) {
+  generate_report <- TRUE
+  
+  # Default parameters
+  output_format <- "html"
+  output_dir <- "reports"
+  output_file <- "dada2_workflow_report"
+  
+  # Check for format parameter
+  format_idx <- match("--format", args)
+  if (!is.na(format_idx) && format_idx < length(args)) {
+    output_format <- args[format_idx + 1]
+  }
+  
+  # Check for output directory parameter
+  dir_idx <- match("--output-dir", args)
+  if (!is.na(dir_idx) && dir_idx < length(args)) {
+    output_dir <- args[dir_idx + 1]
+  }
+  
+  # Check for output file parameter
+  file_idx <- match("--output-file", args)
+  if (!is.na(file_idx) && file_idx < length(args)) {
+    output_file <- args[file_idx + 1]
+  }
+  
+  # If report generation was requested, render the report and exit
+  if (generate_report) {
+    cat("Generating DADA2 workflow report...\n")
+    cat("Format:", output_format, "\n")
+    cat("Output directory:", output_dir, "\n")
+    cat("Output file:", output_file, "\n")
+    
+    # Load rmarkdown package
+    if (!requireNamespace("rmarkdown", quietly = TRUE)) {
+      cat("Installing rmarkdown package...\n")
+      install.packages("rmarkdown")
+    }
+    
+    # Render the report
+    rmarkdown::render(
+      input = "dada2_workflow.Rmd",
+      output_format = output_format,
+      output_dir = output_dir,
+      output_file = output_file,
+      params = list(
+        generate_report = TRUE,
+        output_format = output_format,
+        output_dir = output_dir,
+        output_file = output_file
+      )
+    )
+    
+    cat("Report generated successfully!\n")
+    q(status = 0)
+  }
+}
+
 # Check for required packages and install if missing
 required_packages <- c(
   "shiny",          # Web application framework for R

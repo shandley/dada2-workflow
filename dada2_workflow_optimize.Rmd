@@ -8,7 +8,17 @@ output:
     toc_float: true
     theme: united
     highlight: tango
-    code_folding: show
+    code_folding: hide
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    latex_engine: xelatex
+params:
+  generate_report: FALSE
+  output_format: "html"
+  output_dir: "reports"
+  output_file: "dada2_workflow_report"
 ---
 
 ```{r setup, include=FALSE}
@@ -3651,6 +3661,44 @@ saveRDS(workflow_summary, "results/workflow_summary.rds")
 cat("Saved workflow summary to results/workflow_summary.rds\n")
 ```
 
+# Generate Automated Report
+
+```{r generate-report, eval=params$generate_report}
+# Only execute this block if report generation is requested via parameters
+
+# Create reports directory if it doesn't exist
+if(!dir.exists(params$output_dir)) {
+  dir.create(params$output_dir, recursive = TRUE)
+  cat("Created reports directory:", params$output_dir, "\n")
+}
+
+# Current date for report filename
+report_date <- format(Sys.Date(), "%Y%m%d")
+
+# Create output filename
+output_file <- file.path(params$output_dir, 
+                         paste0(params$output_file, "_", report_date))
+
+# Generate the report
+report_result <- try({
+  rmarkdown::render(
+    input = knitr::current_input(),  # Use current file as input
+    output_format = params$output_format,
+    output_file = output_file,
+    params = list(
+      generate_report = FALSE  # Prevent infinite recursion
+    ),
+    envir = new.env(parent = globalenv())
+  )
+}, silent = TRUE)
+
+if(inherits(report_result, "try-error")) {
+  cat("Error generating report:", conditionMessage(report_result), "\n")
+} else {
+  cat("Report successfully generated:", output_file, "\n")
+}
+```
+
 # Conclusion
 
 This document outlines an optimized DADA2 workflow for processing 16S rRNA gene amplicon data. The workflow includes automatic parameter optimization based on your sequencing data, quality filtering, denoising, merging paired reads, chimera removal, and taxonomic assignment to generate a table of amplicon sequence variants (ASVs).
@@ -3666,6 +3714,7 @@ Key enhancements in this optimized workflow:
 7. **Extensive quality control** throughout the pipeline
 8. **Detailed visualization** of results at each step
 9. **Comprehensive results export** for downstream analysis
+10. **Automated HTML/PDF report generation**
 
 ## Checkpointing System
 
@@ -3693,6 +3742,23 @@ This optimized workflow creates checkpoints after each major processing step:
 - After taxonomy assignment
 - After phyloseq object creation
 - After phylogenetic tree construction
+
+## Automated Reporting
+
+This workflow supports automated report generation in both HTML and PDF formats. To generate a report, use the following command-line options with the `run_dashboard.R` script:
+
+```bash
+# Generate HTML report (default)
+Rscript run_dashboard.R --generate-report
+
+# Generate PDF report
+Rscript run_dashboard.R --generate-report --format pdf_document
+
+# Customize output location and filename
+Rscript run_dashboard.R --generate-report --output-dir custom/path --output-file custom_name
+```
+
+The report will include all the plots, tables, and analysis results with the code optionally hidden (toggled via the code_folding parameter). Reports are automatically timestamped and saved in the specified output directory.
 
 To visualize and explore your results interactively, you can use the companion dashboard:
 

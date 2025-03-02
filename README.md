@@ -16,6 +16,7 @@ This repository contains an RMarkdown workflow that implements the complete DADA
 6. **Chimera removal** - Remove artifactual sequences
 7. **Taxonomic assignment** - Classify ASVs
 8. **Output generation** - Create tables and visualizations
+9. **Automated reporting** - Generate HTML/PDF reports
 
 ## Requirements
 
@@ -74,6 +75,18 @@ This repository contains an RMarkdown workflow that implements the complete DADA
    
    # Note: If you encounter a greyed-out dashboard, try restarting R
    # and running the dashboard again
+   ```
+
+7. Generate automated reports:
+   ```bash
+   # Generate HTML report (default)
+   Rscript run_dashboard.R --generate-report
+   
+   # Generate PDF report
+   Rscript run_dashboard.R --generate-report --format pdf_document
+   
+   # Customize output location and filename
+   Rscript run_dashboard.R --generate-report --output-dir custom/path --output-file custom_name
    ```
 
 ## Customizing the Workflow
