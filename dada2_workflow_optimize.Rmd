@@ -2756,15 +2756,55 @@ taxa_results <- list()
 ```
 
 ```{r silva-taxonomy}
+# ===================================================================
+# Enhanced Taxonomy Assignment with Confidence Scores
+# ===================================================================
+# 
+# This section implements reference-based taxonomy confidence scoring 
+# functionality to improve taxonomy assignment reliability assessment.
+#
+# Key enhancements include:
+#
+# 1. Bootstrap confidence scores for taxonomic assignments
+#    - Uses DADA2's bootstrap confidence estimation
+#    - Reports confidence percentages (0-100%) for each taxonomic level
+#    - Provides species-level confidence for exact matches
+#
+# 2. Visualization of confidence scores
+#    - Distribution of confidence values by taxonomic level
+#    - Identification of low-confidence assignments
+#    - Summary statistics of assignment confidence
+#
+# 3. Confidence-based taxonomy filtering
+#    - Optional filtering based on confidence thresholds
+#    - Customizable thresholds by taxonomic level
+#    - Comparison between raw and filtered assignments
+#
+# 4. Data export
+#    - Taxonomic assignments with confidence scores
+#    - Filtered taxonomy based on confidence thresholds
+#    - Visualization outputs for reports
+#
+# The confidence scores help researchers:
+# - Assess reliability of taxonomic assignments
+# - Identify potentially problematic assignments
+# - Apply appropriate filtering based on research needs
+# - Report assignment quality metrics in publications
+#
+# Confidence thresholds can be customized based on study requirements,
+# with more stringent thresholds typically applied at lower taxonomic
+# levels where assignment uncertainty is higher.
+# ===================================================================
+
 # DADA2 with SILVA database (default method)
 if (taxonomy_methods$SILVA_DADA2) {
-  cat("\n=== Method 1: DADA2 with SILVA database ===\n")
+  cat("\n=== Method 1: DADA2 with SILVA database (with confidence scores) ===\n")
   
   # Download/locate SILVA database
   silva_files <- download_ref_db("SILVA")
   
-  # Assign taxonomy at the genus level with optimized parallelization
-  cat("Assigning taxonomy using Silva database with optimized parallelization...\n")
+  # Assign taxonomy at the genus level with optimized parallelization and include confidence scores
+  cat("Assigning taxonomy using Silva database with confidence scores and optimized parallelization...\n")
 
   # For large datasets, use batched taxonomy assignment
   if(ncol(seqtab.nochim) > 3000) {
@@ -2775,8 +2815,9 @@ if (taxonomy_methods$SILVA_DADA2) {
     asv_sequences <- colnames(seqtab.nochim)
     n_batches <- ceiling(length(asv_sequences) / batch_size)
     
-    # Initialize results matrix
+    # Initialize results matrices
     taxa_silva <- NULL
+    taxa_silva_confidence <- NULL
     
     # Process each batch
     for(i in 1:n_batches) {
@@ -2792,37 +2833,93 @@ if (taxonomy_methods$SILVA_DADA2) {
       # Create a mini sequence table with just these ASVs
       batch_seqtab <- seqtab.nochim[, batch_seqs, drop=FALSE]
       
-      # Assign taxonomy for this batch
-      batch_taxa <- assignTaxonomy(batch_seqtab, silva_files$train, multithread=TRUE)
+      # Assign taxonomy for this batch with confidence scores
+      batch_taxa_result <- assignTaxonomy(batch_seqtab, silva_files$train, multithread=TRUE, 
+                                         outputBootstraps=TRUE)
       
-      # Add species assignments
-      batch_taxa <- addSpecies(batch_taxa, silva_files$species)
+      # Extract taxonomic assignments and bootstrap confidence values
+      batch_taxa <- batch_taxa_result$tax
+      batch_confidence <- batch_taxa_result$boot
+      
+      # Add species assignments with confidence scores
+      batch_species_result <- addSpecies(batch_taxa, silva_files$species, allowMultiple=FALSE,
+                                        tryRC=TRUE, verbose=TRUE)
+      
+      # Prepare species-level confidence (assumed 100% for exact matches, NA for no match)
+      n_asvs <- nrow(batch_taxa)
+      species_confidence <- rep(NA, n_asvs)
+      species_confidence[!is.na(batch_species_result[, "Species"])] <- 100
+      
+      # Add species confidence to the bootstrap confidence matrix
+      batch_confidence <- cbind(batch_confidence, Species=species_confidence)
       
       # Combine with previous results
       if(is.null(taxa_silva)) {
-        taxa_silva <- batch_taxa
+        taxa_silva <- batch_species_result
+        taxa_silva_confidence <- batch_confidence
       } else {
-        taxa_silva <- rbind(taxa_silva, batch_taxa)
+        taxa_silva <- rbind(taxa_silva, batch_species_result)
+        taxa_silva_confidence <- rbind(taxa_silva_confidence, batch_confidence)
       }
       
       # Force garbage collection
       gc()
     }
   } else {
-    # For smaller datasets, use the standard approach
-    taxa_silva <- assignTaxonomy(seqtab.nochim, silva_files$train, multithread=TRUE)
+    # For smaller datasets, use the standard approach with confidence scores
+    cat("Assigning taxonomy with bootstrap confidence values...\n")
+    taxa_result <- assignTaxonomy(seqtab.nochim, silva_files$train, multithread=TRUE, 
+                                  outputBootstraps=TRUE)
+    
+    # Extract taxonomic assignments and bootstrap confidence values
+    taxa_silva <- taxa_result$tax
+    taxa_silva_confidence <- taxa_result$boot
     
     # Add species-level assignments
     cat("Adding species-level assignments...\n")
-    taxa_silva <- addSpecies(taxa_silva, silva_files$species)
+    taxa_silva <- addSpecies(taxa_silva, silva_files$species, allowMultiple=FALSE,
+                            tryRC=TRUE, verbose=TRUE)
+    
+    # Prepare species-level confidence (assumed 100% for exact matches, NA for no match)
+    n_asvs <- nrow(taxa_silva)
+    species_confidence <- rep(NA, n_asvs)
+    species_confidence[!is.na(taxa_silva[, "Species"])] <- 100
+    
+    # Add species confidence to the bootstrap confidence matrix
+    taxa_silva_confidence <- cbind(taxa_silva_confidence, Species=species_confidence)
   }
   
-  # View taxonomic assignments
-  cat("First few taxonomic assignments:\n")
+  # View taxonomic assignments and confidence scores
+  cat("First few taxonomic assignments with confidence scores:\n")
   print(head(taxa_silva))
+  cat("\nCorresponding confidence scores (bootstrap support %):\n")
+  print(head(taxa_silva_confidence))
+  
+  # Create a combined data frame with taxa and confidence for easier visualization and export
+  taxa_with_confidence <- as.data.frame(taxa_silva)
+  taxa_with_confidence$ASV_ID <- rownames(taxa_with_confidence)
+  
+  # Create confidence data frame
+  confidence_df <- as.data.frame(taxa_silva_confidence)
+  confidence_df$ASV_ID <- rownames(confidence_df)
+  
+  # Add confidence score columns with prefix "Confidence_"
+  for (level in c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")) {
+    if (level %in% colnames(confidence_df)) {
+      confidence_col_name <- paste0("Confidence_", level)
+      taxa_with_confidence[[confidence_col_name]] <- confidence_df[[level]]
+    }
+  }
   
   # Save to results list
   taxa_results$SILVA_DADA2 <- taxa_silva
+  taxa_results$SILVA_DADA2_confidence <- taxa_silva_confidence
+  taxa_results$SILVA_DADA2_combined <- taxa_with_confidence
+  
+  # Export the combined taxonomy and confidence scores
+  if (!dir.exists("results")) dir.create("results")
+  write.csv(taxa_with_confidence, "results/taxonomy_with_confidence.csv", row.names = FALSE)
+  cat("Saved taxonomy with confidence scores to results/taxonomy_with_confidence.csv\n")
   
   # Create a taxonomy summary for SILVA
   silva_summary <- data.frame(
@@ -2844,29 +2941,111 @@ if (taxonomy_methods$SILVA_DADA2) {
       round(sum(!is.na(taxa_silva[, "Family"])) / nrow(taxa_silva) * 100, 1),
       round(sum(!is.na(taxa_silva[, "Genus"])) / nrow(taxa_silva) * 100, 1),
       round(sum(!is.na(taxa_silva[, "Species"])) / nrow(taxa_silva) * 100, 1)
+    ),
+    MeanConfidence = c(
+      mean(taxa_silva_confidence[, "Kingdom"], na.rm = TRUE),
+      mean(taxa_silva_confidence[, "Phylum"], na.rm = TRUE),
+      mean(taxa_silva_confidence[, "Class"], na.rm = TRUE),
+      mean(taxa_silva_confidence[, "Order"], na.rm = TRUE),
+      mean(taxa_silva_confidence[, "Family"], na.rm = TRUE),
+      mean(taxa_silva_confidence[, "Genus"], na.rm = TRUE),
+      mean(taxa_silva_confidence[, "Species"], na.rm = TRUE)
     )
   )
   
   # Display SILVA summary table
-  kable(silva_summary, caption = "SILVA Taxonomic Assignment Summary")
+  kable(silva_summary, caption = "SILVA Taxonomic Assignment Summary with Confidence Scores")
   
-  # Create a bar plot for SILVA results
+  # Visualize confidence scores distribution by taxonomic level
+  confidence_long <- tidyr::pivot_longer(
+    as.data.frame(taxa_silva_confidence),
+    cols = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
+    names_to = "TaxonomicLevel",
+    values_to = "Confidence"
+  )
+  
+  # Remove NA values
+  confidence_long <- confidence_long[!is.na(confidence_long$Confidence), ]
+  
+  # Order taxonomic levels by assignment hierarchy
+  confidence_long$TaxonomicLevel <- factor(confidence_long$TaxonomicLevel, 
+                                        levels = c("Kingdom", "Phylum", "Class", 
+                                                  "Order", "Family", "Genus", "Species"))
+  
+  # Create violin plot showing confidence score distributions
+  confidence_violin_plot <- ggplot(confidence_long, aes(x = TaxonomicLevel, y = Confidence, fill = TaxonomicLevel)) +
+    geom_violin(alpha = 0.7) +
+    geom_boxplot(width = 0.1, fill = "white", color = "darkgray") +
+    stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "white") +
+    scale_y_continuous(limits = c(0, 100)) +
+    labs(title = "Distribution of Taxonomy Assignment Confidence Scores",
+         x = "Taxonomic Level",
+         y = "Bootstrap Confidence (%)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none")
+  
+  print(confidence_violin_plot)
+  
+  # Create heatmap for low confidence assignments
+  # Calculate confidence threshold
+  confidence_threshold <- 80
+  
+  # Filter for low confidence assignments
+  low_confidence <- confidence_long %>%
+    filter(Confidence < confidence_threshold) %>%
+    group_by(TaxonomicLevel) %>%
+    summarize(Count = n(),
+              Percentage = round(n() / sum(!is.na(taxa_silva_confidence[, TaxonomicLevel])) * 100, 1))
+  
+  if (nrow(low_confidence) > 0) {
+    # Plot low confidence summary
+    low_confidence_plot <- ggplot(low_confidence, aes(x = TaxonomicLevel, y = Percentage, fill = TaxonomicLevel)) +
+      geom_bar(stat = "identity") +
+      geom_text(aes(label = paste0(Percentage, "%\n(n=", Count, ")")), vjust = -0.5) +
+      labs(title = paste0("Low Confidence (<", confidence_threshold, "%) Assignments by Taxonomic Level"),
+           x = "Taxonomic Level",
+           y = "Percentage of Assignments") +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.position = "none")
+    
+    print(low_confidence_plot)
+  } else {
+    cat("No low confidence assignments found (<", confidence_threshold, "%).\n")
+  }
+  
+  # Create a bar plot for SILVA results with confidence info
   # Order the data by percent assigned (descending)
   silva_summary$TaxonomicLevel <- factor(silva_summary$TaxonomicLevel, 
-                                      levels = silva_summary$TaxonomicLevel[order(silva_summary$PercentAssigned, decreasing = TRUE)])
+                                       levels = silva_summary$TaxonomicLevel[order(silva_summary$PercentAssigned, decreasing = TRUE)])
   
-  # Create the plot
+  # Create the plot with confidence overlay
   silva_plot <- ggplot(silva_summary, aes(x = TaxonomicLevel, y = PercentAssigned)) +
     geom_bar(stat = "identity", fill = "steelblue") +
     geom_text(aes(label = paste0(PercentAssigned, "%")), vjust = -0.3) +
+    geom_text(aes(label = paste0("(", round(MeanConfidence, 1), "% conf.)")), vjust = 1.5, color = "darkblue") +
     theme_minimal() +
     labs(title = "SILVA: Percentage of ASVs with Taxonomic Assignment",
+         subtitle = "Mean confidence score shown in parentheses",
          x = "Taxonomic Level",
          y = "Percent Assigned") +
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-    scale_y_continuous(limits = c(0, max(silva_summary$PercentAssigned) * 1.1))
+    scale_y_continuous(limits = c(0, max(silva_summary$PercentAssigned) * 1.2))
   
   print(silva_plot)
+  
+  # Save visualization files
+  ggsave("results/confidence_distribution.pdf", confidence_violin_plot, width = 8, height = 6)
+  ggsave("results/confidence_distribution.png", confidence_violin_plot, width = 8, height = 6, dpi = 300)
+  
+  if (nrow(low_confidence) > 0) {
+    ggsave("results/low_confidence_summary.pdf", low_confidence_plot, width = 8, height = 6)
+    ggsave("results/low_confidence_summary.png", low_confidence_plot, width = 8, height = 6, dpi = 300)
+  }
+  
+  ggsave("results/taxonomy_assignment_with_confidence.pdf", silva_plot, width = 8, height = 6)
+  ggsave("results/taxonomy_assignment_with_confidence.png", silva_plot, width = 8, height = 6, dpi = 300)
 }
 ```
 
@@ -3182,6 +3361,152 @@ if (length(taxa_results) > 1) {
 } else {
   # Error if no taxonomy method was successful
   stop("No taxonomy assignment method was successful!")
+}
+
+# Function to filter taxonomy based on confidence thresholds
+filter_taxonomy_by_confidence <- function(taxa, confidence, thresholds = NULL) {
+  # Default thresholds by taxonomic level - becomes more stringent at lower levels
+  if (is.null(thresholds)) {
+    thresholds <- c(
+      Kingdom = 50,
+      Phylum = 60, 
+      Class = 70,
+      Order = 75,
+      Family = 80,
+      Genus = 85,
+      Species = 95  # Very high threshold for species
+    )
+  }
+  
+  # Create a copy of the taxonomy
+  filtered_taxa <- taxa
+  
+  # Filter each level based on confidence
+  for (level in names(thresholds)) {
+    if (level %in% colnames(confidence)) {
+      threshold <- thresholds[level]
+      mask <- !is.na(confidence[, level]) & confidence[, level] < threshold
+      filtered_taxa[mask, level] <- NA
+      cat(sprintf("Filtered %d %s-level assignments below %d%% confidence\n", 
+                 sum(mask), level, threshold))
+    }
+  }
+  
+  return(filtered_taxa)
+}
+
+# Function to add confidence-filtered taxonomy to a phyloseq object
+add_confidence_filtered_taxonomy <- function(ps, taxa_filtered) {
+  # Check if input phyloseq has tax_table
+  if (is.null(tax_table(ps, errorIfNULL=FALSE))) {
+    stop("Input phyloseq object does not have a taxonomy table")
+  }
+  
+  # Ensure tax_table and filtered_taxa have the same dimensions and taxa
+  if (!identical(dim(tax_table(ps)), dim(taxa_filtered)) || 
+      !all(taxa_names(ps) == rownames(taxa_filtered))) {
+    stop("Filtered taxonomy does not match the dimensions or taxa in the phyloseq object")
+  }
+  
+  # Create a copy of the phyloseq object
+  ps_filtered <- ps
+  
+  # Replace tax_table with filtered version
+  tax_table(ps_filtered) <- tax_table(as.matrix(taxa_filtered))
+  
+  return(ps_filtered)
+}
+
+# Example of using confidence filtering if confidence scores are available
+if (exists("taxa_silva") && exists("taxa_silva_confidence")) {
+  cat("\n=== Example: Filtering Taxonomy by Confidence Scores ===\n")
+  
+  # Define custom confidence thresholds (optional)
+  custom_thresholds <- c(
+    Kingdom = 60,
+    Phylum = 70, 
+    Class = 75,
+    Order = 80,
+    Family = 85,
+    Genus = 90,
+    Species = 98  # Very high threshold for species
+  )
+  
+  # Filter taxonomy using custom thresholds
+  taxa_silva_filtered <- filter_taxonomy_by_confidence(
+    taxa_silva, 
+    taxa_silva_confidence,
+    thresholds = custom_thresholds
+  )
+  
+  # Compare original and filtered taxonomy
+  compare_df <- data.frame(
+    TaxonomicLevel = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
+    Original = c(
+      sum(!is.na(taxa_silva[, "Kingdom"])),
+      sum(!is.na(taxa_silva[, "Phylum"])),
+      sum(!is.na(taxa_silva[, "Class"])),
+      sum(!is.na(taxa_silva[, "Order"])),
+      sum(!is.na(taxa_silva[, "Family"])),
+      sum(!is.na(taxa_silva[, "Genus"])),
+      sum(!is.na(taxa_silva[, "Species"]))
+    ),
+    Filtered = c(
+      sum(!is.na(taxa_silva_filtered[, "Kingdom"])),
+      sum(!is.na(taxa_silva_filtered[, "Phylum"])),
+      sum(!is.na(taxa_silva_filtered[, "Class"])),
+      sum(!is.na(taxa_silva_filtered[, "Order"])),
+      sum(!is.na(taxa_silva_filtered[, "Family"])),
+      sum(!is.na(taxa_silva_filtered[, "Genus"])),
+      sum(!is.na(taxa_silva_filtered[, "Species"]))
+    )
+  )
+  
+  # Calculate percentage removed
+  compare_df$PercentRemoved <- round((compare_df$Original - compare_df$Filtered) / compare_df$Original * 100, 1)
+  
+  # Display comparison table
+  kable(compare_df, caption = "Comparison of Taxonomic Assignments Before and After Confidence Filtering")
+  
+  # Plot the comparison
+  compare_long <- tidyr::pivot_longer(
+    compare_df,
+    cols = c("Original", "Filtered"),
+    names_to = "Dataset",
+    values_to = "Count"
+  )
+  
+  # Order taxonomic levels
+  compare_long$TaxonomicLevel <- factor(compare_long$TaxonomicLevel, 
+                                      levels = c("Kingdom", "Phylum", "Class", 
+                                               "Order", "Family", "Genus", "Species"))
+  
+  # Create comparison plot
+  comparison_plot <- ggplot(compare_long, aes(x = TaxonomicLevel, y = Count, fill = Dataset)) +
+    geom_bar(stat = "identity", position = position_dodge()) +
+    geom_text(aes(label = Count), position = position_dodge(width = 0.9), vjust = -0.5) +
+    labs(title = "Effect of Confidence Filtering on Taxonomic Assignments",
+         subtitle = paste("Thresholds:", paste(names(custom_thresholds), custom_thresholds, sep = "=", collapse = ", ")),
+         x = "Taxonomic Level",
+         y = "Number of ASVs with Assignment") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  print(comparison_plot)
+  
+  # Export filtered taxonomy
+  write.csv(as.data.frame(taxa_silva_filtered), "results/taxonomy_confidence_filtered.csv", row.names = TRUE)
+  cat("Saved confidence-filtered taxonomy to results/taxonomy_confidence_filtered.csv\n")
+  
+  # Create phyloseq object with filtered taxonomy if phyloseq exists
+  if (exists("ps")) {
+    # Create a version with confidence-filtered taxonomy
+    ps_filtered <- add_confidence_filtered_taxonomy(ps, taxa_silva_filtered)
+    
+    # Save the filtered phyloseq object
+    saveRDS(ps_filtered, "results/phyloseq_confidence_filtered.rds")
+    cat("Created and saved phyloseq object with confidence-filtered taxonomy to results/phyloseq_confidence_filtered.rds\n")
+  }
 }
 
 # Save all taxonomy results
