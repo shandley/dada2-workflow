@@ -3087,6 +3087,505 @@ if (can_build_trees) {
 
 # Save Results
 
+# Rarefaction Analysis
+
+```{r rarefaction-analysis}
+# Check required packages for rarefaction analysis
+can_do_rarefaction <- requireNamespace("vegan", quietly = TRUE)
+
+if (can_do_rarefaction) {
+  cat("Beginning rarefaction analysis...\n")
+  
+  # Function to calculate rarefaction curves
+  calculate_rarefaction_curves <- function(ps, 
+                                          step_size = 10, 
+                                          label = NULL,
+                                          max_depth = NULL) {
+    
+    cat("Calculating rarefaction curves...\n")
+    
+    # Get the abundance matrix
+    abundances <- as.matrix(otu_table(ps))
+    if(taxa_are_rows(ps)) {
+      abundances <- t(abundances)
+    }
+    
+    # Get sample data
+    sample_data <- as.data.frame(sample_data(ps))
+    
+    # Get max depth if not specified
+    if(is.null(max_depth)) {
+      max_depth <- max(rowSums(abundances))
+    }
+    
+    # Define depths at which to rarefy
+    depths <- seq(1, max_depth, by = step_size)
+    depths <- unique(c(depths, max_depth))
+    
+    # Calculate rarefaction at each depth for each sample
+    rarefaction_curves <- data.frame(depth = numeric(), 
+                                    richness = numeric(), 
+                                    sample = character(),
+                                    stringsAsFactors = FALSE)
+    
+    # Use parallel processing if available
+    if (exists("parallel_cores") && parallel_cores > 1 && 
+        requireNamespace("future.apply", quietly = TRUE) && 
+        requireNamespace("future", quietly = TRUE)) {
+      
+      cat("Using parallel processing for rarefaction curves calculations...\n")
+      
+      # Set up future plan for parallel processing
+      previous_plan <- future::plan(future::multisession, workers = parallel_cores)
+      on.exit(future::plan(previous_plan), add = TRUE)
+      
+      # Process in chunks to avoid memory issues
+      chunk_size <- min(10, length(depths))  # Adjust chunk size based on your data
+      depth_chunks <- split(depths, ceiling(seq_along(depths) / chunk_size))
+      
+      for (chunk_idx in seq_along(depth_chunks)) {
+        chunk <- depth_chunks[[chunk_idx]]
+        cat(sprintf("Processing depths chunk %d of %d...\n", chunk_idx, length(depth_chunks)))
+        
+        # Process this chunk in parallel
+        chunk_results <- future.apply::future_lapply(chunk, function(depth) {
+          if(!requireNamespace("vegan", quietly = TRUE)) {
+            return(NULL)  # Skip if vegan not available
+          }
+          
+          # Calculate richness at this depth for each sample
+          richness <- vegan::rarefy(abundances, depth)
+          
+          # Create results for each sample
+          result_df <- data.frame(
+            depth = depth,
+            richness = richness,
+            sample = rownames(abundances),
+            stringsAsFactors = FALSE
+          )
+          
+          # Filter out samples with insufficient reads
+          result_df <- result_df[!is.na(result_df$richness), ]
+          return(result_df)
+        })
+        
+        # Combine results from this chunk
+        for (result in chunk_results) {
+          if (!is.null(result)) {
+            rarefaction_curves <- rbind(rarefaction_curves, result)
+          }
+        }
+        
+        # Force garbage collection to free memory
+        gc()
+      }
+    } else {
+      # Non-parallel processing
+      for (i in seq_along(depths)) {
+        depth <- depths[i]
+        
+        # Calculate richness at this depth for each sample
+        richness <- vegan::rarefy(abundances, depth)
+        
+        # Store the results
+        for (j in seq_along(richness)) {
+          if(!is.na(richness[j])) {  # Skip samples with insufficient reads
+            rarefaction_curves <- rbind(rarefaction_curves, 
+                                      data.frame(depth = depth,
+                                               richness = richness[j],
+                                               sample = rownames(abundances)[j],
+                                               stringsAsFactors = FALSE))
+          }
+        }
+        
+        # Progress indicator
+        if(i %% 10 == 0 || i == length(depths)) {
+          cat(sprintf("Processed %d of %d depths...\n", i, length(depths)))
+        }
+      }
+    }
+    
+    # Add sample metadata if available
+    if(!is.null(sample_data) && nrow(sample_data) > 0) {
+      # Ensure sample names match
+      sample_data$sample_id <- rownames(sample_data)
+      rarefaction_curves$sample_id <- rarefaction_curves$sample
+      
+      # Merge with sample data
+      rarefaction_curves <- merge(rarefaction_curves, sample_data, 
+                                by = "sample_id", all.x = TRUE)
+    }
+    
+    return(rarefaction_curves)
+  }
+  
+  # Rarefy at specific depth to create a rarefied phyloseq object
+  rarefy_phyloseq <- function(ps, depth = NULL, seed = 123) {
+    # Get the abundance matrix
+    abundances <- as.matrix(otu_table(ps))
+    if(taxa_are_rows(ps)) {
+      abundances <- t(abundances)
+    }
+    
+    # Determine rarefaction depth if not specified
+    if(is.null(depth)) {
+      depth <- min(rowSums(abundances))
+      cat("Auto-selecting minimum sample depth:", depth, "reads\n")
+    } else {
+      cat("Rarefying to specified depth:", depth, "reads\n")
+    }
+    
+    # Check if any samples have fewer reads than the rarefaction depth
+    if(any(rowSums(abundances) < depth)) {
+      excluded_samples <- rownames(abundances)[rowSums(abundances) < depth]
+      cat("WARNING: The following samples have fewer reads than the rarefaction depth and will be excluded:\n")
+      cat(paste(excluded_samples, collapse = ", "), "\n")
+    }
+    
+    # Perform rarefaction
+    ps_rare <- NULL
+    tryCatch({
+      ps_rare <- rarefy_even_depth(ps, sample.size = depth, 
+                                  rngseed = seed, replace = FALSE, 
+                                  trimOTUs = TRUE, verbose = TRUE)
+      cat("Rarefaction successful!\n")
+    }, error = function(e) {
+      cat("Error in rarefaction:", conditionMessage(e), "\n")
+      cat("Try a different rarefaction depth or check your data.\n")
+    })
+    
+    return(ps_rare)
+  }
+  
+  # Define an appropriate step size based on the dataset size
+  # For larger datasets, we use larger steps to reduce computation time
+  max_depth <- max(sample_sums(ps))
+  if (max_depth > 100000) {
+    step_size <- 1000  # Very large datasets
+  } else if (max_depth > 50000) {
+    step_size <- 500   # Large datasets
+  } else if (max_depth > 10000) {
+    step_size <- 200   # Medium datasets
+  } else {
+    step_size <- 100   # Small datasets
+  }
+  
+  cat("Calculating rarefaction curves with step size:", step_size, "\n")
+  
+  # Generate rarefaction curves
+  rarefaction_curves <- calculate_rarefaction_curves(ps, step_size = step_size)
+  
+  # Plot rarefaction curves
+  if(!is.null(rarefaction_curves)) {
+    # Get metadata for grouping
+    sample_metadata <- as.data.frame(sample_data(ps))
+    
+    # Find suitable categorical variable for grouping
+    metadata_cols <- colnames(sample_metadata)
+    categorical_cols <- sapply(sample_metadata, function(col) {
+      is.character(col) || is.factor(col) || length(unique(col)) < 10
+    })
+    
+    group_var <- if(any(categorical_cols)) {
+      metadata_cols[which(categorical_cols)[1]]  # Choose first categorical column
+    } else {
+      NULL  # No suitable grouping variable
+    }
+    
+    # Basic rarefaction plot with grouping if available
+    plot_title <- "Rarefaction Curves"
+    
+    if(!is.null(group_var) && group_var %in% colnames(rarefaction_curves)) {
+      # Plot with grouping
+      rare_plot <- ggplot(rarefaction_curves, 
+                         aes(x = depth, y = richness, group = sample, 
+                             color = .data[[group_var]])) +
+        geom_line(alpha = 0.7) +
+        labs(title = plot_title,
+             subtitle = paste("Grouped by", group_var),
+             x = "Sequencing Depth",
+             y = "ASV Richness") +
+        theme_minimal() +
+        theme(legend.position = "right")
+    } else {
+      # Plot without grouping
+      rare_plot <- ggplot(rarefaction_curves, 
+                         aes(x = depth, y = richness, group = sample)) +
+        geom_line(alpha = 0.7) +
+        labs(title = plot_title,
+             x = "Sequencing Depth",
+             y = "ASV Richness") +
+        theme_minimal()
+    }
+    
+    # Enhanced visualization
+    rare_plot <- rare_plot +
+      geom_vline(xintercept = min(sample_sums(ps)), 
+                linetype = "dashed", color = "blue", alpha = 0.7) +
+      geom_vline(xintercept = median(sample_sums(ps)), 
+                linetype = "dashed", color = "darkgreen", alpha = 0.7) +
+      annotate("text", x = min(sample_sums(ps)), y = max(rarefaction_curves$richness),
+              label = "Min depth", hjust = -0.1, vjust = 0, color = "blue") +
+      annotate("text", x = median(sample_sums(ps)), y = max(rarefaction_curves$richness),
+              label = "Median depth", hjust = -0.1, vjust = 1, color = "darkgreen")
+    
+    print(rare_plot)
+    
+    # Find suitable rarefaction depth
+    # Typically, we choose a depth that retains most samples while reaching near-asymptotic richness
+    sample_depths <- data.frame(
+      sample = names(sample_sums(ps)),
+      depth = sample_sums(ps)
+    )
+    
+    # Recommend a rarefaction depth
+    min_depth <- min(sample_depths$depth)
+    median_depth <- median(sample_depths$depth)
+    mean_depth <- mean(sample_depths$depth)
+    
+    cat("\nSample sequencing depth summary:\n")
+    cat("Minimum depth:", min_depth, "reads\n")
+    cat("Mean depth:", round(mean_depth, 1), "reads\n")
+    cat("Median depth:", median_depth, "reads\n")
+    cat("Maximum depth:", max(sample_depths$depth), "reads\n")
+    
+    # Create depth distribution plot
+    depth_dist_plot <- ggplot(sample_depths, aes(x = depth)) +
+      geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+      geom_vline(xintercept = min_depth, linetype = "dashed", color = "blue") +
+      geom_vline(xintercept = median_depth, linetype = "dashed", color = "darkgreen") +
+      labs(title = "Distribution of Sample Sequencing Depths",
+           subtitle = "Dashed lines show min (blue) and median (green) depths",
+           x = "Sequencing Depth (reads)",
+           y = "Number of Samples") +
+      theme_minimal()
+    
+    print(depth_dist_plot)
+    
+    # Analyze rarefaction curve saturation
+    # To evaluate if samples have reached a plateau in their rarefaction curves
+    evaluate_rarefaction_saturation <- function(curves, threshold = 0.05) {
+      # Group by sample
+      sample_curves <- split(curves, curves$sample)
+      
+      # Calculate rate of change at the end of each curve
+      saturation_status <- data.frame(
+        sample = character(),
+        plateau_reached = logical(),
+        plateau_depth = numeric(),
+        final_slope = numeric(),
+        stringsAsFactors = FALSE
+      )
+      
+      for (sample_name in names(sample_curves)) {
+        curve_data <- sample_curves[[sample_name]]
+        # Sort by depth
+        curve_data <- curve_data[order(curve_data$depth), ]
+        
+        # Need at least 3 points to calculate saturation
+        if (nrow(curve_data) < 3) next
+        
+        # Calculate slopes between consecutive points
+        depths <- curve_data$depth
+        richness <- curve_data$richness
+        slopes <- diff(richness) / diff(depths)
+        
+        # Check the last 20% of the curve (or at least the last 3 points)
+        end_index <- max(3, round(length(slopes) * 0.2))
+        end_slopes <- tail(slopes, end_index)
+        
+        # Calculate average slope at the end
+        final_slope <- mean(end_slopes)
+        
+        # Normalize by maximum richness to get relative rate of change
+        max_richness <- max(richness)
+        relative_slope <- final_slope / max_richness
+        
+        # Determine if plateau has been reached (slope is below threshold)
+        plateau_reached <- relative_slope < threshold
+        
+        # If plateau reached, find approximate depth where it started
+        plateau_depth <- NA
+        if (plateau_reached) {
+          # Find where the curve first flattens (slope drops below threshold)
+          relative_slopes <- slopes / max_richness
+          plateau_idx <- which(relative_slopes < threshold)[1]
+          if (!is.na(plateau_idx)) {
+            plateau_depth <- depths[plateau_idx]
+          }
+        }
+        
+        # Add to results
+        saturation_status <- rbind(saturation_status, data.frame(
+          sample = sample_name,
+          plateau_reached = plateau_reached,
+          plateau_depth = plateau_depth,
+          final_slope = relative_slope,
+          stringsAsFactors = FALSE
+        ))
+      }
+      
+      return(saturation_status)
+    }
+    
+    # Evaluate plateau status for each sample
+    saturation_results <- evaluate_rarefaction_saturation(rarefaction_curves)
+    
+    # Summarize plateau results
+    plateau_count <- sum(saturation_results$plateau_reached, na.rm = TRUE)
+    total_samples <- nrow(saturation_results)
+    
+    cat("\nRarefaction curve saturation analysis:\n")
+    cat(plateau_count, "out of", total_samples, "samples (", 
+        round(plateau_count/total_samples*100, 1), "%) have reached a rarefaction plateau.\n", sep = "")
+    
+    # Suggest optimal rarefaction depth based on saturation analysis
+    if (plateau_count > 0) {
+      # Calculate median plateau depth for samples that reached plateau
+      median_plateau <- median(saturation_results$plateau_depth, na.rm = TRUE)
+      cat("Median plateau depth:", round(median_plateau), "reads\n")
+      
+      # Suggest a conservative depth that captures most plateaus but doesn't exclude too many samples
+      suggested_depth <- min(median_plateau, median_depth)
+      cat("Suggested rarefaction depth:", round(suggested_depth), "reads\n")
+      
+      # Count how many samples would be excluded at this depth
+      excluded_count <- sum(sample_depths$depth < suggested_depth)
+      if (excluded_count > 0) {
+        cat("NOTE: Using this depth would exclude", excluded_count, "samples (", 
+            round(excluded_count/nrow(sample_depths)*100, 1), "% of total)\n", sep = "")
+      }
+    } else {
+      cat("No samples have clearly reached a plateau. Consider using the minimum depth for conservative rarefaction.\n")
+      suggested_depth <- min_depth
+    }
+    
+    # Create rarefied phyloseq object at suggested depth
+    cat("\nCreating rarefied phyloseq object at suggested depth...\n")
+    ps_rarefied <- rarefy_phyloseq(ps, depth = round(suggested_depth))
+    
+    # Create rarefied phyloseq object at minimum depth (most conservative approach)
+    if (suggested_depth > min_depth) {
+      cat("\nAlso creating a conservative rarefied phyloseq object at minimum depth...\n")
+      ps_rarefied_min <- rarefy_phyloseq(ps, depth = min_depth)
+    } else {
+      ps_rarefied_min <- ps_rarefied  # They're the same in this case
+    }
+    
+    # Compare alpha diversity before and after rarefaction
+    if(!is.null(ps_rarefied)) {
+      # Calculate alpha diversity metrics for all versions
+      alpha_div_raw <- estimate_richness(ps, measures = c("Observed", "Shannon", "Simpson"))
+      alpha_div_rare <- estimate_richness(ps_rarefied, measures = c("Observed", "Shannon", "Simpson"))
+      
+      # Add sample names as a column
+      alpha_div_raw$sample <- rownames(alpha_div_raw)
+      alpha_div_rare$sample <- rownames(alpha_div_rare)
+      
+      # Add data source column
+      alpha_div_raw$data <- "Raw"
+      alpha_div_rare$data <- "Rarefied"
+      
+      # Combine data
+      alpha_div_combined <- rbind(alpha_div_raw, alpha_div_rare)
+      
+      # Add sample metadata
+      sample_data_df <- as.data.frame(sample_data(ps))
+      sample_data_df$sample <- rownames(sample_data_df)
+      alpha_div_combined <- merge(alpha_div_combined, sample_data_df, by = "sample", all.x = TRUE)
+      
+      # Plot comparison
+      p1 <- ggplot(alpha_div_combined, aes(x = data, y = Observed, fill = data)) +
+        geom_boxplot() +
+        labs(title = "Observed ASVs", x = "", y = "Richness") +
+        theme_minimal() +
+        theme(legend.position = "none")
+      
+      p2 <- ggplot(alpha_div_combined, aes(x = data, y = Shannon, fill = data)) +
+        geom_boxplot() +
+        labs(title = "Shannon Diversity", x = "", y = "Shannon Index") +
+        theme_minimal() +
+        theme(legend.position = "none")
+      
+      # Plot side by side
+      grid.arrange(p1, p2, ncol = 2, top = "Alpha Diversity Before and After Rarefaction")
+      
+      # Correlation of diversity metrics before and after rarefaction
+      common_samples <- intersect(alpha_div_raw$sample, alpha_div_rare$sample)
+      
+      if (length(common_samples) > 1) {  # Need at least 2 samples for correlation
+        alpha_div_raw_common <- alpha_div_raw[alpha_div_raw$sample %in% common_samples, ]
+        alpha_div_rare_common <- alpha_div_rare[alpha_div_rare$sample %in% common_samples, ]
+        
+        # Ensure same ordering
+        alpha_div_rare_common <- alpha_div_rare_common[match(alpha_div_raw_common$sample, alpha_div_rare_common$sample), ]
+        
+        # Calculate correlations
+        cor_observed <- cor(alpha_div_raw_common$Observed, alpha_div_rare_common$Observed)
+        cor_shannon <- cor(alpha_div_raw_common$Shannon, alpha_div_rare_common$Shannon)
+        
+        cat("\nCorrelation between raw and rarefied diversity metrics:\n")
+        cat("Observed ASVs: r =", round(cor_observed, 3), "\n")
+        cat("Shannon Index: r =", round(cor_shannon, 3), "\n")
+        
+        # Create correlation plots
+        par(mfrow = c(1, 2))
+        plot(alpha_div_raw_common$Observed, alpha_div_rare_common$Observed,
+             xlab = "Raw", ylab = "Rarefied", main = "Observed ASVs",
+             pch = 19, col = alpha("darkblue", 0.7))
+        abline(0, 1, lty = 2, col = "red")
+        text(max(alpha_div_raw_common$Observed, na.rm = TRUE) * 0.8, 
+             min(alpha_div_rare_common$Observed, na.rm = TRUE) * 1.2,
+             paste("r =", round(cor_observed, 3)))
+        
+        plot(alpha_div_raw_common$Shannon, alpha_div_rare_common$Shannon,
+             xlab = "Raw", ylab = "Rarefied", main = "Shannon Index",
+             pch = 19, col = alpha("darkgreen", 0.7))
+        abline(0, 1, lty = 2, col = "red")
+        text(max(alpha_div_raw_common$Shannon, na.rm = TRUE) * 0.8, 
+             min(alpha_div_rare_common$Shannon, na.rm = TRUE) * 1.2,
+             paste("r =", round(cor_shannon, 3)))
+        par(mfrow = c(1, 1))
+      }
+    }
+    
+    # Save rarefied phyloseq objects
+    if(!is.null(ps_rarefied)) {
+      ps_rarefied_path <- "results/phyloseq_rarefied.rds"
+      saveRDS(ps_rarefied, ps_rarefied_path)
+      cat("Saved rarefied phyloseq object to", ps_rarefied_path, "\n")
+      
+      if (exists("ps_rarefied_min") && !identical(ps_rarefied, ps_rarefied_min)) {
+        ps_rarefied_min_path <- "results/phyloseq_rarefied_min.rds"
+        saveRDS(ps_rarefied_min, ps_rarefied_min_path)
+        cat("Saved conservative rarefied phyloseq object to", ps_rarefied_min_path, "\n")
+      }
+    }
+    
+    # Save rarefaction curves data
+    rarefaction_path <- "results/rarefaction_curves.rds"
+    saveRDS(rarefaction_curves, rarefaction_path)
+    cat("Saved rarefaction curves data to", rarefaction_path, "\n")
+    
+    # Save rarefaction saturation analysis
+    saturation_path <- "results/rarefaction_saturation.rds"
+    saveRDS(saturation_results, saturation_path)
+    cat("Saved rarefaction saturation analysis to", saturation_path, "\n")
+    
+    # Create checkpoint after rarefaction analysis step
+    save_checkpoint("after_rarefaction", 
+                  c("ps", "ps_rarefied", "rarefaction_curves", "saturation_results"),
+                  overwrite = TRUE)
+    cat("Checkpoint saved after rarefaction analysis step\n")
+  }
+} else {
+  cat("Skipping rarefaction analysis due to missing dependencies.\n")
+  cat("Install 'vegan' package to enable this feature.\n")
+}
+```
+
+# Save Results
+
 ```{r save-results}
 # Create directory for results if it doesn't exist
 if(!dir.exists("results")) dir.create("results")
