@@ -336,8 +336,28 @@ library(future)       # For parallel processing
 library(future.apply) # For parallel apply functions
 
 # Set up parallelization for faster processing
-# Adjust this based on your system's capabilities
-plan(multisession, workers = min(parallel::detectCores() - 1, 4))
+# Automatically detect optimal number of workers based on system
+num_cores <- parallel::detectCores()
+optimal_workers <- min(num_cores - 1, 8)  # Keep at least 1 core free for system
+
+# Use progressive parallelization strategy
+if (num_cores >= 16) {
+  # For high-performance systems, use multisession with worker reservation
+  cat(sprintf("Detected %d cores. Using multisession with %d workers.\n", num_cores, optimal_workers))
+  plan(multisession, workers = optimal_workers)
+} else if (num_cores >= 4) {
+  # For mid-range systems, use multisession with fewer workers
+  workers_to_use <- min(num_cores - 1, 4)
+  cat(sprintf("Detected %d cores. Using multisession with %d workers.\n", num_cores, workers_to_use))
+  plan(multisession, workers = workers_to_use)
+} else {
+  # For low-end systems, use minimal parallelization
+  cat(sprintf("Detected only %d cores. Using minimal parallelization.\n", num_cores))
+  plan(multisession, workers = 2)
+}
+
+# Configure memory usage for parallel operations
+options(future.globals.maxSize = 2 * 1024^3)  # 2GB limit for globals
 
 # Set the random seed for reproducibility
 set.seed(100)
@@ -921,12 +941,55 @@ if(!dir.exists(file.path(path, "filtered"))) {
   dir.create(file.path(path, "filtered"))
 }
 
-# Filter and trim with optimized parameters
-cat("Filtering and trimming reads with optimized parameters...\n")
-out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs,
-                     truncLen = c(truncLen_forward, truncLen_reverse), 
-                     maxN = 0, maxEE = c(maxEE_forward, maxEE_reverse), truncQ = 2,
-                     rm.phix = TRUE, compress = TRUE, multithread = TRUE)
+# Filter and trim with optimized parameters and parallelization
+cat("Filtering and trimming reads with optimized parameters and parallelization...\n")
+
+# For large datasets, use batched filtering
+if(length(fnFs) > 50) {
+  cat("Using batched filtering for large dataset...\n")
+  
+  # Process in batches to better manage memory
+  batch_size <- min(20, ceiling(length(fnFs)/4))
+  cat(sprintf("Processing in batches of %d samples...\n", batch_size))
+  
+  # Create batches
+  batches <- ceiling(seq_along(fnFs) / batch_size)
+  
+  # Initialize out matrix
+  out <- matrix(0, nrow = length(sample.names), ncol = 2)
+  rownames(out) <- sample.names
+  colnames(out) <- c("reads.in", "reads.out")
+  
+  # Process each batch
+  for(batch in unique(batches)) {
+    cat(sprintf("Processing batch %d of %d...\n", batch, max(batches)))
+    
+    # Get indices for this batch
+    idx <- which(batches == batch)
+    
+    # Filter this batch
+    batch_out <- filterAndTrim(
+      fnFs[idx], filtFs[idx], fnRs[idx], filtRs[idx],
+      truncLen = c(truncLen_forward, truncLen_reverse), 
+      maxN = 0, maxEE = c(maxEE_forward, maxEE_reverse), truncQ = 2,
+      rm.phix = TRUE, compress = TRUE, multithread = TRUE
+    )
+    
+    # Store results
+    out[rownames(batch_out), ] <- batch_out
+    
+    # Force garbage collection
+    gc()
+  }
+} else {
+  # For smaller datasets, use standard approach
+  out <- filterAndTrim(
+    fnFs, filtFs, fnRs, filtRs,
+    truncLen = c(truncLen_forward, truncLen_reverse), 
+    maxN = 0, maxEE = c(maxEE_forward, maxEE_reverse), truncQ = 2,
+    rm.phix = TRUE, compress = TRUE, multithread = TRUE
+  )
+}
 
 # Create summary of filtering results
 filter_summary <- as.data.frame(out)
@@ -1005,13 +1068,42 @@ if (length(filtFs) > 0) {
 # Learn Error Rates
 
 ```{r learn-errors}
-# Learn error rates for forward reads
-cat("Learning error rates for forward reads...\n")
-errF <- learnErrors(filtFs, multithread = TRUE, randomize = TRUE)
+# Learn error rates with optimized parallelization
+cat("Learning error rates with optimized parallelization...\n")
 
-# Learn error rates for reverse reads
-cat("Learning error rates for reverse reads...\n")
-errR <- learnErrors(filtRs, multithread = TRUE, randomize = TRUE)
+# Determine sample size for error learning
+# For large datasets, use a subset of samples for efficiency
+MAX_ERROR_LEARN_SAMPLES <- 40  # Maximum samples to use for error learning
+
+# Sample selection for error learning
+if(length(filtFs) > MAX_ERROR_LEARN_SAMPLES) {
+  cat(sprintf("Using random subset of %d samples for error learning...\n", MAX_ERROR_LEARN_SAMPLES))
+  
+  # Select a random subset for error learning
+  set.seed(100)  # For reproducibility
+  error_learn_samples <- sample(seq_along(filtFs), MAX_ERROR_LEARN_SAMPLES)
+  
+  # Learn forward error rates using subset
+  cat("Learning error rates for forward reads...\n")
+  errF <- learnErrors(filtFs[error_learn_samples], multithread = TRUE, randomize = TRUE, verbose = TRUE)
+  
+  # Learn reverse error rates using subset
+  cat("Learning error rates for reverse reads...\n")
+  errR <- learnErrors(filtRs[error_learn_samples], multithread = TRUE, randomize = TRUE, verbose = TRUE)
+  
+  # Ensure garbage collection runs after each step
+  gc()
+} else {
+  # For smaller datasets, use all samples
+  cat("Learning error rates for forward reads using all samples...\n")
+  errF <- learnErrors(filtFs, multithread = TRUE, randomize = TRUE, verbose = TRUE)
+  
+  # Force garbage collection between error learning steps
+  gc()
+  
+  cat("Learning error rates for reverse reads using all samples...\n")
+  errR <- learnErrors(filtRs, multithread = TRUE, randomize = TRUE, verbose = TRUE)
+}
 
 # Plot error rates for forward reads
 errF_plot <- plotErrors(errF, nominalQ = TRUE)
@@ -1082,13 +1174,59 @@ cat("Checkpoint saved after dereplication step\n")
 DADA2 will now denoise the data and infer the true biological sequences.
 
 ```{r dada2}
-# Apply the DADA2 algorithm to forward reads
-cat("Denoising forward reads...\n")
-dadaFs <- dada(derepFs, err = errF, multithread = TRUE, pool = "pseudo")
+# Apply the DADA2 algorithm to forward reads with optimized parallelization
+cat("Denoising forward reads with optimized parallelization...\n")
 
-# Apply the DADA2 algorithm to reverse reads
-cat("Denoising reverse reads...\n")
-dadaRs <- dada(derepRs, err = errR, multithread = TRUE, pool = "pseudo")
+# Use parallel batch processing for large datasets
+if (length(derepFs) > 20) {
+  # Process in batches for better memory management
+  batch_size <- min(10, ceiling(length(derepFs)/4))
+  cat(sprintf("Processing forward reads in batches of %d samples...\n", batch_size))
+  
+  # Create batches
+  sample_names <- names(derepFs)
+  batch_groups <- split(sample_names, ceiling(seq_along(sample_names)/batch_size))
+  
+  # Process each batch and combine results
+  dadaFs_list <- list()
+  for (i in seq_along(batch_groups)) {
+    cat(sprintf("Processing forward batch %d of %d...\n", i, length(batch_groups)))
+    batch_samples <- batch_groups[[i]]
+    dadaFs_batch <- dada(derepFs[batch_samples], err = errF, multithread = TRUE, pool = "pseudo")
+    dadaFs_list <- c(dadaFs_list, dadaFs_batch)
+  }
+  dadaFs <- dadaFs_list
+} else {
+  # For smaller datasets, process all at once
+  dadaFs <- dada(derepFs, err = errF, multithread = TRUE, pool = "pseudo")
+}
+
+# Apply the DADA2 algorithm to reverse reads with optimized parallelization
+cat("Denoising reverse reads with optimized parallelization...\n")
+
+# Use parallel batch processing for large datasets
+if (length(derepRs) > 20) {
+  # Process in batches for better memory management
+  batch_size <- min(10, ceiling(length(derepRs)/4))
+  cat(sprintf("Processing reverse reads in batches of %d samples...\n", batch_size))
+  
+  # Create batches
+  sample_names <- names(derepRs)
+  batch_groups <- split(sample_names, ceiling(seq_along(sample_names)/batch_size))
+  
+  # Process each batch and combine results
+  dadaRs_list <- list()
+  for (i in seq_along(batch_groups)) {
+    cat(sprintf("Processing reverse batch %d of %d...\n", i, length(batch_groups)))
+    batch_samples <- batch_groups[[i]]
+    dadaRs_batch <- dada(derepRs[batch_samples], err = errR, multithread = TRUE, pool = "pseudo")
+    dadaRs_list <- c(dadaRs_list, dadaRs_batch)
+  }
+  dadaRs <- dadaRs_list
+} else {
+  # For smaller datasets, process all at once
+  dadaRs <- dada(derepRs, err = errR, multithread = TRUE, pool = "pseudo")
+}
 
 # Inspect the returned dada-class object for the first sample
 cat("\nDADA2 denoising results for first sample (forward reads):\n")
@@ -1123,12 +1261,57 @@ cat("Checkpoint saved after sample inference step\n")
 Now we'll merge the forward and reverse reads to create full-length sequences.
 
 ```{r merge-reads}
-# Merge paired reads
-cat("Merging paired reads...\n")
-mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, 
-                     verbose = TRUE,
-                     # Use a more relaxed minimum overlap if we have short expected overlap
-                     minOverlap = if(truncation_lengths$expected_overlap < 20) 10 else 12)
+# Merge paired reads with optimized parallelization
+cat("Merging paired reads with optimized parallelization...\n")
+
+# Determine if we need to use batched merging based on dataset size
+if (length(dadaFs) > 20) {
+  cat("Using batched merging for large dataset...\n")
+  
+  # Set up batch processing
+  batch_size <- min(10, ceiling(length(dadaFs)/4))
+  sample_names <- names(dadaFs)
+  batch_groups <- split(sample_names, ceiling(seq_along(sample_names)/batch_size))
+  
+  # Initialize results list
+  mergers <- list()
+  
+  # Process each batch
+  for (i in seq_along(batch_groups)) {
+    cat(sprintf("Merging batch %d of %d...\n", i, length(batch_groups)))
+    batch_samples <- batch_groups[[i]]
+    
+    # Calculate appropriate overlap parameter
+    min_overlap <- if(truncation_lengths$expected_overlap < 20) 10 else 12
+    
+    # Process this batch
+    batch_mergers <- mergePairs(
+      dadaFs[batch_samples], 
+      derepFs[batch_samples], 
+      dadaRs[batch_samples], 
+      derepRs[batch_samples],
+      verbose = TRUE,
+      minOverlap = min_overlap
+    )
+    
+    # Add to results
+    mergers <- c(mergers, batch_mergers)
+    
+    # Force garbage collection to free memory
+    gc()
+  }
+} else {
+  # For smaller datasets, use standard approach
+  min_overlap <- if(truncation_lengths$expected_overlap < 20) 10 else 12
+  mergers <- mergePairs(
+    dadaFs, 
+    derepFs, 
+    dadaRs, 
+    derepRs,
+    verbose = TRUE,
+    minOverlap = min_overlap
+  )
+}
 
 # Inspect the merger data.frame for the first sample
 cat("\nMerged read pairs for first sample:\n")
@@ -1232,9 +1415,54 @@ cat("Checkpoint saved after ASV table construction step\n")
 # Remove Chimeras
 
 ```{r chimeras}
-# Remove chimeric sequences using consensus method
-cat("Removing chimeric sequences...\n")
-seqtab.nochim <- removeBimeraDenovo(seqtab, method = "consensus", multithread = TRUE, verbose = TRUE)
+# Remove chimeric sequences using consensus method with optimized parallelization
+cat("Removing chimeric sequences with optimized parallelization...\n")
+
+# For very large ASV tables, use a batched approach to chimera removal
+if(ncol(seqtab) > 5000) {
+  cat("Using batched approach for chimera removal due to large number of ASVs...\n")
+  
+  # Split ASVs into batches
+  batch_size <- 2000  # Process 2000 ASVs at a time
+  n_batches <- ceiling(ncol(seqtab) / batch_size)
+  
+  # Initialize result table
+  seqtab.nochim <- NULL
+  
+  # Process each batch
+  for(i in 1:n_batches) {
+    cat(sprintf("Processing chimera batch %d of %d...\n", i, n_batches))
+    
+    # Calculate batch indices
+    start_idx <- (i-1) * batch_size + 1
+    end_idx <- min(i * batch_size, ncol(seqtab))
+    
+    # Extract batch
+    batch_seqtab <- seqtab[, start_idx:end_idx, drop=FALSE]
+    
+    # Remove chimeras from this batch
+    batch_nochim <- removeBimeraDenovo(batch_seqtab, 
+                                      method = "consensus", 
+                                      multithread = TRUE, 
+                                      verbose = TRUE)
+    
+    # Combine with previous results
+    if(is.null(seqtab.nochim)) {
+      seqtab.nochim <- batch_nochim
+    } else {
+      seqtab.nochim <- cbind(seqtab.nochim, batch_nochim)
+    }
+    
+    # Force garbage collection
+    gc()
+  }
+} else {
+  # For smaller tables, use the standard approach
+  seqtab.nochim <- removeBimeraDenovo(seqtab, 
+                                     method = "consensus", 
+                                     multithread = TRUE, 
+                                     verbose = TRUE)
+}
 
 # Calculate the percentage of non-chimeric sequences
 chimera_pct <- sum(seqtab.nochim)/sum(seqtab) * 100
@@ -1831,13 +2059,59 @@ if (taxonomy_methods$SILVA_DADA2) {
   # Download/locate SILVA database
   silva_files <- download_ref_db("SILVA")
   
-  # Assign taxonomy at the genus level
-  cat("Assigning taxonomy using Silva database...\n")
-  taxa_silva <- assignTaxonomy(seqtab.nochim, silva_files$train, multithread=TRUE)
-  
-  # Add species-level assignments
-  cat("Adding species-level assignments...\n")
-  taxa_silva <- addSpecies(taxa_silva, silva_files$species)
+  # Assign taxonomy at the genus level with optimized parallelization
+  cat("Assigning taxonomy using Silva database with optimized parallelization...\n")
+
+  # For large datasets, use batched taxonomy assignment
+  if(ncol(seqtab.nochim) > 3000) {
+    cat("Using batched approach for taxonomy assignment due to large number of ASVs...\n")
+    
+    # Split ASVs into batches
+    batch_size <- 1000  # Process 1000 ASVs at a time
+    asv_sequences <- colnames(seqtab.nochim)
+    n_batches <- ceiling(length(asv_sequences) / batch_size)
+    
+    # Initialize results matrix
+    taxa_silva <- NULL
+    
+    # Process each batch
+    for(i in 1:n_batches) {
+      cat(sprintf("Processing taxonomy batch %d of %d...\n", i, n_batches))
+      
+      # Calculate batch indices
+      start_idx <- (i-1) * batch_size + 1
+      end_idx <- min(i * batch_size, length(asv_sequences))
+      
+      # Extract batch
+      batch_seqs <- asv_sequences[start_idx:end_idx]
+      
+      # Create a mini sequence table with just these ASVs
+      batch_seqtab <- seqtab.nochim[, batch_seqs, drop=FALSE]
+      
+      # Assign taxonomy for this batch
+      batch_taxa <- assignTaxonomy(batch_seqtab, silva_files$train, multithread=TRUE)
+      
+      # Add species assignments
+      batch_taxa <- addSpecies(batch_taxa, silva_files$species)
+      
+      # Combine with previous results
+      if(is.null(taxa_silva)) {
+        taxa_silva <- batch_taxa
+      } else {
+        taxa_silva <- rbind(taxa_silva, batch_taxa)
+      }
+      
+      # Force garbage collection
+      gc()
+    }
+  } else {
+    # For smaller datasets, use the standard approach
+    taxa_silva <- assignTaxonomy(seqtab.nochim, silva_files$train, multithread=TRUE)
+    
+    # Add species-level assignments
+    cat("Adding species-level assignments...\n")
+    taxa_silva <- addSpecies(taxa_silva, silva_files$species)
+  }
   
   # View taxonomic assignments
   cat("First few taxonomic assignments:\n")
@@ -1908,10 +2182,51 @@ if (taxonomy_methods$IDTAXA_SILVA) {
   dna_seqs <- Biostrings::DNAStringSet(getSequences(seqtab.nochim))
   names(dna_seqs) <- paste0("ASV", seq_along(dna_seqs))
   
-  # Run IDTAXA classification
-  cat("Running IDTAXA classification...\n")
-  ids <- DECIPHER::IdTaxa(dna_seqs, trainingSet, strand = "both", 
-                        processors = NULL, threshold = 50)
+  # Run IDTAXA classification with optimized parallelization
+  cat("Running IDTAXA classification with optimized parallelization...\n")
+  
+  # Determine optimal number of processors for IDTAXA
+  num_processors <- min(parallel::detectCores() - 1, 8)
+  cat(sprintf("Using %d processors for IDTAXA classification...\n", num_processors))
+  
+  # For large datasets, use batched approach
+  if(length(dna_seqs) > 3000) {
+    cat("Using batched approach for IDTAXA due to large number of sequences...\n")
+    
+    # Split sequences into batches
+    batch_size <- 1000  # Process 1000 sequences at a time
+    n_batches <- ceiling(length(dna_seqs) / batch_size)
+    
+    # Initialize results list
+    ids <- vector("list", length(dna_seqs))
+    names(ids) <- names(dna_seqs)
+    
+    # Process each batch
+    for(i in 1:n_batches) {
+      cat(sprintf("Processing IDTAXA batch %d of %d...\n", i, n_batches))
+      
+      # Calculate batch indices
+      start_idx <- (i-1) * batch_size + 1
+      end_idx <- min(i * batch_size, length(dna_seqs))
+      
+      # Extract batch
+      batch_seqs <- dna_seqs[start_idx:end_idx]
+      
+      # Run IDTAXA on this batch
+      batch_ids <- DECIPHER::IdTaxa(batch_seqs, trainingSet, strand = "both", 
+                                   processors = num_processors, threshold = 50)
+      
+      # Store in the correct positions in the results list
+      ids[names(batch_seqs)] <- batch_ids
+      
+      # Force garbage collection
+      gc()
+    }
+  } else {
+    # For smaller datasets, use standard approach
+    ids <- DECIPHER::IdTaxa(dna_seqs, trainingSet, strand = "both", 
+                          processors = num_processors, threshold = 50)
+  }
   
   # Function to convert IDTAXA results to a taxonomy table similar to DADA2's format
   convert_idtaxa_to_table <- function(ids) {
