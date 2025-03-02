@@ -19,6 +19,9 @@ params:
   output_format: "html"
   output_dir: "reports"
   output_file: "dada2_workflow_report"
+  multi_run: FALSE
+  run_dir: NULL
+  big_data: FALSE
 ---
 
 ```{r setup, include=FALSE}
@@ -496,58 +499,119 @@ tryCatch({
 })
 ```
 
-# Set Working Directory and Locate Files
+# Set Working Directory and Configure for Single or Multi-Run Processing
 
-```{r locate-files}
-# Set your working directory to where the fastq files are located
-# Replace with the path to your sequencing data
-path <- "data"
+```{r run-configuration}
+# Check for multi-run mode specified in parameters
+is_multi_run <- params$multi_run
+is_big_data <- params$big_data
 
-# List fastq files - handling multiple naming conventions
-# Try standard Illumina naming pattern first (_R1_001.fastq.gz)
-fnFs.illumina <- sort(list.files(path, pattern="_R1_001\\.fastq\\.gz$", full.names = TRUE))
-fnRs.illumina <- sort(list.files(path, pattern="_R2_001\\.fastq\\.gz$", full.names = TRUE))
-
-# Try alternative naming patterns (_R1.fastq.gz)
-fnFs.alt1 <- sort(list.files(path, pattern="_R1\\.fastq\\.gz$", full.names = TRUE))
-fnRs.alt1 <- sort(list.files(path, pattern="_R2\\.fastq\\.gz$", full.names = TRUE))
-
-# Try other naming patterns (forward/reverse in the name)
-fnFs.alt2 <- sort(list.files(path, pattern="[_\\.]F[_\\.]|[_\\.]forward[_\\.]", full.names = TRUE, ignore.case = TRUE))
-fnRs.alt2 <- sort(list.files(path, pattern="[_\\.]R[_\\.]|[_\\.]reverse[_\\.]", full.names = TRUE, ignore.case = TRUE))
-
-# Check naming pattern and use the appropriate files
-if (length(fnFs.illumina) > 0 && length(fnRs.illumina) > 0) {
-  # Use Illumina naming pattern
-  fnFs <- fnFs.illumina
-  fnRs <- fnRs.illumina
-  cat("Using Illumina naming pattern (_R1_001.fastq.gz)\n")
-  file_pattern <- "_R\\d_001\\.fastq\\.gz$"
-} else if (length(fnFs.alt1) > 0 && length(fnRs.alt1) > 0) {
-  # Use alternative naming pattern
-  fnFs <- fnFs.alt1
-  fnRs <- fnRs.alt1
-  cat("Using alternative naming pattern (_R1.fastq.gz)\n")
-  file_pattern <- "_R\\d\\.fastq\\.gz$"
-} else if (length(fnFs.alt2) > 0 && length(fnRs.alt2) > 0) {
-  # Use other alternative naming pattern
-  fnFs <- fnFs.alt2
-  fnRs <- fnRs.alt2
-  cat("Using alternative naming pattern with forward/reverse in the name\n")
-  file_pattern <- "\\.(fastq|fq)(\\.gz)?$"
-} else {
-  # Look for any fastq files
-  all_fastqs <- sort(list.files(path, pattern="\\.(fastq|fq)(\\.gz)?$", full.names = TRUE))
-  if (length(all_fastqs) > 0) {
-    cat("WARNING: Found", length(all_fastqs), "fastq files but couldn't determine read direction.\n")
-    cat("Please ensure your files follow naming conventions with _R1/_R2 or similar pattern.\n")
+if(is_multi_run) {
+  cat("Multi-run processing mode enabled\n")
+  
+  # Check if run directory is specified
+  if(!is.null(params$run_dir) && nchar(params$run_dir) > 0) {
+    root_path <- params$run_dir
+    cat("Using specified run directory:", root_path, "\n")
+  } else {
+    # Default to data directory with subdirectories for runs
+    root_path <- "data"
+    cat("Using default data directory for multi-run processing\n")
   }
-  stop("No fastq files found with standard naming patterns. Please check your file paths and naming conventions.")
+  
+  # Check if the run directory exists
+  if(!dir.exists(root_path)) {
+    stop("Run directory does not exist: ", root_path)
+  }
+  
+  # Look for run subdirectories
+  run_dirs <- list.dirs(root_path, full.names = TRUE, recursive = FALSE)
+  
+  # Filter to only include directories that have fastq files
+  run_dirs <- run_dirs[sapply(run_dirs, function(dir) {
+    length(list.files(dir, pattern = "\\.(fastq|fq)(\\.gz)?$", recursive = TRUE)) > 0
+  })]
+  
+  if(length(run_dirs) == 0) {
+    cat("No run directories with fastq files found in", root_path, "\n")
+    cat("Falling back to single-run mode with data directory\n")
+    is_multi_run <- FALSE
+    path <- "data"
+  } else {
+    cat("Found", length(run_dirs), "run directories with fastq files:\n")
+    cat(paste(" -", basename(run_dirs)), sep = "\n")
+  }
+} else {
+  # Single run mode
+  cat("Single-run processing mode enabled\n")
+  path <- "data"
 }
 
-# Extract sample names from filenames
-# Function to extract sample names that works with multiple naming conventions
-extract_sample_names <- function(file_paths, pattern) {
+# For big data mode, we'll use more aggressive memory management
+if(is_big_data) {
+  cat("Big data mode enabled - optimizing for memory efficiency\n")
+}
+
+# Create a function to handle file finding for both single and multi-run modes
+find_fastq_files <- function(search_path, recursive = FALSE) {
+  # Common function to handle various file naming patterns
+  
+  # Try standard Illumina naming pattern first (_R1_001.fastq.gz)
+  fnFs.illumina <- sort(list.files(search_path, pattern="_R1_001\\.fastq\\.gz$", 
+                                  full.names = TRUE, recursive = recursive))
+  fnRs.illumina <- sort(list.files(search_path, pattern="_R2_001\\.fastq\\.gz$", 
+                                  full.names = TRUE, recursive = recursive))
+  
+  # Try alternative naming patterns (_R1.fastq.gz)
+  fnFs.alt1 <- sort(list.files(search_path, pattern="_R1\\.fastq\\.gz$", 
+                              full.names = TRUE, recursive = recursive))
+  fnRs.alt1 <- sort(list.files(search_path, pattern="_R2\\.fastq\\.gz$", 
+                              full.names = TRUE, recursive = recursive))
+  
+  # Try other naming patterns (forward/reverse in the name)
+  fnFs.alt2 <- sort(list.files(search_path, pattern="[_\\.]F[_\\.]|[_\\.]forward[_\\.]", 
+                              full.names = TRUE, ignore.case = TRUE, recursive = recursive))
+  fnRs.alt2 <- sort(list.files(search_path, pattern="[_\\.]R[_\\.]|[_\\.]reverse[_\\.]", 
+                              full.names = TRUE, ignore.case = TRUE, recursive = recursive))
+  
+  # Check naming pattern and use the appropriate files
+  if (length(fnFs.illumina) > 0 && length(fnRs.illumina) > 0) {
+    # Use Illumina naming pattern
+    fnFs <- fnFs.illumina
+    fnRs <- fnRs.illumina
+    cat("Using Illumina naming pattern (_R1_001.fastq.gz)\n")
+    file_pattern <- "_R\\d_001\\.fastq\\.gz$"
+  } else if (length(fnFs.alt1) > 0 && length(fnRs.alt1) > 0) {
+    # Use alternative naming pattern
+    fnFs <- fnFs.alt1
+    fnRs <- fnRs.alt1
+    cat("Using alternative naming pattern (_R1.fastq.gz)\n")
+    file_pattern <- "_R\\d\\.fastq\\.gz$"
+  } else if (length(fnFs.alt2) > 0 && length(fnRs.alt2) > 0) {
+    # Use other alternative naming pattern
+    fnFs <- fnFs.alt2
+    fnRs <- fnRs.alt2
+    cat("Using alternative naming pattern with forward/reverse in the name\n")
+    file_pattern <- "\\.(fastq|fq)(\\.gz)?$"
+  } else {
+    # Look for any fastq files
+    all_fastqs <- sort(list.files(search_path, pattern="\\.(fastq|fq)(\\.gz)?$", 
+                                 full.names = TRUE, recursive = recursive))
+    if (length(all_fastqs) > 0) {
+      cat("WARNING: Found", length(all_fastqs), "fastq files but couldn't determine read direction.\n")
+      cat("Please ensure your files follow naming conventions with _R1/_R2 or similar pattern.\n")
+    }
+    return(NULL)  # Return NULL to indicate no valid files found
+  }
+  
+  # Return both file lists and the pattern
+  return(list(fnFs = fnFs, fnRs = fnRs, pattern = file_pattern))
+}
+```
+
+```{r locate-files}
+# Function to extract sample names from filenames that works with multiple naming conventions
+extract_sample_names <- function(file_paths, pattern, run_names = NULL) {
   sample_names <- basename(file_paths)
   
   # First handle the standard Illumina pattern
@@ -569,23 +633,29 @@ extract_sample_names <- function(file_paths, pattern) {
   # Remove trailing underscores if present
   sample_names <- gsub("_+$", "", sample_names)
   
+  # If we have run names and are in multi-run mode, prefix with run name
+  if(!is.null(run_names)) {
+    # Extract the run name for each file by matching its path against the run directories
+    file_runs <- sapply(file_paths, function(fp) {
+      # Find which run directory this file belongs to
+      run_idx <- which(sapply(names(run_names), function(r) grepl(r, fp, fixed = TRUE)))
+      if(length(run_idx) > 0) {
+        return(run_names[run_idx[1]])  # Return the run name
+      } else {
+        return("unknown")  # Fallback
+      }
+    })
+    
+    # Prefix sample names with run names (if in multi-run mode)
+    if(is_multi_run) {
+      sample_names <- paste(file_runs, sample_names, sep = "_")
+    }
+    
+    # Store the run information (useful for multi-run handling)
+    attr(sample_names, "runs") <- file_runs
+  }
+  
   return(sample_names)
-}
-
-# Extract sample names
-sample.names <- extract_sample_names(fnFs, file_pattern)
-
-# Verify sample names were extracted properly
-sample.df <- data.frame(
-  ForwardFile = basename(fnFs),
-  ReverseFile = basename(fnRs),
-  SampleName = sample.names
-)
-kable(head(sample.df, 10), caption = "Sample Names Extracted from Files")
-
-# Verify forward and reverse files match
-if (length(fnFs) != length(fnRs)) {
-  stop("Number of forward and reverse files don't match. Check your files.")
 }
 
 # Detect primers from filenames
@@ -617,9 +687,6 @@ detect_primers <- function(file_names) {
     return(NULL)
   }
 }
-
-# Get primer information
-primer_info <- detect_primers(c(fnFs, fnRs))
 
 # Map primer to expected amplicon length
 get_expected_amplicon_size <- function(primer) {
@@ -662,11 +729,107 @@ get_expected_amplicon_size <- function(primer) {
   }
 }
 
+# Process files differently based on single or multi-run mode
+if(is_multi_run) {
+  # Initialize lists to store file information for each run
+  all_fnFs <- list()
+  all_fnRs <- list()
+  all_sample_names <- list()
+  run_names <- character()
+  
+  # Process each run directory
+  for(i in seq_along(run_dirs)) {
+    run_dir <- run_dirs[i]
+    run_name <- basename(run_dir)
+    cat("\nProcessing run directory:", run_name, "\n")
+    
+    # Find fastq files for this run
+    files <- find_fastq_files(run_dir)
+    
+    if(is.null(files)) {
+      cat("No valid fastq files found in", run_dir, "- skipping\n")
+      next
+    }
+    
+    # Store the files for this run
+    all_fnFs[[run_name]] <- files$fnFs
+    all_fnRs[[run_name]] <- files$fnRs
+    
+    # Extract sample names for this run
+    run_sample_names <- extract_sample_names(files$fnFs, files$pattern)
+    all_sample_names[[run_name]] <- run_sample_names
+    
+    # Store the run name
+    run_names[run_name] <- run_name
+    
+    cat("Found", length(files$fnFs), "samples in run", run_name, "\n")
+  }
+  
+  # Check if we found any valid runs
+  if(length(all_fnFs) == 0) {
+    stop("No valid fastq files found in any run directories")
+  }
+  
+  # Combine all runs into single vectors
+  fnFs <- unlist(all_fnFs, use.names = FALSE)
+  fnRs <- unlist(all_fnRs, use.names = FALSE)
+  
+  # Get run for each file for later use in naming
+  file_to_run <- rep(names(all_fnFs), sapply(all_fnFs, length))
+  names(file_to_run) <- NULL  # Clean names to avoid confusion
+  
+  # Extract sample names with run prefixes
+  sample.names <- extract_sample_names(fnFs, "combined", run_names = file_to_run)
+  
+  cat("\nCombined all runs:", length(fnFs), "total samples from", length(all_fnFs), "runs\n")
+} else {
+  # Single run mode
+  cat("\nProcessing in single-run mode\n")
+  
+  # Find fastq files
+  files <- find_fastq_files(path)
+  
+  if(is.null(files)) {
+    stop("No valid fastq files found in data directory. Please check your file paths and naming conventions.")
+  }
+  
+  fnFs <- files$fnFs
+  fnRs <- files$fnRs
+  file_pattern <- files$pattern
+  
+  # Extract sample names
+  sample.names <- extract_sample_names(fnFs, file_pattern)
+  
+  cat("Found", length(fnFs), "samples\n")
+}
+
+# Verify sample names were extracted properly
+sample.df <- data.frame(
+  ForwardFile = basename(fnFs),
+  ReverseFile = basename(fnRs),
+  SampleName = sample.names
+)
+kable(head(sample.df, min(10, nrow(sample.df))), caption = "Sample Names Extracted from Files")
+
+# Verify forward and reverse files match
+if (length(fnFs) != length(fnRs)) {
+  stop("Number of forward and reverse files don't match. Check your files.")
+}
+
+# Get primer information based on combined files if in multi-run mode
+primer_info <- detect_primers(c(fnFs, fnRs))
 expected_amplicon_size <- get_expected_amplicon_size(primer_info)
 cat("Expected amplicon size:", expected_amplicon_size, "bp\n")
 
-# Print summary
-cat("Found", length(fnFs), "samples\n")
+# Create run information table if in multi-run mode
+if(is_multi_run && exists("file_to_run")) {
+  run_table <- table(file_to_run)
+  run_df <- data.frame(
+    Run = names(run_table),
+    Samples = as.numeric(run_table)
+  )
+  kable(run_df, caption = "Sample Counts by Run")
+}
 ```
 
 # Initial Quality Assessment
@@ -1426,55 +1589,146 @@ DADA2 will now denoise the data and infer the true biological sequences.
 # Apply the DADA2 algorithm to forward reads with optimized parallelization
 cat("Denoising forward reads with optimized parallelization...\n")
 
+# Determine pooling option based on multi-run status
+# For multi-run data, we can use "pseudo" pooling within each run
+# For a single run, use "pseudo" pooling overall
+pooling_option <- ifelse(is_multi_run && exists("file_to_run"), FALSE, "pseudo")
+
+if(is_multi_run && exists("file_to_run")) {
+  cat("Multi-run mode: Each run will be processed separately with pseudo-pooling within each run\n")
+} else {
+  cat("Using pseudo-pooling across all samples\n")
+}
+
 # Use parallel batch processing for large datasets
-if (length(derepFs) > 20) {
+if (length(derepFs) > 20 || is_multi_run) {
   # Process in batches for better memory management
   batch_size <- min(10, ceiling(length(derepFs)/4))
   cat(sprintf("Processing forward reads in batches of %d samples...\n", batch_size))
   
-  # Create batches
-  sample_names <- names(derepFs)
-  batch_groups <- split(sample_names, ceiling(seq_along(sample_names)/batch_size))
-  
-  # Process each batch and combine results
-  dadaFs_list <- list()
-  for (i in seq_along(batch_groups)) {
-    cat(sprintf("Processing forward batch %d of %d...\n", i, length(batch_groups)))
-    batch_samples <- batch_groups[[i]]
-    dadaFs_batch <- dada(derepFs[batch_samples], err = errF, multithread = TRUE, pool = "pseudo")
-    dadaFs_list <- c(dadaFs_list, dadaFs_batch)
+  if(is_multi_run && exists("file_to_run")) {
+    # In multi-run mode, use runs for batching
+    run_names <- unique(file_to_run)
+    cat("Processing each sequencing run independently\n")
+    
+    # Process each run separately
+    dadaFs_list <- list()
+    for(run in run_names) {
+      cat(sprintf("Processing run '%s' forward reads...\n", run))
+      # Get samples for this run
+      run_samples <- names(derepFs)[file_to_run == run]
+      
+      if(length(run_samples) > batch_size) {
+        # Further divide into batches if the run has many samples
+        run_batches <- split(run_samples, ceiling(seq_along(run_samples)/batch_size))
+        
+        # Process each batch with pooling within the run
+        run_dadaFs <- list()
+        for(j in seq_along(run_batches)) {
+          cat(sprintf("  Processing batch %d of %d within run '%s'...\n", 
+                    j, length(run_batches), run))
+          batch_samples <- run_batches[[j]]
+          # Use pseudo-pooling within each run
+          batch_dadaFs <- dada(derepFs[batch_samples], err = errF, multithread = TRUE, pool = "pseudo")
+          run_dadaFs <- c(run_dadaFs, batch_dadaFs)
+        }
+      } else {
+        # Process all samples in this run at once with pooling
+        run_dadaFs <- dada(derepFs[run_samples], err = errF, multithread = TRUE, pool = "pseudo")
+      }
+      
+      # Add to the full list
+      dadaFs_list <- c(dadaFs_list, run_dadaFs)
+      
+      # Force garbage collection
+      gc()
+    }
+    dadaFs <- dadaFs_list
+  } else {
+    # Standard batch processing (not separated by run)
+    sample_names <- names(derepFs)
+    batch_groups <- split(sample_names, ceiling(seq_along(sample_names)/batch_size))
+    
+    # Process each batch and combine results
+    dadaFs_list <- list()
+    for (i in seq_along(batch_groups)) {
+      cat(sprintf("Processing forward batch %d of %d...\n", i, length(batch_groups)))
+      batch_samples <- batch_groups[[i]]
+      dadaFs_batch <- dada(derepFs[batch_samples], err = errF, multithread = TRUE, pool = pooling_option)
+      dadaFs_list <- c(dadaFs_list, dadaFs_batch)
+    }
+    dadaFs <- dadaFs_list
   }
-  dadaFs <- dadaFs_list
 } else {
   # For smaller datasets, process all at once
-  dadaFs <- dada(derepFs, err = errF, multithread = TRUE, pool = "pseudo")
+  dadaFs <- dada(derepFs, err = errF, multithread = TRUE, pool = pooling_option)
 }
 
 # Apply the DADA2 algorithm to reverse reads with optimized parallelization
 cat("Denoising reverse reads with optimized parallelization...\n")
 
 # Use parallel batch processing for large datasets
-if (length(derepRs) > 20) {
+if (length(derepRs) > 20 || is_multi_run) {
   # Process in batches for better memory management
   batch_size <- min(10, ceiling(length(derepRs)/4))
   cat(sprintf("Processing reverse reads in batches of %d samples...\n", batch_size))
   
-  # Create batches
-  sample_names <- names(derepRs)
-  batch_groups <- split(sample_names, ceiling(seq_along(sample_names)/batch_size))
-  
-  # Process each batch and combine results
-  dadaRs_list <- list()
-  for (i in seq_along(batch_groups)) {
-    cat(sprintf("Processing reverse batch %d of %d...\n", i, length(batch_groups)))
-    batch_samples <- batch_groups[[i]]
-    dadaRs_batch <- dada(derepRs[batch_samples], err = errR, multithread = TRUE, pool = "pseudo")
-    dadaRs_list <- c(dadaRs_list, dadaRs_batch)
+  if(is_multi_run && exists("file_to_run")) {
+    # In multi-run mode, use runs for batching
+    run_names <- unique(file_to_run)
+    cat("Processing each sequencing run independently\n")
+    
+    # Process each run separately
+    dadaRs_list <- list()
+    for(run in run_names) {
+      cat(sprintf("Processing run '%s' reverse reads...\n", run))
+      # Get samples for this run
+      run_samples <- names(derepRs)[file_to_run == run]
+      
+      if(length(run_samples) > batch_size) {
+        # Further divide into batches if the run has many samples
+        run_batches <- split(run_samples, ceiling(seq_along(run_samples)/batch_size))
+        
+        # Process each batch with pooling within the run
+        run_dadaRs <- list()
+        for(j in seq_along(run_batches)) {
+          cat(sprintf("  Processing batch %d of %d within run '%s'...\n", 
+                    j, length(run_batches), run))
+          batch_samples <- run_batches[[j]]
+          # Use pseudo-pooling within each run
+          batch_dadaRs <- dada(derepRs[batch_samples], err = errR, multithread = TRUE, pool = "pseudo")
+          run_dadaRs <- c(run_dadaRs, batch_dadaRs)
+        }
+      } else {
+        # Process all samples in this run at once with pooling
+        run_dadaRs <- dada(derepRs[run_samples], err = errR, multithread = TRUE, pool = "pseudo")
+      }
+      
+      # Add to the full list
+      dadaRs_list <- c(dadaRs_list, run_dadaRs)
+      
+      # Force garbage collection
+      gc()
+    }
+    dadaRs <- dadaRs_list
+  } else {
+    # Standard batch processing (not separated by run)
+    sample_names <- names(derepRs)
+    batch_groups <- split(sample_names, ceiling(seq_along(sample_names)/batch_size))
+    
+    # Process each batch and combine results
+    dadaRs_list <- list()
+    for (i in seq_along(batch_groups)) {
+      cat(sprintf("Processing reverse batch %d of %d...\n", i, length(batch_groups)))
+      batch_samples <- batch_groups[[i]]
+      dadaRs_batch <- dada(derepRs[batch_samples], err = errR, multithread = TRUE, pool = pooling_option)
+      dadaRs_list <- c(dadaRs_list, dadaRs_batch)
+    }
+    dadaRs <- dadaRs_list
   }
-  dadaRs <- dadaRs_list
 } else {
   # For smaller datasets, process all at once
-  dadaRs <- dada(derepRs, err = errR, multithread = TRUE, pool = "pseudo")
+  dadaRs <- dada(derepRs, err = errR, multithread = TRUE, pool = pooling_option)
 }
 
 # Inspect the returned dada-class object for the first sample
@@ -1490,6 +1744,11 @@ denoise_summary <- data.frame(
   PercentRetained = sapply(dadaFs, function(x) round(sum(getUniques(x$denoised)) / sum(getUniques(x)) * 100, 1))
 )
 
+# Add run information if in multi-run mode
+if(is_multi_run && exists("file_to_run")) {
+  denoise_summary$Run <- file_to_run[match(denoise_summary$Sample, names(derepFs))]
+}
+
 kable(head(denoise_summary, 10), caption = "Denoising Summary (First 10 Samples)")
 
 # Average denoising stats
@@ -1500,7 +1759,8 @@ cat("Total ASVs identified in forward reads:", total_asvs_forward, "\n")
 
 # Create checkpoint after sample inference step
 save_checkpoint("after_sample_inference", 
-               c("derepFs", "derepRs", "errF", "errR", "dadaFs", "dadaRs", "sample.names"),
+               c("derepFs", "derepRs", "errF", "errR", "dadaFs", "dadaRs", "sample.names",
+                 "is_multi_run", "file_to_run"),
                overwrite = TRUE)
 cat("Checkpoint saved after sample inference step\n")
 ```
@@ -1601,7 +1861,39 @@ cat("Checkpoint saved after merging paired reads step\n")
 ```{r seqtab}
 # Construct sequence table
 cat("Constructing ASV sequence table...\n")
-seqtab <- makeSequenceTable(mergers)
+
+# Special handling for multi-run data
+if (is_multi_run && exists("file_to_run")) {
+  cat("Multi-run mode: Creating separate sequence tables for each run first\n")
+  
+  # Get unique runs
+  run_names <- unique(file_to_run)
+  
+  # Create a separate sequence table for each run
+  run_seqtabs <- list()
+  for (run in run_names) {
+    cat(sprintf("Creating sequence table for run '%s'...\n", run))
+    # Get mergers for this run
+    run_samples <- names(mergers)[file_to_run == run]
+    
+    # Make sequence table for this run
+    run_seqtab <- makeSequenceTable(mergers[run_samples])
+    run_seqtabs[[run]] <- run_seqtab
+    
+    cat(sprintf("  Run '%s' sequence table dimensions: %d samples x %d ASVs\n", 
+              run, nrow(run_seqtab), ncol(run_seqtab)))
+  }
+  
+  # Merge all sequence tables
+  cat("Merging sequence tables from all runs...\n")
+  seqtab <- mergeSequenceTables(tables = run_seqtabs)
+  
+  # Add run info to sequence table attributes for tracking
+  attr(seqtab, "run_info") <- file_to_run
+} else {
+  # Standard processing for single run
+  seqtab <- makeSequenceTable(mergers)
+}
 
 # Display table dimensions
 cat("Dimensions of ASV table:", dim(seqtab), "(samples × ASVs)\n")
@@ -1654,9 +1946,37 @@ cat("Removed", original_reads - filtered_reads, "reads (",
 # Use filtered sequence table for further analysis
 seqtab <- seqtab_filtered
 
+# If multi-run, create a summary of ASVs per run
+if (is_multi_run && exists("file_to_run") && exists("run_seqtabs")) {
+  # Create a table showing how many ASVs were found in each run
+  run_asv_counts <- sapply(run_seqtabs, ncol)
+  shared_asv_count <- ncol(seqtab)
+  
+  # Calculate percentage of ASVs shared across runs
+  unique_asvs_all_runs <- length(unique(unlist(lapply(run_seqtabs, colnames))))
+  shared_pct <- round(shared_asv_count / unique_asvs_all_runs * 100, 1)
+  
+  run_summary <- data.frame(
+    Run = names(run_asv_counts),
+    ASVs = run_asv_counts,
+    SamplesInRun = sapply(run_seqtabs, nrow)
+  )
+  
+  # Add overall row
+  run_summary <- rbind(run_summary, 
+                     c("COMBINED", ncol(seqtab), nrow(seqtab)))
+  
+  # Display summary table
+  kable(run_summary, caption = "ASV Counts by Run")
+  
+  cat("Found", unique_asvs_all_runs, "unique ASVs across all runs\n")
+  cat("After merging:", ncol(seqtab), "ASVs in the combined dataset\n")
+}
+
 # Create checkpoint after ASV table construction step
 save_checkpoint("after_asv_table", 
-               c("mergers", "seqtab", "sample.names", "seqtab_filtered", "expected_amplicon_size"),
+               c("mergers", "seqtab", "sample.names", "seqtab_filtered", "expected_amplicon_size",
+                 "is_multi_run", "file_to_run", "run_seqtabs"),
                overwrite = TRUE)
 cat("Checkpoint saved after ASV table construction step\n")
 ```
@@ -2997,8 +3317,7 @@ cat("Checkpoint saved after phyloseq creation step\n")
 if(!dir.exists("results")) dir.create("results")
 
 # Create sample data frame
-# Try to extract metadata from file names
-cat("Extracting metadata from sample names...\n")
+cat("Creating sample metadata...\n")
 
 # Extract sample group information (if follows naming pattern like Sample_GroupName_...)
 sample_metadata <- data.frame(
@@ -3007,11 +3326,24 @@ sample_metadata <- data.frame(
   row.names = sample.names
 )
 
+# Add run information if in multi-run mode
+if (is_multi_run && exists("file_to_run")) {
+  cat("Adding sequencing run information to sample metadata\n")
+  sample_metadata$Run <- file_to_run
+  
+  # Try to extract experimental groups without the run prefix 
+  # First remove the run prefix from sample names
+  clean_names <- gsub("^[^_]*_", "", sample.names)
+} else {
+  # When not in multi-run mode, use the original sample names
+  clean_names <- sample.names
+}
+
 # Try to extract experimental groups from sample names using a common pattern
 # This is just a generic example - modify based on your actual naming convention
 group_pattern <- ".*?_(.*?)_.*|.*?-(.*?)-.*"
-group_matches <- regmatches(sample.names, 
-                          regexec(group_pattern, sample.names))
+group_matches <- regmatches(clean_names, 
+                          regexec(group_pattern, clean_names))
 
 # Extract group information if the pattern matched
 valid_matches <- sapply(group_matches, length) > 1
@@ -3032,6 +3364,20 @@ if (any(valid_matches)) {
 group_counts <- table(sample_metadata$Group)
 cat("Detected sample groups:\n")
 print(group_counts)
+
+# Display run summary if in multi-run mode
+if (is_multi_run && exists("file_to_run")) {
+  # Cross-tabulate samples by group and run
+  if (length(unique(sample_metadata$Group)) > 1) {
+    group_by_run <- table(sample_metadata$Group, sample_metadata$Run)
+    cat("\nSample counts by group and run:\n")
+    print(group_by_run)
+  } else {
+    run_counts <- table(sample_metadata$Run)
+    cat("\nSample counts by run:\n")
+    print(run_counts)
+  }
+}
 
 # First create basic phyloseq components
 otu <- otu_table(seqtab.nochim, taxa_are_rows = FALSE)
