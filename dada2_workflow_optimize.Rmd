@@ -28,6 +28,8 @@ Key features of this optimized workflow:
 - **Primer detection** to assist with expected amplicon size calculations
 - **Read merging optimization** to ensure sufficient overlap for reliable ASV calling
 
+> **Note on amplicon size and sequencing cycles:** While Illumina sequencers run a fixed number of cycles (e.g., 2x250 for MiSeq, 2x150 for NovaSeq), the expected amplicon size is still crucial for parameter optimization. For example, the V4 region using 515F-806R primers produces a ~253 bp amplicon. For a MiSeq 2x250 run, this means the forward read covers positions 1-250 and the reverse read covers positions 253-4 (reading backward), creating substantial overlap (~247 bp). The algorithm needs this information to properly balance quality trimming while maintaining sufficient overlap for read merging. Even if individual reads are limited by cycle count, knowing the true amplicon size helps optimize trimming parameters and validates that merged sequences represent genuine amplicons rather than artifacts.
+
 # Setup
 
 ```{r load-packages}
@@ -182,19 +184,37 @@ get_expected_amplicon_size <- function(primer) {
   
   # Approximate amplicon sizes for common primer sets
   amplicon_sizes <- c(
-    "515F-806R" = 253,
-    "341F-805R" = 464,
-    "515F-926R" = 411,
-    "27F-338R" = 311,
+    "515F-806R" = 253,  # V4 region
+    "341F-805R" = 464,  # V3-V4 region
+    "515F-926R" = 411,  # V4-V5 region
+    "27F-338R" = 311,   # V1-V2 region
     "V4" = 253,
     "V3-V4" = 464,
     "V1-V2" = 311,
     "806R" = 253  # Assuming 515F-806R when only 806R is mentioned
   )
   
+  # Display informative message about the primers and amplicon size
   if (primer %in% names(amplicon_sizes)) {
-    return(amplicon_sizes[primer])
+    size <- amplicon_sizes[primer]
+    
+    # For common primer sets, provide additional information
+    if (primer %in% c("515F-806R", "806R", "V4")) {
+      cat("Using the 515F-806R primer set (V4 region). Expected amplicon size:", size, "bp\n")
+      cat("Note: While MiSeq runs 2x250 cycles, the ~253 bp amplicon size is important for\n")
+      cat("      proper read merging and quality filtering parameter optimization.\n")
+    } else if (primer %in% c("341F-805R", "V3-V4")) {
+      cat("Using the 341F-805R primer set (V3-V4 region). Expected amplicon size:", size, "bp\n")
+      cat("Note: This longer amplicon requires high-quality overlapping regions for proper merging.\n")
+    } else {
+      cat("Using", primer, "primers. Expected amplicon size:", size, "bp\n")
+    }
+    
+    return(size)
   } else {
+    cat("Unknown primer set. Using default amplicon size of 250 bp\n")
+    cat("Warning: Parameter optimization will be less precise without\n")
+    cat("         accurate amplicon size information.\n")
     return(250)  # Default if not in the list
   }
 }
