@@ -562,6 +562,22 @@ The configuration automatically:
 - Configures memory management for big datasets
 - Sets up appropriate data structures for tracking run information
 
+**To enable multi-run mode or big data mode**, modify the YAML header at the top of this document:
+
+```yaml
+params:
+  multi_run: TRUE             # Set to TRUE for multi-run processing
+  run_dir: "path/to/runs"     # Optional: specify directory containing run folders
+  big_data: TRUE              # Set to TRUE for memory optimization with large datasets
+```
+
+- For **multi-run mode**, set `multi_run: TRUE` and optionally specify `run_dir` 
+- For **big data mode**, set `big_data: TRUE` to enable memory-efficient processing
+- You can also set these parameters when rendering the Rmd via command line:
+  ```r
+  rmarkdown::render("dada2_workflow_optimize.Rmd", params = list(multi_run = TRUE, big_data = TRUE))
+  ```
+
 ```{r run-configuration}
 # Check for multi-run mode specified in parameters
 is_multi_run <- params$multi_run
@@ -910,7 +926,47 @@ print(reverse_qual)
 
 # Automatic Parameter Optimization
 
-Based on the quality profiles, we'll optimize key parameters like truncation lengths and error thresholds to maximize both data quality and sequence retention.
+Based on the quality profiles, we'll optimize key parameters like truncation lengths and error thresholds to maximize both data quality and sequence retention. This optimization process is a key feature of this workflow that automatically determines the best parameters for your specific dataset.
+
+## Understanding the Parameter Optimization Plots
+
+### Truncation Length Optimization
+
+The truncation length optimization generates **paired plots for forward and reverse reads**:
+
+![](https://i.imgur.com/vAEjPQU.png)
+
+These plots show:
+- **Blue line**: The mean quality score at each position (cycle) in the read
+- **Red horizontal line**: The quality threshold (Q25) below which bases are considered unreliable
+- **Blue vertical line**: The automatically determined optimal truncation point
+
+The algorithm finds the optimal truncation by:
+1. Identifying where quality drops below the threshold
+2. Balancing quality concerns with the need to maintain sufficient sequence overlap
+3. Ensuring the combined read length can cover the expected amplicon size
+4. Adjusting for platform-specific characteristics
+
+The optimal truncation positions are chosen to discard low-quality bases while retaining enough high-quality sequence for reliable merging. The text output provides additional information, including expected overlap after truncation.
+
+### Expected Error Threshold Optimization
+
+The maxEE parameter optimization generates a **bar chart showing read retention percentages**:
+
+![](https://i.imgur.com/UxOaXWQ.png)
+
+This plot shows:
+- **X-axis**: Different combinations of maxEE values for forward and reverse reads (F-R)
+- **Y-axis**: Percentage of reads retained after filtering
+- **Bar labels**: Exact percentage of reads retained for each parameter combination
+
+The algorithm tests various combinations and selects the optimal maxEE values by:
+1. Starting with stringent maxEE values (lower is more stringent)
+2. Targeting at least 70% read retention (dropping to 50% if necessary)
+3. Choosing the most stringent combination that meets the retention target
+4. Accommodating the typically lower quality of reverse reads by allowing higher maxEE values
+
+The goal is to remove as many low-quality reads as possible while still retaining a sufficient percentage of the data for robust downstream analysis.
 
 ```{r parameter-optimization}
 # Function to determine optimal truncation lengths based on quality profiles
@@ -1491,8 +1547,26 @@ if (length(filtFs) > 0) {
     before_reverse_data <- reverse_qual$data
     
     # Sample a subset of filtered reads quality data for comparison
-    filtered_forward_data <- plotQualityProfile(filtFs[1:n_sample_agg], aggregate = TRUE)$data
-    filtered_reverse_data <- plotQualityProfile(filtRs[1:n_sample_agg], aggregate = TRUE)$data
+    filtered_forward_qual <- plotQualityProfile(filtFs[1:n_sample_agg], aggregate = TRUE)
+    filtered_reverse_qual <- plotQualityProfile(filtRs[1:n_sample_agg], aggregate = TRUE)
+    filtered_forward_data <- filtered_forward_qual$data
+    filtered_reverse_data <- filtered_reverse_qual$data
+    
+    # Make sure all necessary columns exist in both datasets 
+    # (fixing "numbers of columns of arguments do not match" error)
+    necessary_cols <- c("Cycle", "Score", "Sample")
+    for (col in necessary_cols) {
+      if (!col %in% colnames(before_forward_data)) before_forward_data[[col]] <- NA
+      if (!col %in% colnames(filtered_forward_data)) filtered_forward_data[[col]] <- NA
+      if (!col %in% colnames(before_reverse_data)) before_reverse_data[[col]] <- NA
+      if (!col %in% colnames(filtered_reverse_data)) filtered_reverse_data[[col]] <- NA
+    }
+    
+    # Subset columns to ensure they match
+    before_forward_data <- before_forward_data[, c("Cycle", "Score", "Sample")]
+    filtered_forward_data <- filtered_forward_data[, c("Cycle", "Score", "Sample")]
+    before_reverse_data <- before_reverse_data[, c("Cycle", "Score", "Sample")]
+    filtered_reverse_data <- filtered_reverse_data[, c("Cycle", "Score", "Sample")]
     
     # Add a 'Stage' column to both datasets
     before_forward_data$Stage <- "Before Filtering"
@@ -1500,42 +1574,52 @@ if (length(filtFs) > 0) {
     before_reverse_data$Stage <- "Before Filtering"
     filtered_reverse_data$Stage <- "After Filtering"
     
-    # Combine data
-    combined_forward <- rbind(before_forward_data, filtered_forward_data)
-    combined_reverse <- rbind(before_reverse_data, filtered_reverse_data)
-    
-    # Create comparison plots
-    forward_comparison <- ggplot(combined_forward, aes(x = Cycle, y = Score, color = Stage)) +
-      stat_summary(fun = mean, geom = "line", size = 1.2) +
-      geom_hline(yintercept = 30, linetype = "dashed", color = "blue") +
-      geom_hline(yintercept = 20, linetype = "dashed", color = "red") +
-      {if (exists("truncLen_forward")) 
-        geom_vline(xintercept = truncLen_forward, color = "purple", size = 1, alpha = 0.7)} +
-      scale_color_manual(values = c("Before Filtering" = "gray40", "After Filtering" = "steelblue")) +
-      labs(
-        title = "Forward Reads: Quality Before vs After Filtering",
-        x = "Cycle (bp position)",
-        y = "Mean Quality Score"
-      ) +
-      theme_minimal()
-    
-    reverse_comparison <- ggplot(combined_reverse, aes(x = Cycle, y = Score, color = Stage)) +
-      stat_summary(fun = mean, geom = "line", size = 1.2) +
-      geom_hline(yintercept = 30, linetype = "dashed", color = "blue") +
-      geom_hline(yintercept = 20, linetype = "dashed", color = "red") +
-      {if (exists("truncLen_reverse")) 
-        geom_vline(xintercept = truncLen_reverse, color = "purple", size = 1, alpha = 0.7)} +
-      scale_color_manual(values = c("Before Filtering" = "gray40", "After Filtering" = "steelblue")) +
-      labs(
-        title = "Reverse Reads: Quality Before vs After Filtering",
-        x = "Cycle (bp position)",
-        y = "Mean Quality Score"
-      ) +
-      theme_minimal()
-    
-    # Display comparison plots
-    grid.arrange(forward_comparison, reverse_comparison, ncol = 2,
-                 top = "Quality Improvement After Filtering")
+    # Safely combine data
+    tryCatch({
+      combined_forward <- rbind(before_forward_data, filtered_forward_data)
+      combined_reverse <- rbind(before_reverse_data, filtered_reverse_data)
+      
+      # Create comparison plots
+      forward_comparison <- ggplot(combined_forward, aes(x = Cycle, y = Score, color = Stage)) +
+        stat_summary(fun = mean, geom = "line", size = 1.2) +
+        geom_hline(yintercept = 30, linetype = "dashed", color = "blue") +
+        geom_hline(yintercept = 20, linetype = "dashed", color = "red") +
+        {if (exists("truncLen_forward")) 
+          geom_vline(xintercept = truncLen_forward, color = "purple", size = 1, alpha = 0.7)} +
+        scale_color_manual(values = c("Before Filtering" = "gray40", "After Filtering" = "steelblue")) +
+        labs(
+          title = "Forward Reads: Quality Before vs After Filtering",
+          x = "Cycle (bp position)",
+          y = "Mean Quality Score"
+        ) +
+        theme_minimal()
+      
+      reverse_comparison <- ggplot(combined_reverse, aes(x = Cycle, y = Score, color = Stage)) +
+        stat_summary(fun = mean, geom = "line", size = 1.2) +
+        geom_hline(yintercept = 30, linetype = "dashed", color = "blue") +
+        geom_hline(yintercept = 20, linetype = "dashed", color = "red") +
+        {if (exists("truncLen_reverse")) 
+          geom_vline(xintercept = truncLen_reverse, color = "purple", size = 1, alpha = 0.7)} +
+        scale_color_manual(values = c("Before Filtering" = "gray40", "After Filtering" = "steelblue")) +
+        labs(
+          title = "Reverse Reads: Quality Before vs After Filtering",
+          x = "Cycle (bp position)",
+          y = "Mean Quality Score"
+        ) +
+        theme_minimal()
+      
+      # Display comparison plots
+      grid.arrange(forward_comparison, reverse_comparison, ncol = 2,
+                   top = "Quality Improvement After Filtering")
+    }, error = function(e) {
+      cat("Could not create before vs after comparison plots due to data structure differences.\n")
+      cat("This is likely due to differences in the quality profile data structures. Using individual plots instead.\n")
+      cat("Error details:", conditionMessage(e), "\n")
+      
+      # Display the plots separately instead
+      print(forward_enhanced)
+      print(reverse_enhanced)
+    })
   }
   
 } else {
