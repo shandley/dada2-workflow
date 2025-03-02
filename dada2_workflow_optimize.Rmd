@@ -891,120 +891,267 @@ if (chimera_pct < 50) {
 # Track reads through the pipeline
 getN <- function(x) sum(getUniques(x))
 
-# Create tracking table with all processing steps
-# First check that we have the same samples throughout
-# Get common sample names across all steps
-common_samples <- Reduce(intersect, list(
-  rownames(out),
-  names(derepFs),
-  names(dadaFs),
-  names(dadaRs),
-  names(mergers)
-))
-
-# Warn if any samples were dropped
-if (length(common_samples) < length(names(derepFs))) {
-  cat("Warning: Some samples are missing from one or more processing steps.\n")
-  cat("Using only", length(common_samples), "samples for tracking.\n")
-}
-
-# Create tracking table explicitly for each sample to avoid dimension issues
-track <- data.frame(
-  Input = out[common_samples, "reads.in"],
-  Filtered = out[common_samples, "reads.out"],
-  Denoised_F = sapply(dadaFs[common_samples], getN),
-  Denoised_R = sapply(dadaRs[common_samples], getN),
-  Merged = sapply(mergers[common_samples], getN)
-)
-
-# Add non-chimeric reads column - handle potential dimension mismatch
-track$NonChimeric <- 0  # Initialize with zeros
-for (sample in rownames(track)) {
-  if (sample %in% rownames(seqtab.nochim)) {
-    track[sample, "NonChimeric"] <- sum(seqtab.nochim[sample, ])
+# Create a robust tracking function that handles empty or missing data
+create_tracking_table <- function() {
+  # First check that we have data to track
+  if (length(names(derepFs)) == 0) {
+    cat("ERROR: No samples available for tracking. Some processing steps may have failed.\n")
+    # Return an empty tracking dataframe with the correct structure
+    return(data.frame(
+      Sample = character(),
+      Input = numeric(),
+      Filtered = numeric(),
+      Denoised_F = numeric(),
+      Denoised_R = numeric(),
+      Merged = numeric(),
+      NonChimeric = numeric()
+    ))
   }
+  
+  # Get all possible sample names from any of the steps
+  all_samples <- unique(c(
+    rownames(out),
+    names(derepFs),
+    names(dadaFs),
+    names(dadaRs),
+    names(mergers)
+  ))
+  
+  # Create a tracking data frame with NA values
+  track_df <- data.frame(
+    Sample = all_samples,
+    Input = NA_real_,
+    Filtered = NA_real_,
+    Denoised_F = NA_real_,
+    Denoised_R = NA_real_,
+    Merged = NA_real_,
+    NonChimeric = NA_real_,
+    row.names = all_samples
+  )
+  
+  # Fill in values from each step
+  # Input reads
+  if (nrow(out) > 0) {
+    for (s in rownames(out)) {
+      if (s %in% all_samples) {
+        track_df[s, "Input"] <- out[s, "reads.in"]
+      }
+    }
+  }
+  
+  # Filtered reads
+  if (nrow(out) > 0) {
+    for (s in rownames(out)) {
+      if (s %in% all_samples) {
+        track_df[s, "Filtered"] <- out[s, "reads.out"]
+      }
+    }
+  }
+  
+  # Denoised forward reads
+  for (s in names(dadaFs)) {
+    if (s %in% all_samples) {
+      track_df[s, "Denoised_F"] <- sum(getUniques(dadaFs[[s]]))
+    }
+  }
+  
+  # Denoised reverse reads
+  for (s in names(dadaRs)) {
+    if (s %in% all_samples) {
+      track_df[s, "Denoised_R"] <- sum(getUniques(dadaRs[[s]]))
+    }
+  }
+  
+  # Merged reads
+  for (s in names(mergers)) {
+    if (s %in% all_samples) {
+      track_df[s, "Merged"] <- sum(getUniques(mergers[[s]]))
+    }
+  }
+  
+  # Non-chimeric reads
+  if (nrow(seqtab.nochim) > 0) {
+    for (s in rownames(seqtab.nochim)) {
+      if (s %in% all_samples) {
+        track_df[s, "NonChimeric"] <- sum(seqtab.nochim[s, ])
+      }
+    }
+  }
+  
+  # Keep only samples with complete data to avoid NA issues
+  complete_samples <- rownames(track_df)[complete.cases(track_df)]
+  if (length(complete_samples) < nrow(track_df)) {
+    cat("Warning: ", nrow(track_df) - length(complete_samples), 
+        " samples had incomplete data and were removed from tracking.\n")
+    if (length(complete_samples) == 0) {
+      cat("ERROR: No samples have complete data through all pipeline steps.\n")
+      cat("This suggests a failure in one or more processing steps.\n")
+      # Return the incomplete data anyway for diagnostics
+      return(track_df)
+    }
+    track_df <- track_df[complete_samples, ]
+  }
+  
+  return(track_df)
 }
 
-# Ensure row names are preserved
-rownames(track) <- common_samples
+# Create the tracking table
+track_df <- create_tracking_table()
 
-# Convert to data frame for better display
-track_df <- as.data.frame(track)
-track_df$Sample <- rownames(track_df)
+# Check if we have data to proceed
+if (nrow(track_df) == 0) {
+  cat("WARNING: No samples could be tracked through the pipeline.\n")
+  cat("Skipping tracking visualization.\n")
+} else {
+  cat("Successfully tracked", nrow(track_df), "samples through the pipeline.\n")
+}
 
-# Calculate percentage retained at each step
-track_df$Percent_Filtered <- round(track_df$Filtered / track_df$Input * 100, 1)
-track_df$Percent_Denoised_F <- round(track_df$Denoised_F / track_df$Filtered * 100, 1)
-track_df$Percent_Merged <- round(track_df$Merged / track_df$Denoised_F * 100, 1)
-track_df$Percent_NonChimeric <- round(track_df$NonChimeric / track_df$Merged * 100, 1)
-track_df$Percent_Final <- round(track_df$NonChimeric / track_df$Input * 100, 1)
+# Make sure we have the Sample column for display
+if (!("Sample" %in% colnames(track_df)) && nrow(track_df) > 0) {
+  track_df$Sample <- rownames(track_df)
+}
+
+# Calculate percentage retained at each step if we have data
+if (nrow(track_df) > 0) {
+  # Safe division function to handle division by zero
+  safe_div <- function(num, denom) {
+    ifelse(denom > 0, num / denom * 100, NA)
+  }
+  
+  track_df$Percent_Filtered <- round(safe_div(track_df$Filtered, track_df$Input), 1)
+  track_df$Percent_Denoised_F <- round(safe_div(track_df$Denoised_F, track_df$Filtered), 1)
+  track_df$Percent_Merged <- round(safe_div(track_df$Merged, track_df$Denoised_F), 1)
+  track_df$Percent_NonChimeric <- round(safe_div(track_df$NonChimeric, track_df$Merged), 1)
+  track_df$Percent_Final <- round(safe_div(track_df$NonChimeric, track_df$Input), 1)
+}
 
 # Display tracking information for the first few samples
 kable(head(track_df[, c("Sample", "Input", "Filtered", "Denoised_F", "Merged", "NonChimeric", "Percent_Final")], 10), 
       caption = "Read Tracking Through Pipeline (First 10 Samples)")
 
-# Create a summary of read loss at each step
-pipeline_summary <- data.frame(
-  Step = c("Raw Input", "After Filtering", "After Denoising", "After Merging", "After Chimera Removal"),
-  Reads = c(sum(track_df$Input), sum(track_df$Filtered), sum(track_df$Denoised_F), 
-            sum(track_df$Merged), sum(track_df$NonChimeric)),
-  PercentOfInput = c(100, 
-                     round(sum(track_df$Filtered) / sum(track_df$Input) * 100, 1),
-                     round(sum(track_df$Denoised_F) / sum(track_df$Input) * 100, 1),
-                     round(sum(track_df$Merged) / sum(track_df$Input) * 100, 1),
-                     round(sum(track_df$NonChimeric) / sum(track_df$Input) * 100, 1)),
-  PercentOfPreviousStep = c(100,
-                          round(sum(track_df$Filtered) / sum(track_df$Input) * 100, 1),
-                          round(sum(track_df$Denoised_F) / sum(track_df$Filtered) * 100, 1),
-                          round(sum(track_df$Merged) / sum(track_df$Denoised_F) * 100, 1),
-                          round(sum(track_df$NonChimeric) / sum(track_df$Merged) * 100, 1))
-)
+# Create a summary of read loss at each step if we have data
+if (nrow(track_df) > 0) {
+  # Safe sum function
+  safe_sum <- function(x) {
+    sum(x, na.rm = TRUE)
+  }
+  
+  # Safe division function
+  safe_percent <- function(numerator, denominator) {
+    if (denominator > 0) {
+      round(numerator / denominator * 100, 1)
+    } else {
+      NA
+    }
+  }
+  
+  # Calculate totals
+  total_input <- safe_sum(track_df$Input)
+  total_filtered <- safe_sum(track_df$Filtered)
+  total_denoised <- safe_sum(track_df$Denoised_F)
+  total_merged <- safe_sum(track_df$Merged)
+  total_nonchim <- safe_sum(track_df$NonChimeric)
+  
+  # Create summary data frame
+  pipeline_summary <- data.frame(
+    Step = c("Raw Input", "After Filtering", "After Denoising", "After Merging", "After Chimera Removal"),
+    Reads = c(total_input, total_filtered, total_denoised, total_merged, total_nonchim),
+    PercentOfInput = c(
+      100, 
+      safe_percent(total_filtered, total_input),
+      safe_percent(total_denoised, total_input),
+      safe_percent(total_merged, total_input),
+      safe_percent(total_nonchim, total_input)
+    ),
+    PercentOfPreviousStep = c(
+      100,
+      safe_percent(total_filtered, total_input),
+      safe_percent(total_denoised, total_filtered),
+      safe_percent(total_merged, total_denoised),
+      safe_percent(total_nonchim, total_merged)
+    )
+  )
+  
+  kable(pipeline_summary, caption = "Summary of Reads Retained at Each Processing Step")
+} else {
+  cat("No tracking data available for pipeline summary.\n")
+}
 
-kable(pipeline_summary, caption = "Summary of Reads Retained at Each Processing Step")
+# Create a plot to visualize read tracking if we have data
+if (nrow(track_df) > 0) {
+  # Try to create visualizations with proper error handling
+  tryCatch({
+    # Reshape data for plotting
+    track_long <- tidyr::pivot_longer(
+      track_df[, c("Sample", "Input", "Filtered", "Denoised_F", "Merged", "NonChimeric")],
+      cols = c("Input", "Filtered", "Denoised_F", "Merged", "NonChimeric"),
+      names_to = "Step",
+      values_to = "Reads"
+    )
+    
+    # Convert Step to factor with specified order
+    track_long$Step <- factor(track_long$Step, 
+                              levels = c("Input", "Filtered", "Denoised_F", "Merged", "NonChimeric"))
+    
+    # Create the plot for all samples together
+    overall_tracking_plot <- ggplot(track_long, aes(x = Step, y = Reads, group = Sample, color = Sample)) +
+      geom_line(alpha = 0.5) +
+      geom_point(size = 1) +
+      theme_minimal() +
+      labs(title = "Read Count Tracking Through DADA2 Pipeline",
+           x = "Processing Step",
+           y = "Number of Reads") +
+      theme(legend.position = "none")  # Hide individual sample legend as it can be cluttered
+    
+    # Create an average tracking plot
+    avg_tracking <- aggregate(Reads ~ Step, data = track_long, FUN = mean, na.rm = TRUE)
+    avg_tracking$StdDev <- aggregate(Reads ~ Step, data = track_long, FUN = sd, na.rm = TRUE)$Reads
+    
+    avg_tracking_plot <- ggplot(avg_tracking, aes(x = Step, y = Reads, group = 1)) +
+      geom_line(size = 1.5, color = "blue") +
+      geom_point(size = 3, color = "blue") +
+      geom_errorbar(aes(ymin = pmax(Reads - StdDev, 0), ymax = Reads + StdDev), width = 0.2, color = "blue") +
+      theme_minimal() +
+      labs(title = "Average Read Counts Through DADA2 Pipeline",
+           subtitle = "Error bars show standard deviation across samples",
+           x = "Processing Step",
+           y = "Average Number of Reads")
+    
+    # Show both plots
+    grid.arrange(overall_tracking_plot, avg_tracking_plot, ncol = 1)
+  }, error = function(e) {
+    cat("Error creating read tracking plots:", conditionMessage(e), "\n")
+    cat("Displaying simple summary statistics instead.\n")
+    
+    # Display summary statistics as an alternative
+    step_summary <- sapply(c("Input", "Filtered", "Denoised_F", "Merged", "NonChimeric"), function(step) {
+      values <- track_df[[step]]
+      c(Mean = mean(values, na.rm = TRUE),
+        Min = min(values, na.rm = TRUE),
+        Max = max(values, na.rm = TRUE))
+    })
+    
+    print(step_summary)
+  })
+} else {
+  cat("No tracking data available for visualization.\n")
+}
 
-# Create a plot to visualize read tracking
-# Reshape data for plotting
-track_long <- tidyr::pivot_longer(
-  track_df[, c("Sample", "Input", "Filtered", "Denoised_F", "Merged", "NonChimeric")],
-  cols = c("Input", "Filtered", "Denoised_F", "Merged", "NonChimeric"),
-  names_to = "Step",
-  values_to = "Reads"
-)
-
-# Convert Step to factor with specified order
-track_long$Step <- factor(track_long$Step, 
-                          levels = c("Input", "Filtered", "Denoised_F", "Merged", "NonChimeric"))
-
-# Create the plot for all samples together
-overall_tracking_plot <- ggplot(track_long, aes(x = Step, y = Reads, group = Sample, color = Sample)) +
-  geom_line(alpha = 0.5) +
-  geom_point(size = 1) +
-  theme_minimal() +
-  labs(title = "Read Count Tracking Through DADA2 Pipeline",
-       x = "Processing Step",
-       y = "Number of Reads") +
-  theme(legend.position = "none")  # Hide individual sample legend as it can be cluttered
-
-# Create an average tracking plot
-avg_tracking <- aggregate(Reads ~ Step, data = track_long, FUN = mean)
-avg_tracking$StdDev <- aggregate(Reads ~ Step, data = track_long, FUN = sd)$Reads
-
-avg_tracking_plot <- ggplot(avg_tracking, aes(x = Step, y = Reads, group = 1)) +
-  geom_line(size = 1.5, color = "blue") +
-  geom_point(size = 3, color = "blue") +
-  geom_errorbar(aes(ymin = Reads - StdDev, ymax = Reads + StdDev), width = 0.2, color = "blue") +
-  theme_minimal() +
-  labs(title = "Average Read Counts Through DADA2 Pipeline",
-       subtitle = "Error bars show standard deviation across samples",
-       x = "Processing Step",
-       y = "Average Number of Reads")
-
-# Show both plots
-grid.arrange(overall_tracking_plot, avg_tracking_plot, ncol = 1)
-
-# Save the tracking data for dashboard visualization
-saveRDS(track_df, "results/read_tracking.rds")
-cat("Saved read tracking data to results/read_tracking.rds\n")
+# Save the tracking data for dashboard visualization if we have results directory and data
+if (dir.exists("results") && nrow(track_df) > 0) {
+  tryCatch({
+    saveRDS(track_df, "results/read_tracking.rds")
+    cat("Saved read tracking data to results/read_tracking.rds\n")
+  }, error = function(e) {
+    cat("Error saving tracking data:", conditionMessage(e), "\n")
+  })
+} else {
+  if (!dir.exists("results")) {
+    cat("Results directory doesn't exist. Create it with dir.create('results') to save tracking data.\n")
+  } else {
+    cat("No tracking data available to save.\n")
+  }
+}
 ```
 
 # Assign Taxonomy
