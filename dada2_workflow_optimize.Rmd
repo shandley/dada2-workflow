@@ -1,0 +1,1255 @@
+---
+title: "DADA2 Workflow with Parameter Optimization for 16S rRNA Amplicon Sequence Variants"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+This document implements an optimized workflow for processing 16S rRNA gene amplicon data using DADA2. The workflow includes automatic parameter optimization, quality filtering, denoising, merging paired reads, chimera removal, and taxonomic assignment to generate a table of amplicon sequence variants (ASVs).
+
+Key features of this optimized workflow:
+
+- **Automatic detection of sequencing platform** (MiSeq, NovaSeq, etc.)
+- **Optimization of quality filtering parameters** based on your specific sequence data
+- **Adaptive truncation lengths** that adjust to your read lengths and quality profiles
+- **Expected error threshold optimization** to balance quality and read retention
+- **Primer detection** to assist with expected amplicon size calculations
+- **Read merging optimization** to ensure sufficient overlap for reliable ASV calling
+
+# Setup
+
+```{r load-packages}
+# Load required packages
+library(dada2)        # Core package for denoising and processing amplicon data
+library(ggplot2)      # For creating publication-quality graphics
+library(phyloseq)     # For handling and analyzing microbiome census data
+library(Biostrings)   # For efficient string objects representation of biological sequences
+library(ShortRead)    # For manipulation of FASTQ files and short read sequences
+library(tidyverse)    # Collection of data science packages for data manipulation and visualization
+library(gridExtra)    # For arranging multiple plots
+library(knitr)        # For tables in R Markdown
+library(future)       # For parallel processing
+library(future.apply) # For parallel apply functions
+
+# Set up parallelization for faster processing
+# Adjust this based on your system's capabilities
+plan(multisession, workers = min(parallel::detectCores() - 1, 4))
+
+# Set the random seed for reproducibility
+set.seed(100)
+```
+
+# Set Working Directory and Locate Files
+
+```{r locate-files}
+# Set your working directory to where the fastq files are located
+# Replace with the path to your sequencing data
+path <- "data"
+
+# List fastq files - handling multiple naming conventions
+# Try standard Illumina naming pattern first (_R1_001.fastq.gz)
+fnFs.illumina <- sort(list.files(path, pattern="_R1_001\\.fastq\\.gz$", full.names = TRUE))
+fnRs.illumina <- sort(list.files(path, pattern="_R2_001\\.fastq\\.gz$", full.names = TRUE))
+
+# Try alternative naming patterns (_R1.fastq.gz)
+fnFs.alt1 <- sort(list.files(path, pattern="_R1\\.fastq\\.gz$", full.names = TRUE))
+fnRs.alt1 <- sort(list.files(path, pattern="_R2\\.fastq\\.gz$", full.names = TRUE))
+
+# Try other naming patterns (forward/reverse in the name)
+fnFs.alt2 <- sort(list.files(path, pattern="[_\\.]F[_\\.]|[_\\.]forward[_\\.]", full.names = TRUE, ignore.case = TRUE))
+fnRs.alt2 <- sort(list.files(path, pattern="[_\\.]R[_\\.]|[_\\.]reverse[_\\.]", full.names = TRUE, ignore.case = TRUE))
+
+# Check naming pattern and use the appropriate files
+if (length(fnFs.illumina) > 0 && length(fnRs.illumina) > 0) {
+  # Use Illumina naming pattern
+  fnFs <- fnFs.illumina
+  fnRs <- fnRs.illumina
+  cat("Using Illumina naming pattern (_R1_001.fastq.gz)\n")
+  file_pattern <- "_R\\d_001\\.fastq\\.gz$"
+} else if (length(fnFs.alt1) > 0 && length(fnRs.alt1) > 0) {
+  # Use alternative naming pattern
+  fnFs <- fnFs.alt1
+  fnRs <- fnRs.alt1
+  cat("Using alternative naming pattern (_R1.fastq.gz)\n")
+  file_pattern <- "_R\\d\\.fastq\\.gz$"
+} else if (length(fnFs.alt2) > 0 && length(fnRs.alt2) > 0) {
+  # Use other alternative naming pattern
+  fnFs <- fnFs.alt2
+  fnRs <- fnRs.alt2
+  cat("Using alternative naming pattern with forward/reverse in the name\n")
+  file_pattern <- "\\.(fastq|fq)(\\.gz)?$"
+} else {
+  # Look for any fastq files
+  all_fastqs <- sort(list.files(path, pattern="\\.(fastq|fq)(\\.gz)?$", full.names = TRUE))
+  if (length(all_fastqs) > 0) {
+    cat("WARNING: Found", length(all_fastqs), "fastq files but couldn't determine read direction.\n")
+    cat("Please ensure your files follow naming conventions with _R1/_R2 or similar pattern.\n")
+  }
+  stop("No fastq files found with standard naming patterns. Please check your file paths and naming conventions.")
+}
+
+# Extract sample names from filenames
+# Function to extract sample names that works with multiple naming conventions
+extract_sample_names <- function(file_paths, pattern) {
+  sample_names <- basename(file_paths)
+  
+  # First handle the standard Illumina pattern
+  if (grepl("_R\\d_001\\.fastq\\.gz$", pattern)) {
+    sample_names <- gsub("_R\\d_001\\.fastq\\.gz$", "", sample_names)
+  } 
+  # Then handle the simplified R1/R2 pattern
+  else if (grepl("_R\\d\\.fastq\\.gz$", pattern)) {
+    sample_names <- gsub("_R\\d\\.fastq\\.gz$", "", sample_names)
+  }
+  # General case: remove file extension and the "R1"/"R2"/"forward"/"reverse" pattern
+  else {
+    # Remove fastq/fq file extension
+    sample_names <- gsub("\\.(fastq|fq)(\\.gz)?$", "", sample_names)
+    # Remove R1/R2 or forward/reverse pattern
+    sample_names <- gsub("_R[12]_?|_?[FR]_?|_forward_?|_reverse_?", "", sample_names, ignore.case = TRUE)
+  }
+  
+  # Remove trailing underscores if present
+  sample_names <- gsub("_+$", "", sample_names)
+  
+  return(sample_names)
+}
+
+# Extract sample names
+sample.names <- extract_sample_names(fnFs, file_pattern)
+
+# Verify sample names were extracted properly
+sample.df <- data.frame(
+  ForwardFile = basename(fnFs),
+  ReverseFile = basename(fnRs),
+  SampleName = sample.names
+)
+kable(head(sample.df, 10), caption = "Sample Names Extracted from Files")
+
+# Verify forward and reverse files match
+if (length(fnFs) != length(fnRs)) {
+  stop("Number of forward and reverse files don't match. Check your files.")
+}
+
+# Detect primers from filenames
+detect_primers <- function(file_names) {
+  # Common 16S rRNA primers to check for
+  primer_patterns <- c(
+    "515F-806R" = "515f.*806r|806r.*515f",
+    "341F-805R" = "341f.*805r|805r.*341f",
+    "515F-926R" = "515f.*926r|926r.*515f",
+    "27F-338R" = "27f.*338r|338r.*27f",
+    "V4" = "v4",
+    "V3-V4" = "v3.*v4|v3-v4",
+    "V1-V2" = "v1.*v2|v1-v2",
+    "806R" = "806r"
+  )
+  
+  # Check for primer patterns in filenames
+  all_filenames <- paste(file_names, collapse = " ")
+  matches <- sapply(primer_patterns, function(pattern) {
+    grepl(pattern, all_filenames, ignore.case = TRUE)
+  })
+  
+  if (any(matches)) {
+    primers <- names(which(matches))
+    cat("Detected primers/regions:", paste(primers, collapse = ", "), "\n")
+    return(primers[1])  # Return the first match
+  } else {
+    cat("No specific primers detected from filenames\n")
+    return(NULL)
+  }
+}
+
+# Get primer information
+primer_info <- detect_primers(c(fnFs, fnRs))
+
+# Map primer to expected amplicon length
+get_expected_amplicon_size <- function(primer) {
+  if (is.null(primer)) return(250)  # Default if unknown
+  
+  # Approximate amplicon sizes for common primer sets
+  amplicon_sizes <- c(
+    "515F-806R" = 253,
+    "341F-805R" = 464,
+    "515F-926R" = 411,
+    "27F-338R" = 311,
+    "V4" = 253,
+    "V3-V4" = 464,
+    "V1-V2" = 311,
+    "806R" = 253  # Assuming 515F-806R when only 806R is mentioned
+  )
+  
+  if (primer %in% names(amplicon_sizes)) {
+    return(amplicon_sizes[primer])
+  } else {
+    return(250)  # Default if not in the list
+  }
+}
+
+expected_amplicon_size <- get_expected_amplicon_size(primer_info)
+cat("Expected amplicon size:", expected_amplicon_size, "bp\n")
+
+# Print summary
+cat("Found", length(fnFs), "samples\n")
+```
+
+# Initial Quality Assessment
+
+First, we'll examine the quality profiles of the raw reads to get a baseline understanding of the data quality.
+
+```{r quality-plots}
+# Plot quality profiles for a few forward reads
+forward_qual <- plotQualityProfile(fnFs[1:min(3, length(fnFs))])
+# Plot quality profiles for a few reverse reads
+reverse_qual <- plotQualityProfile(fnRs[1:min(3, length(fnRs))])
+
+# Display the quality plots
+print(forward_qual)
+print(reverse_qual)
+```
+
+# Automatic Parameter Optimization
+
+Based on the quality profiles, we'll optimize key parameters like truncation lengths and error thresholds to maximize both data quality and sequence retention.
+
+```{r parameter-optimization}
+# Function to determine optimal truncation lengths based on quality profiles
+optimize_truncation_lengths <- function(forward_files, reverse_files, quality_threshold = 30,
+                                        min_overlap = 20, target_amplicon_size = NULL) {
+  # Sample a subset of files for efficiency (max 5)
+  n_sample <- min(5, length(forward_files))
+  sample_idx <- sample(1:length(forward_files), n_sample)
+  
+  sample_forwards <- forward_files[sample_idx]
+  sample_reverses <- reverse_files[sample_idx]
+  
+  # Generate quality profiles
+  forward_qual <- plotQualityProfile(sample_forwards, aggregate = TRUE)
+  reverse_qual <- plotQualityProfile(sample_reverses, aggregate = TRUE)
+  
+  # Extract quality data
+  forward_data <- forward_qual$data
+  reverse_data <- reverse_qual$data
+  
+  # Detect maximum read length from data
+  max_forward_cycle <- max(forward_data$Cycle)
+  max_reverse_cycle <- max(reverse_data$Cycle)
+  
+  cat("Detected read lengths: Forward =", max_forward_cycle, "bp, Reverse =", max_reverse_cycle, "bp\n")
+  
+  # Determine platform type based on read length
+  platform <- "Unknown"
+  if (max_forward_cycle >= 250 && max_reverse_cycle >= 250) {
+    platform <- "MiSeq/HiSeq (2x250 or longer)"
+  } else if (max_forward_cycle >= 150 && max_reverse_cycle >= 150) {
+    platform <- "MiniSeq/NextSeq (2x150)"
+  } else if (max_forward_cycle >= 100 && max_reverse_cycle >= 100) {
+    platform <- "NovaSeq/NextSeq (2x100)"
+  }
+  cat("Likely sequencing platform:", platform, "\n")
+  
+  # Calculate mean quality by position
+  forward_mean_qual <- aggregate(Score ~ Cycle, data = forward_data, FUN = mean)
+  reverse_mean_qual <- aggregate(Score ~ Cycle, data = reverse_data, FUN = mean)
+  
+  # Find position where quality drops below threshold
+  quality_drop_f <- which(forward_mean_qual$Score < quality_threshold)
+  quality_drop_r <- which(reverse_mean_qual$Score < quality_threshold)
+  
+  # Determine initial truncation points
+  if (length(quality_drop_f) > 0) {
+    forward_trunc <- max(quality_drop_f[1] - 10, floor(max_forward_cycle * 0.5))
+  } else {
+    forward_trunc <- max_forward_cycle  # Use full length if quality remains high
+  }
+  
+  if (length(quality_drop_r) > 0) {
+    reverse_trunc <- max(quality_drop_r[1] - 10, floor(max_reverse_cycle * 0.5))
+  } else {
+    reverse_trunc <- max_reverse_cycle  # Use full length if quality remains high
+  }
+  
+  # Safety checks to ensure quality is maintained
+  # Find the last position where quality is good (Q25+)
+  good_quality_f <- max(which(forward_mean_qual$Score >= 25))
+  good_quality_r <- max(which(reverse_mean_qual$Score >= 25))
+  
+  # Limit truncation to positions with good quality
+  forward_trunc <- min(forward_trunc, good_quality_f)
+  reverse_trunc <- min(reverse_trunc, good_quality_r)
+  
+  # Account for expected amplicon size if provided
+  if (!is.null(target_amplicon_size)) {
+    # Adjust truncation to ensure enough overlap for merging
+    min_read_sum <- target_amplicon_size + min_overlap
+    
+    if (forward_trunc + reverse_trunc < min_read_sum) {
+      # Need to adjust truncation to ensure sufficient bp for assembly
+      cat("Warning: Detected quality-based truncation might not preserve enough sequence for assembly\n")
+      cat("Target amplicon size:", target_amplicon_size, "bp, Minimum required read sum:", min_read_sum, "bp\n")
+      
+      # Prefer keeping higher quality read at full length
+      if (mean(forward_mean_qual$Score) > mean(reverse_mean_qual$Score)) {
+        # Keep forward at max quality-based truncation, extend reverse as needed
+        forward_trunc <- min(forward_trunc, max_forward_cycle)
+        reverse_trunc <- max(min_read_sum - forward_trunc, 0.7 * max_reverse_cycle)
+      } else {
+        # Keep reverse at max quality-based truncation, extend forward as needed
+        reverse_trunc <- min(reverse_trunc, max_reverse_cycle)
+        forward_trunc <- max(min_read_sum - reverse_trunc, 0.7 * max_forward_cycle)
+      }
+    }
+  }
+  
+  # Ensure truncation doesn't exceed read length
+  forward_trunc <- min(forward_trunc, max_forward_cycle)
+  reverse_trunc <- min(reverse_trunc, max_reverse_cycle)
+  
+  # Round to integers
+  forward_trunc <- as.integer(forward_trunc)
+  reverse_trunc <- as.integer(reverse_trunc)
+  
+  # Create plots with platform-specific recommendations
+  forward_plot <- ggplot(forward_mean_qual, aes(x = Cycle, y = Score)) +
+    geom_line(size = 1) +
+    geom_hline(yintercept = quality_threshold, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = forward_trunc, linetype = "dashed", color = "blue") +
+    scale_y_continuous(limits = c(0, 40)) +
+    labs(title = paste("Forward Read Quality -", platform), 
+         subtitle = paste("Suggested truncation at position", forward_trunc),
+         x = "Cycle", y = "Quality Score") +
+    theme_minimal()
+  
+  reverse_plot <- ggplot(reverse_mean_qual, aes(x = Cycle, y = Score)) +
+    geom_line(size = 1) +
+    geom_hline(yintercept = quality_threshold, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = reverse_trunc, linetype = "dashed", color = "blue") +
+    scale_y_continuous(limits = c(0, 40)) +
+    labs(title = paste("Reverse Read Quality -", platform), 
+         subtitle = paste("Suggested truncation at position", reverse_trunc),
+         x = "Cycle", y = "Quality Score") +
+    theme_minimal()
+  
+  # Display plots together
+  grid.arrange(forward_plot, reverse_plot, ncol = 2)
+  
+  # Estimate expected overlap after trimming
+  expected_overlap <- forward_trunc + reverse_trunc - target_amplicon_size
+  cat("Expected overlap after trimming:", expected_overlap, "bp\n")
+  if (expected_overlap < min_overlap) {
+    cat("WARNING: Expected overlap is less than recommended minimum (", min_overlap, "bp)\n")
+    cat("Consider adjusting truncation lengths or using a more relaxed merging criteria\n")
+  } else {
+    cat("Overlap is sufficient for reliable read merging\n")
+  }
+  
+  # Return recommendations with platform info
+  return(list(
+    forward = forward_trunc, 
+    reverse = reverse_trunc,
+    platform = platform,
+    max_forward_len = max_forward_cycle,
+    max_reverse_len = max_reverse_cycle,
+    expected_overlap = expected_overlap
+  ))
+}
+
+# Function to optimize expected error thresholds
+optimize_maxEE <- function(trunc_forward, trunc_reverse, forward_files, reverse_files, 
+                          sample_names, ee_range = c(1, 2, 3, 4)) {
+  # Make a temporary directory for testing
+  temp_dir <- file.path(path, "temp_filter")
+  if(!dir.exists(temp_dir)) dir.create(temp_dir)
+  
+  # Use a small subset of files to test parameters efficiently
+  n_test <- min(3, length(forward_files))
+  test_fnFs <- forward_files[1:n_test]
+  test_fnRs <- reverse_files[1:n_test]
+  test_names <- sample_names[1:n_test]
+  
+  # Generate test file paths
+  test_filtFs <- file.path(temp_dir, paste0(test_names, "_F_filt.fastq.gz"))
+  test_filtRs <- file.path(temp_dir, paste0(test_names, "_R_filt.fastq.gz"))
+  names(test_filtFs) <- test_names
+  names(test_filtRs) <- test_names
+  
+  # Track results for each maxEE value
+  results <- data.frame(maxEE_F = numeric(), 
+                        maxEE_R = numeric(),
+                        reads_in = numeric(),
+                        reads_kept = numeric(),
+                        percent_kept = numeric())
+  
+  # Generate combinations of expected error thresholds to test
+  ee_combinations <- expand.grid(maxEE_F = ee_range, maxEE_R = ee_range)
+  
+  # Filter out combinations where reverse EE is lower than forward
+  # (since reverse reads typically have lower quality)
+  ee_combinations <- ee_combinations[ee_combinations$maxEE_R >= ee_combinations$maxEE_F, ]
+  
+  # Test different expected error thresholds
+  for (i in 1:nrow(ee_combinations)) {
+    f_ee <- ee_combinations$maxEE_F[i]
+    r_ee <- ee_combinations$maxEE_R[i]
+    
+    # Filter and track results
+    test_out <- suppressWarnings(
+      filterAndTrim(test_fnFs, test_filtFs, test_fnRs, test_filtRs,
+                   truncLen = c(trunc_forward, trunc_reverse),
+                   maxN = 0, maxEE = c(f_ee, r_ee), truncQ = 2,
+                   rm.phix = TRUE, compress = TRUE, multithread = TRUE)
+    )
+    
+    # Calculate statistics
+    reads_in <- sum(test_out[, 1])
+    reads_kept <- sum(test_out[, 2])
+    percent_kept <- round(reads_kept / reads_in * 100, 1)
+    
+    # Store results
+    results <- rbind(results, data.frame(
+      maxEE_F = f_ee,
+      maxEE_R = r_ee,
+      reads_in = reads_in,
+      reads_kept = reads_kept,
+      percent_kept = percent_kept
+    ))
+  }
+  
+  # Clean up temporary files
+  unlink(temp_dir, recursive = TRUE)
+  
+  # Find optimal parameters (target ~80% retention while being stringent)
+  # Sort by percent kept descending
+  results <- results[order(results$percent_kept, decreasing = TRUE), ]
+  
+  # Create a label column for the plot
+  results$label <- paste0(results$maxEE_F, "-", results$maxEE_R)
+  
+  # Make the plot
+  ee_plot <- ggplot(results, aes(x = reorder(label, percent_kept), y = percent_kept)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    geom_text(aes(label = paste0(percent_kept, "%")), vjust = -0.3, size = 3) +
+    labs(title = "Read Retention by Expected Error Parameters",
+         x = "maxEE (Forward-Reverse)",
+         y = "Percent Reads Kept") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  print(ee_plot)
+  
+  # Determine optimal values
+  # Look for >70% retention while using lowest possible maxEE values
+  optimal <- results[results$percent_kept > 70, ]
+  if (nrow(optimal) > 0) {
+    # Sort by forward then reverse EE to get most stringent option
+    optimal <- optimal[order(optimal$maxEE_F, optimal$maxEE_R), ]
+    optimal_maxEE <- c(optimal$maxEE_F[1], optimal$maxEE_R[1])
+    optimal_pct <- optimal$percent_kept[1]
+  } else {
+    # If retention is too low with 70% threshold, drop to 50%
+    optimal <- results[results$percent_kept > 50, ]
+    if (nrow(optimal) > 0) {
+      optimal <- optimal[order(optimal$maxEE_F, optimal$maxEE_R), ]
+      optimal_maxEE <- c(optimal$maxEE_F[1], optimal$maxEE_R[1])
+      optimal_pct <- optimal$percent_kept[1]
+      cat("Warning: Using relaxed retention threshold (50%)\n")
+    } else {
+      # If all else fails, use the combination with highest retention
+      optimal_maxEE <- c(results$maxEE_F[1], results$maxEE_R[1])
+      optimal_pct <- results$percent_kept[1]
+      cat("Warning: All tested parameters had low retention (<50%)\n")
+    }
+  }
+  
+  cat("Optimal maxEE parameters:", optimal_maxEE[1], "(forward),", 
+      optimal_maxEE[2], "(reverse) with", optimal_pct, "% read retention\n")
+  
+  return(list(
+    maxEE = optimal_maxEE,
+    percent_kept = optimal_pct,
+    all_results = results
+  ))
+}
+
+# Run truncation length optimization
+cat("Optimizing truncation lengths...\n")
+truncation_lengths <- optimize_truncation_lengths(
+  fnFs, fnRs, 
+  quality_threshold = 25, 
+  min_overlap = 20, 
+  target_amplicon_size = expected_amplicon_size
+)
+
+# Run expected error threshold optimization
+cat("Optimizing expected error thresholds...\n")
+maxEE_params <- optimize_maxEE(
+  truncation_lengths$forward, 
+  truncation_lengths$reverse, 
+  fnFs, fnRs, 
+  sample.names
+)
+
+# Create a parameter summary table
+param_summary <- data.frame(
+  Parameter = c("Platform", "Forward Read Length", "Reverse Read Length", 
+                "Forward Truncation Length", "Reverse Truncation Length", 
+                "Forward maxEE", "Reverse maxEE",
+                "Expected Amplicon Size", "Expected Overlap"),
+  Value = c(truncation_lengths$platform, 
+            truncation_lengths$max_forward_len,
+            truncation_lengths$max_reverse_len,
+            truncation_lengths$forward, 
+            truncation_lengths$reverse, 
+            maxEE_params$maxEE[1], 
+            maxEE_params$maxEE[2],
+            expected_amplicon_size,
+            truncation_lengths$expected_overlap),
+  Notes = c("Detected sequencing platform",
+            "Maximum cycle number in forward reads",
+            "Maximum cycle number in reverse reads",
+            "Position where quality drops below threshold",
+            "Position where quality drops below threshold",
+            "Maximum expected errors allowed in forward reads",
+            "Maximum expected errors allowed in reverse reads",
+            "Expected amplicon size based on primer",
+            "Expected overlap after truncation")
+)
+kable(param_summary, caption = "Optimized Filtering Parameters")
+
+# Set the optimized parameters for use in the workflow
+truncLen_forward <- truncation_lengths$forward  
+truncLen_reverse <- truncation_lengths$reverse
+maxEE_forward <- maxEE_params$maxEE[1]
+maxEE_reverse <- maxEE_params$maxEE[2]
+
+# Allow parameter override (uncomment to override)
+# truncLen_forward <- 240  # Uncomment to override
+# truncLen_reverse <- 200  # Uncomment to override
+# maxEE_forward <- 2       # Uncomment to override
+# maxEE_reverse <- 2       # Uncomment to override
+
+cat("Final parameters for filtering:\n")
+cat("truncLen =", c(truncLen_forward, truncLen_reverse), "\n")
+cat("maxEE =", c(maxEE_forward, maxEE_reverse), "\n")
+```
+
+# Filter and Trim
+
+Now we apply the optimized filtering parameters to our dataset.
+
+```{r filter-trim}
+# Create directory for filtered files
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# Make sure the filtered directory exists
+if(!dir.exists(file.path(path, "filtered"))) {
+  dir.create(file.path(path, "filtered"))
+}
+
+# Filter and trim with optimized parameters
+cat("Filtering and trimming reads with optimized parameters...\n")
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs,
+                     truncLen = c(truncLen_forward, truncLen_reverse), 
+                     maxN = 0, maxEE = c(maxEE_forward, maxEE_reverse), truncQ = 2,
+                     rm.phix = TRUE, compress = TRUE, multithread = TRUE)
+
+# Create summary of filtering results
+filter_summary <- as.data.frame(out)
+filter_summary$SampleName <- rownames(filter_summary)
+filter_summary$PercentRetained <- round(filter_summary$reads.out / filter_summary$reads.in * 100, 1)
+filter_summary <- filter_summary[, c("SampleName", "reads.in", "reads.out", "PercentRetained")]
+colnames(filter_summary) <- c("Sample", "Input Reads", "Filtered Reads", "% Retained")
+
+# View filtering statistics
+kable(filter_summary, caption = "Filtering Statistics", row.names = FALSE)
+
+# Plot filtering results
+filter_plot <- ggplot(filter_summary, aes(x = reorder(Sample, -`Filtered Reads`), y = `Filtered Reads`)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_text(aes(label = paste0(`% Retained`, "%")), vjust = -0.3, size = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Reads Retained After Filtering", x = "Sample", y = "Filtered Reads")
+
+print(filter_plot)
+
+# Count number of samples that retained >50% of reads
+samples_gt_50pct <- sum(filter_summary$`% Retained` > 50)
+cat(samples_gt_50pct, "out of", nrow(filter_summary), "samples retained >50% of reads after filtering\n")
+
+# Check if any samples have very low retention
+low_retention_samples <- filter_summary[filter_summary$`% Retained` < 30, ]
+if (nrow(low_retention_samples) > 0) {
+  cat("WARNING:", nrow(low_retention_samples), "samples have very low read retention (<30%):\n")
+  print(low_retention_samples)
+}
+
+# Check if any samples have zero reads after filtering
+zero_samples <- filter_summary[filter_summary$`Filtered Reads` == 0, ]
+if (nrow(zero_samples) > 0) {
+  cat("WARNING:", nrow(zero_samples), "samples have zero reads after filtering and will be removed:\n")
+  print(zero_samples)
+  
+  # Remove samples with zero reads after filtering
+  samples_to_keep <- filter_summary$Sample[filter_summary$`Filtered Reads` > 0]
+  filtFs <- filtFs[samples_to_keep]
+  filtRs <- filtRs[samples_to_keep]
+  sample.names <- sample.names[sample.names %in% samples_to_keep]
+  cat("Continuing with", length(sample.names), "samples\n")
+}
+```
+
+# Quality Profiles After Filtering
+
+Let's check the quality profiles of the filtered reads to confirm our filtering parameters worked as expected.
+
+```{r quality-filtered}
+# Plot quality profiles for filtered reads (first few samples)
+if (length(filtFs) > 0) {
+  # Look at quality profiles of filtered reads
+  filtered_forward_qual <- plotQualityProfile(filtFs[1:min(3, length(filtFs))])
+  filtered_reverse_qual <- plotQualityProfile(filtRs[1:min(3, length(filtRs))])
+  
+  # Display the quality plots
+  print(filtered_forward_qual)
+  print(filtered_reverse_qual)
+} else {
+  cat("No samples remain after filtering. Please review filtering parameters.\n")
+  knitr::knit_exit()
+}
+```
+
+# Learn Error Rates
+
+```{r learn-errors}
+# Learn error rates for forward reads
+cat("Learning error rates for forward reads...\n")
+errF <- learnErrors(filtFs, multithread = TRUE, randomize = TRUE)
+
+# Learn error rates for reverse reads
+cat("Learning error rates for reverse reads...\n")
+errR <- learnErrors(filtRs, multithread = TRUE, randomize = TRUE)
+
+# Plot error rates for forward reads
+errF_plot <- plotErrors(errF, nominalQ = TRUE)
+print(errF_plot + ggtitle("Error Rates - Forward Reads"))
+
+# Plot error rates for reverse reads
+errR_plot <- plotErrors(errR, nominalQ = TRUE)
+print(errR_plot + ggtitle("Error Rates - Reverse Reads"))
+
+# Create error rate plots with more informative titles
+errF_plot <- plotErrors(errF, nominalQ = TRUE) + 
+  ggtitle("Error Rates - Forward Reads") + 
+  labs(subtitle = "Points: observed error rates; Lines: fitted error model")
+
+errR_plot <- plotErrors(errR, nominalQ = TRUE) + 
+  ggtitle("Error Rates - Reverse Reads") + 
+  labs(subtitle = "Points: observed error rates; Lines: fitted error model")
+
+# Create a side-by-side plot
+grid.arrange(errF_plot, errR_plot, ncol = 2)
+```
+
+# Dereplication
+
+```{r dereplication}
+# Dereplicate identical reads
+cat("Dereplicating forward reads...\n")
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+
+cat("Dereplicating reverse reads...\n")
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+
+# Name the derep-class objects by the sample names
+names(derepFs) <- names(filtFs)
+names(derepRs) <- names(filtRs)
+
+# Create summary of dereplication
+derep_summary <- data.frame(
+  Sample = names(derepFs),
+  InputReads = sapply(derepFs, function(x) sum(getUniques(x))),
+  UniqueSequences = sapply(derepFs, function(x) length(getUniques(x))),
+  CompressionRatio = sapply(derepFs, function(x) sum(getUniques(x)) / length(getUniques(x)))
+)
+
+kable(head(derep_summary, 10), caption = "Dereplication Summary (First 10 Samples)")
+
+# Average compression ratio
+avg_compression <- mean(derep_summary$CompressionRatio)
+cat("Average compression ratio:", round(avg_compression, 1), 
+    "reads per unique sequence\n")
+```
+
+# Sample Inference
+
+DADA2 will now denoise the data and infer the true biological sequences.
+
+```{r dada2}
+# Apply the DADA2 algorithm to forward reads
+cat("Denoising forward reads...\n")
+dadaFs <- dada(derepFs, err = errF, multithread = TRUE, pool = "pseudo")
+
+# Apply the DADA2 algorithm to reverse reads
+cat("Denoising reverse reads...\n")
+dadaRs <- dada(derepRs, err = errR, multithread = TRUE, pool = "pseudo")
+
+# Inspect the returned dada-class object for the first sample
+cat("\nDADA2 denoising results for first sample (forward reads):\n")
+dadaFs[[1]]
+
+# Create summary of denoising
+denoise_summary <- data.frame(
+  Sample = names(dadaFs),
+  InputReads = sapply(derepFs, function(x) sum(getUniques(x))),
+  DenoisedReads = sapply(dadaFs, function(x) sum(getUniques(x$denoised))),
+  ASVsFound = sapply(dadaFs, function(x) length(getUniques(x$denoised))),
+  PercentRetained = sapply(dadaFs, function(x) round(sum(getUniques(x$denoised)) / sum(getUniques(x)) * 100, 1))
+)
+
+kable(head(denoise_summary, 10), caption = "Denoising Summary (First 10 Samples)")
+
+# Average denoising stats
+avg_denoised_pct <- mean(denoise_summary$PercentRetained)
+total_asvs_forward <- sum(sapply(dadaFs, function(x) length(x$denoised)))
+cat("Average percentage of reads retained after denoising:", round(avg_denoised_pct, 1), "%\n")
+cat("Total ASVs identified in forward reads:", total_asvs_forward, "\n")
+```
+
+# Merge Paired Reads
+
+Now we'll merge the forward and reverse reads to create full-length sequences.
+
+```{r merge-reads}
+# Merge paired reads
+cat("Merging paired reads...\n")
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, 
+                     verbose = TRUE,
+                     # Use a more relaxed minimum overlap if we have short expected overlap
+                     minOverlap = if(truncation_lengths$expected_overlap < 20) 10 else 12)
+
+# Inspect the merger data.frame for the first sample
+cat("\nMerged read pairs for first sample:\n")
+head(mergers[[1]])
+
+# Create summary of merging
+merge_summary <- data.frame(
+  Sample = names(mergers),
+  DenoisedReads = sapply(dadaFs, function(x) sum(getUniques(x$denoised))),
+  MergedReads = sapply(mergers, function(x) sum(getUniques(x))),
+  PercentMerged = sapply(names(mergers), function(sample) 
+    round(sum(getUniques(mergers[[sample]])) / sum(getUniques(dadaFs[[sample]]$denoised)) * 100, 1))
+)
+
+kable(head(merge_summary, 10), caption = "Read Merging Summary (First 10 Samples)")
+
+# Average merging stats
+avg_merged_pct <- mean(merge_summary$PercentMerged)
+cat("Average percentage of denoised reads successfully merged:", round(avg_merged_pct, 1), "%\n")
+
+# Check if any samples have very low merging rates
+low_merge_samples <- merge_summary[merge_summary$PercentMerged < 50, ]
+if (nrow(low_merge_samples) > 0) {
+  cat("WARNING:", nrow(low_merge_samples), "samples have low merging rates (<50%):\n")
+  print(low_merge_samples)
+}
+```
+
+# Construct ASV Table
+
+```{r seqtab}
+# Construct sequence table
+cat("Constructing ASV sequence table...\n")
+seqtab <- makeSequenceTable(mergers)
+
+# Display table dimensions
+cat("Dimensions of ASV table:", dim(seqtab), "(samples × ASVs)\n")
+
+# Count ASVs by length
+asv_lengths <- table(nchar(getSequences(seqtab)))
+asv_lengths_df <- data.frame(
+  Length = names(asv_lengths),
+  Count = as.vector(asv_lengths)
+)
+
+# Create a histogram of ASV lengths
+asv_length_plot <- ggplot(asv_lengths_df, aes(x = Length, y = Count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "Distribution of ASV Lengths",
+       x = "Sequence Length (bp)",
+       y = "Number of ASVs")
+
+print(asv_length_plot)
+
+# Get the most common ASV length
+modal_length <- as.numeric(names(which.max(asv_lengths)))
+cat("Most common ASV length:", modal_length, "bp\n")
+
+# Compare to expected amplicon size
+cat("Expected amplicon size based on primers:", expected_amplicon_size, "bp\n")
+if (abs(modal_length - expected_amplicon_size) <= 10) {
+  cat("ASV lengths match expected amplicon size ✓\n")
+} else {
+  cat("WARNING: Most common ASV length differs from expected amplicon size\n")
+}
+
+# Filter out suspiciously short or long ASVs
+min_allowed_len <- max(expected_amplicon_size - 50, 0.8 * modal_length)
+max_allowed_len <- min(expected_amplicon_size + 50, 1.2 * modal_length)
+
+cat("Filtering ASVs with lengths outside the range:", min_allowed_len, "-", max_allowed_len, "bp\n")
+seqtab_filtered <- seqtab[, nchar(colnames(seqtab)) >= min_allowed_len & 
+                           nchar(colnames(seqtab)) <= max_allowed_len]
+
+# Report filtering results
+cat("Removed", ncol(seqtab) - ncol(seqtab_filtered), "ASVs with suspicious lengths\n")
+cat("Retained", ncol(seqtab_filtered), "ASVs for further analysis\n")
+original_reads <- sum(seqtab)
+filtered_reads <- sum(seqtab_filtered)
+cat("Removed", original_reads - filtered_reads, "reads (", 
+    round((original_reads - filtered_reads) / original_reads * 100, 1), "% of total)\n")
+
+# Use filtered sequence table for further analysis
+seqtab <- seqtab_filtered
+```
+
+# Remove Chimeras
+
+```{r chimeras}
+# Remove chimeric sequences using consensus method
+cat("Removing chimeric sequences...\n")
+seqtab.nochim <- removeBimeraDenovo(seqtab, method = "consensus", multithread = TRUE, verbose = TRUE)
+
+# Calculate the percentage of non-chimeric sequences
+chimera_pct <- sum(seqtab.nochim)/sum(seqtab) * 100
+cat("Percentage of non-chimeric sequences:", round(chimera_pct, 1), "%\n")
+
+# Chimera stats
+cat("ASVs before chimera removal:", ncol(seqtab), "\n")
+cat("ASVs after chimera removal:", ncol(seqtab.nochim), "\n")
+cat("ASVs identified as chimeric:", ncol(seqtab) - ncol(seqtab.nochim), 
+    "(", round((ncol(seqtab) - ncol(seqtab.nochim))/ncol(seqtab) * 100, 1), "%)\n")
+
+# Create a summary dataframe
+chimera_summary <- data.frame(
+  Category = c("Before Chimera Removal", "After Chimera Removal", "Removed as Chimeric"),
+  ASVs = c(ncol(seqtab), ncol(seqtab.nochim), ncol(seqtab) - ncol(seqtab.nochim)),
+  TotalReads = c(sum(seqtab), sum(seqtab.nochim), sum(seqtab) - sum(seqtab.nochim)),
+  Percentage = c(100, chimera_pct, 100 - chimera_pct)
+)
+
+kable(chimera_summary, caption = "Chimera Removal Summary")
+
+# Check if chimera removal is excessive
+if (chimera_pct < 50) {
+  cat("WARNING: Less than 50% of sequences remain after chimera removal.\n")
+  cat("This could indicate poor read merging or excessive chimera removal.\n")
+  cat("Consider revisiting the truncation lengths and quality filtering parameters.\n")
+}
+```
+
+# Track Reads Through the Pipeline
+
+```{r track}
+# Track reads through the pipeline
+getN <- function(x) sum(getUniques(x))
+
+# Create tracking table with all processing steps
+track <- cbind(
+  # Input reads
+  out[rownames(out) %in% names(derepFs), "reads.in"],
+  # Filtered reads
+  out[rownames(out) %in% names(derepFs), "reads.out"],
+  # Denoised forward reads
+  sapply(dadaFs, getN),
+  # Denoised reverse reads
+  sapply(dadaRs, getN),
+  # Merged reads
+  sapply(mergers, getN),
+  # Non-chimeric reads
+  rowSums(seqtab.nochim)
+)
+
+# Set column and row names
+colnames(track) <- c("Input", "Filtered", "Denoised_F", "Denoised_R", "Merged", "NonChimeric")
+rownames(track) <- names(derepFs)
+
+# Convert to data frame for better display
+track_df <- as.data.frame(track)
+track_df$Sample <- rownames(track_df)
+
+# Calculate percentage retained at each step
+track_df$Percent_Filtered <- round(track_df$Filtered / track_df$Input * 100, 1)
+track_df$Percent_Denoised_F <- round(track_df$Denoised_F / track_df$Filtered * 100, 1)
+track_df$Percent_Merged <- round(track_df$Merged / track_df$Denoised_F * 100, 1)
+track_df$Percent_NonChimeric <- round(track_df$NonChimeric / track_df$Merged * 100, 1)
+track_df$Percent_Final <- round(track_df$NonChimeric / track_df$Input * 100, 1)
+
+# Display tracking information for the first few samples
+kable(head(track_df[, c("Sample", "Input", "Filtered", "Denoised_F", "Merged", "NonChimeric", "Percent_Final")], 10), 
+      caption = "Read Tracking Through Pipeline (First 10 Samples)")
+
+# Create a summary of read loss at each step
+pipeline_summary <- data.frame(
+  Step = c("Raw Input", "After Filtering", "After Denoising", "After Merging", "After Chimera Removal"),
+  Reads = c(sum(track_df$Input), sum(track_df$Filtered), sum(track_df$Denoised_F), 
+            sum(track_df$Merged), sum(track_df$NonChimeric)),
+  PercentOfInput = c(100, 
+                     round(sum(track_df$Filtered) / sum(track_df$Input) * 100, 1),
+                     round(sum(track_df$Denoised_F) / sum(track_df$Input) * 100, 1),
+                     round(sum(track_df$Merged) / sum(track_df$Input) * 100, 1),
+                     round(sum(track_df$NonChimeric) / sum(track_df$Input) * 100, 1)),
+  PercentOfPreviousStep = c(100,
+                          round(sum(track_df$Filtered) / sum(track_df$Input) * 100, 1),
+                          round(sum(track_df$Denoised_F) / sum(track_df$Filtered) * 100, 1),
+                          round(sum(track_df$Merged) / sum(track_df$Denoised_F) * 100, 1),
+                          round(sum(track_df$NonChimeric) / sum(track_df$Merged) * 100, 1))
+)
+
+kable(pipeline_summary, caption = "Summary of Reads Retained at Each Processing Step")
+
+# Create a plot to visualize read tracking
+# Reshape data for plotting
+track_long <- tidyr::pivot_longer(
+  track_df[, c("Sample", "Input", "Filtered", "Denoised_F", "Merged", "NonChimeric")],
+  cols = c("Input", "Filtered", "Denoised_F", "Merged", "NonChimeric"),
+  names_to = "Step",
+  values_to = "Reads"
+)
+
+# Convert Step to factor with specified order
+track_long$Step <- factor(track_long$Step, 
+                          levels = c("Input", "Filtered", "Denoised_F", "Merged", "NonChimeric"))
+
+# Create the plot for all samples together
+overall_tracking_plot <- ggplot(track_long, aes(x = Step, y = Reads, group = Sample, color = Sample)) +
+  geom_line(alpha = 0.5) +
+  geom_point(size = 1) +
+  theme_minimal() +
+  labs(title = "Read Count Tracking Through DADA2 Pipeline",
+       x = "Processing Step",
+       y = "Number of Reads") +
+  theme(legend.position = "none")  # Hide individual sample legend as it can be cluttered
+
+# Create an average tracking plot
+avg_tracking <- aggregate(Reads ~ Step, data = track_long, FUN = mean)
+avg_tracking$StdDev <- aggregate(Reads ~ Step, data = track_long, FUN = sd)$Reads
+
+avg_tracking_plot <- ggplot(avg_tracking, aes(x = Step, y = Reads, group = 1)) +
+  geom_line(size = 1.5, color = "blue") +
+  geom_point(size = 3, color = "blue") +
+  geom_errorbar(aes(ymin = Reads - StdDev, ymax = Reads + StdDev), width = 0.2, color = "blue") +
+  theme_minimal() +
+  labs(title = "Average Read Counts Through DADA2 Pipeline",
+       subtitle = "Error bars show standard deviation across samples",
+       x = "Processing Step",
+       y = "Average Number of Reads")
+
+# Show both plots
+grid.arrange(overall_tracking_plot, avg_tracking_plot, ncol = 1)
+
+# Save the tracking data for dashboard visualization
+saveRDS(track_df, "results/read_tracking.rds")
+cat("Saved read tracking data to results/read_tracking.rds\n")
+```
+
+# Assign Taxonomy
+
+```{r taxonomy}
+# Create directory for reference databases if it doesn't exist
+if(!dir.exists("ref_db")) dir.create("ref_db")
+
+# Using Silva database for taxonomy assignment
+cat("Using Silva database for taxonomy assignment...\n")
+
+# Check if Silva files are available in the DADA2 package
+silva_train <- system.file("extdata", "silva_nr99_v138.1_train_set.fa.gz", package="dada2")
+silva_species <- system.file("extdata", "silva_species_assignment_v138.1.fa.gz", package="dada2")
+
+silva_files_in_package <- (file.exists(silva_train) && file.exists(silva_species))
+
+if(silva_files_in_package) {
+  cat("Using Silva database files from DADA2 package\n")
+} else {
+  cat("Silva files not found in DADA2 package, will download from Zenodo\n")
+  
+  # URLs for Silva files from Zenodo
+  silva_url_base <- "https://zenodo.org/records/4587955/files/"
+  silva_train_url <- paste0(silva_url_base, "silva_nr99_v138.1_train_set.fa.gz")
+  silva_species_url <- paste0(silva_url_base, "silva_species_assignment_v138.1.fa.gz")
+  
+  # Local file paths for Silva files
+  silva_train <- file.path("ref_db", "silva_train_set.fa.gz")
+  silva_species <- file.path("ref_db", "silva_species.fa.gz")
+  
+  # Download training set if needed
+  if(!file.exists(silva_train)) {
+    cat("Downloading Silva taxonomy training file...\n")
+    # Set extended timeout
+    options(timeout = max(300, getOption("timeout")))
+    
+    tryCatch({
+      download.file(silva_train_url, silva_train, method="auto", mode="wb")
+      cat("Download successful!\n")
+    }, error = function(e) {
+      cat("Error downloading Silva taxonomy file:", conditionMessage(e), "\n")
+      cat("Please try downloading it manually from:", silva_train_url, "\n")
+      cat("and save it to:", silva_train, "\n")
+      stop("Download failed. Please download files manually.")
+    })
+  }
+  
+  # Download species file if needed
+  if(!file.exists(silva_species)) {
+    cat("Downloading Silva species assignment file...\n")
+    
+    tryCatch({
+      download.file(silva_species_url, silva_species, method="auto", mode="wb")
+      cat("Download successful!\n")
+    }, error = function(e) {
+      cat("Error downloading Silva species file:", conditionMessage(e), "\n")
+      cat("Please try downloading it manually from:", silva_species_url, "\n")
+      cat("and save it to:", silva_species, "\n")
+      stop("Download failed. Please download files manually.")
+    })
+  }
+}
+
+# Check if files exist before proceeding
+if(!file.exists(silva_train) || !file.exists(silva_species)) {
+  stop("Required Silva files not available. Please download them manually as noted above.")
+}
+
+# Assign taxonomy at the genus level
+cat("Assigning taxonomy using Silva database...\n")
+taxa <- assignTaxonomy(seqtab.nochim, silva_train, multithread=TRUE)
+
+# Add species-level assignments
+cat("Adding species-level assignments...\n")
+taxa <- addSpecies(taxa, silva_species)
+
+# View taxonomic assignments
+taxa.print <- taxa
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+# Create a taxonomy summary
+taxa_summary <- data.frame(
+  TaxonomicLevel = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
+  AssignmentCount = c(
+    sum(!is.na(taxa[, "Kingdom"])),
+    sum(!is.na(taxa[, "Phylum"])),
+    sum(!is.na(taxa[, "Class"])),
+    sum(!is.na(taxa[, "Order"])),
+    sum(!is.na(taxa[, "Family"])),
+    sum(!is.na(taxa[, "Genus"])),
+    sum(!is.na(taxa[, "Species"]))
+  ),
+  PercentAssigned = c(
+    round(sum(!is.na(taxa[, "Kingdom"])) / nrow(taxa) * 100, 1),
+    round(sum(!is.na(taxa[, "Phylum"])) / nrow(taxa) * 100, 1),
+    round(sum(!is.na(taxa[, "Class"])) / nrow(taxa) * 100, 1),
+    round(sum(!is.na(taxa[, "Order"])) / nrow(taxa) * 100, 1),
+    round(sum(!is.na(taxa[, "Family"])) / nrow(taxa) * 100, 1),
+    round(sum(!is.na(taxa[, "Genus"])) / nrow(taxa) * 100, 1),
+    round(sum(!is.na(taxa[, "Species"])) / nrow(taxa) * 100, 1)
+  )
+)
+
+kable(taxa_summary, caption = "Taxonomic Assignment Summary")
+
+# Create a bar plot of taxonomic assignment success
+taxa_plot <- ggplot(taxa_summary, aes(x = TaxonomicLevel, y = PercentAssigned)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_text(aes(label = paste0(PercentAssigned, "%")), vjust = -0.3) +
+  theme_minimal() +
+  labs(title = "Percentage of ASVs with Taxonomic Assignment",
+       x = "Taxonomic Level",
+       y = "Percent Assigned")
+
+print(taxa_plot)
+```
+
+# Create Phyloseq Object
+
+```{r phyloseq}
+# Create a directory for results if it doesn't exist
+if(!dir.exists("results")) dir.create("results")
+
+# Create sample data frame
+# Try to extract metadata from file names
+cat("Extracting metadata from sample names...\n")
+
+# Extract sample group information (if follows naming pattern like Sample_GroupName_...)
+sample_metadata <- data.frame(
+  SampleID = sample.names,
+  Group = sample.names,  # Default to sample name if no pattern is found
+  row.names = sample.names
+)
+
+# Try to extract experimental groups from sample names using a common pattern
+# This is just a generic example - modify based on your actual naming convention
+group_pattern <- ".*?_(.*?)_.*|.*?-(.*?)-.*"
+group_matches <- regmatches(sample.names, 
+                            regexec(group_pattern, sample.names))
+
+# Extract group information if the pattern matched
+valid_matches <- sapply(group_matches, length) > 1
+if (any(valid_matches)) {
+  for (i in which(valid_matches)) {
+    match <- group_matches[[i]]
+    # Use the first capturing group that matched
+    for (j in 2:length(match)) {
+      if (!is.na(match[j]) && match[j] != "") {
+        sample_metadata$Group[i] <- match[j]
+        break
+      }
+    }
+  }
+}
+
+# Count the number of samples in each group
+group_counts <- table(sample_metadata$Group)
+cat("Detected sample groups:\n")
+print(group_counts)
+
+# Create phyloseq object
+ps <- phyloseq(
+  otu_table(seqtab.nochim, taxa_are_rows = FALSE),
+  sample_data(sample_metadata),
+  tax_table(taxa)
+)
+
+# Add ASV sequences as reference sequences
+dna <- Biostrings::DNAStringSet(colnames(seqtab.nochim))
+names(dna) <- colnames(seqtab.nochim)
+ps <- merge_phyloseq(ps, dna)
+
+# Replace sequence names with ASV_1, ASV_2, etc. for easier reference
+asv_ids <- paste0("ASV_", seq(ntaxa(ps)))
+taxa_names(ps) <- asv_ids
+
+# Update reference sequences
+dna <- refseq(ps)
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+
+# Inspect phyloseq object
+cat("Created phyloseq object with:\n")
+cat(" -", nsamples(ps), "samples\n")
+cat(" -", ntaxa(ps), "ASVs\n")
+cat(" -", sum(sample_sums(ps)), "total reads\n")
+cat(" - Mean", round(mean(sample_sums(ps))), "reads per sample\n")
+
+# Display sample read counts
+ps_counts <- tibble(
+  SampleID = sample_names(ps),
+  Group = sample_data(ps)$Group,
+  ReadCount = sample_sums(ps)
+) %>%
+  arrange(desc(ReadCount))
+
+kable(head(ps_counts, 10), caption = "Sample Read Counts (Top 10)")
+```
+
+# Save Results
+
+```{r save-results}
+# Create directory for results if it doesn't exist
+if(!dir.exists("results")) dir.create("results")
+
+# Save sequence table with ASV IDs
+asv_tab <- as.data.frame(t(otu_table(ps)))
+asv_tab$ASV_ID <- rownames(asv_tab)
+write.csv(asv_tab, "results/seqtab_nochim.csv", row.names = FALSE)
+cat("Saved ASV table to results/seqtab_nochim.csv\n")
+
+# Save taxonomy table with ASV IDs
+tax_tab <- as.data.frame(tax_table(ps))
+tax_tab$ASV_ID <- rownames(tax_tab)
+write.csv(tax_tab, "results/taxonomy.csv", row.names = FALSE)
+cat("Saved taxonomy table to results/taxonomy.csv\n")
+
+# Save phyloseq object
+saveRDS(ps, "results/phyloseq_object.rds")
+cat("Saved phyloseq object to results/phyloseq_object.rds\n")
+
+# Extract and save ASV sequences with IDs
+asv_seqs <- refseq(ps)
+asv_headers <- names(asv_seqs)
+asv_strings <- paste(asv_seqs)
+
+# Interleave headers and sequences for FASTA format
+asv_fasta <- c(rbind(paste0(">", asv_headers), asv_strings))
+write(asv_fasta, "results/ASVs.fasta")
+cat("Saved ASV sequences to results/ASVs.fasta\n")
+
+# Save parameter optimization results for future reference
+param_optimization <- list(
+  platform = truncation_lengths$platform,
+  max_read_lengths = c(forward = truncation_lengths$max_forward_len, 
+                      reverse = truncation_lengths$max_reverse_len),
+  truncation_lengths = c(forward = truncation_lengths$forward, 
+                        reverse = truncation_lengths$reverse),
+  maxEE = c(forward = maxEE_params$maxEE[1], 
+           reverse = maxEE_params$maxEE[2]),
+  expected_amplicon_size = expected_amplicon_size,
+  expected_overlap = truncation_lengths$expected_overlap,
+  primers = primer_info
+)
+saveRDS(param_optimization, "results/parameter_optimization.rds")
+cat("Saved parameter optimization results to results/parameter_optimization.rds\n")
+
+# Save workflow results summary
+workflow_summary <- list(
+  date = Sys.Date(),
+  num_samples = nsamples(ps),
+  num_asvs = ntaxa(ps),
+  total_reads = sum(sample_sums(ps)),
+  mean_reads_per_sample = mean(sample_sums(ps)),
+  read_tracking = track_df,
+  parameters = param_optimization
+)
+saveRDS(workflow_summary, "results/workflow_summary.rds")
+cat("Saved workflow summary to results/workflow_summary.rds\n")
+```
+
+# Conclusion
+
+This document outlines an optimized DADA2 workflow for processing 16S rRNA gene amplicon data. The workflow includes automatic parameter optimization based on your sequencing data, quality filtering, denoising, merging paired reads, chimera removal, and taxonomic assignment to generate a table of amplicon sequence variants (ASVs).
+
+Key enhancements in this optimized workflow:
+
+1. **Automatic platform detection** and parameter optimization based on read length and quality
+2. **Adaptive quality filtering** with optimized truncation lengths and expected error thresholds
+3. **Primer detection** for expected amplicon size estimation
+4. **Read merging optimization** to ensure sufficient overlap
+5. **Extensive quality control** throughout the pipeline
+6. **Detailed visualization** of results at each step
+7. **Comprehensive results export** for downstream analysis
+
+To visualize and explore your results interactively, you can use the companion dashboard:
+
+```r
+# Run the dashboard
+source("run_dashboard.R")
+```
+
+The output files in the `results/` directory can be used for further microbiome analyses in R (using phyloseq, microbiome, vegan, etc.) or exported to other platforms.
