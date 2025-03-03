@@ -4549,31 +4549,75 @@ if (can_do_rarefaction) {
         # Ensure same ordering
         alpha_div_rare_common <- alpha_div_rare_common[match(alpha_div_raw_common$sample, alpha_div_rare_common$sample), ]
         
-        # Calculate correlations
-        cor_observed <- cor(alpha_div_raw_common$Observed, alpha_div_rare_common$Observed)
-        cor_shannon <- cor(alpha_div_raw_common$Shannon, alpha_div_rare_common$Shannon)
+        # Calculate correlations with proper error handling
+        cor_observed <- tryCatch({
+          # Check if there's enough variation to calculate correlation
+          if (sd(alpha_div_raw_common$Observed) > 0 && sd(alpha_div_rare_common$Observed) > 0) {
+            cor(alpha_div_raw_common$Observed, alpha_div_rare_common$Observed)
+          } else {
+            NA
+          }
+        }, error = function(e) NA)
+        
+        cor_shannon <- tryCatch({
+          # Check if there's enough variation to calculate correlation
+          if (sd(alpha_div_raw_common$Shannon) > 0 && sd(alpha_div_rare_common$Shannon) > 0) {
+            cor(alpha_div_raw_common$Shannon, alpha_div_rare_common$Shannon)
+          } else {
+            NA
+          }
+        }, error = function(e) NA)
         
         cat("\nCorrelation between raw and rarefied diversity metrics:\n")
-        cat("Observed ASVs: r =", round(cor_observed, 3), "\n")
-        cat("Shannon Index: r =", round(cor_shannon, 3), "\n")
+        if (is.na(cor_observed)) {
+          cat("Observed ASVs: Not enough variation to calculate correlation\n")
+        } else {
+          cat("Observed ASVs: r =", round(cor_observed, 3), "\n")
+        }
         
-        # Create correlation plots
+        if (is.na(cor_shannon)) {
+          cat("Shannon Index: Not enough variation to calculate correlation\n")
+        } else {
+          cat("Shannon Index: r =", round(cor_shannon, 3), "\n")
+        }
+        
+        # Create correlation plots (with error handling)
         par(mfrow = c(1, 2))
+        
+        # Plot for Observed ASVs
         plot(alpha_div_raw_common$Observed, alpha_div_rare_common$Observed,
              xlab = "Raw", ylab = "Rarefied", main = "Observed ASVs",
              pch = 19, col = alpha("darkblue", 0.7))
         abline(0, 1, lty = 2, col = "red")
-        text(max(alpha_div_raw_common$Observed, na.rm = TRUE) * 0.8, 
-             min(alpha_div_rare_common$Observed, na.rm = TRUE) * 1.2,
-             paste("r =", round(cor_observed, 3)))
         
+        # Add correlation text if applicable
+        if (!is.na(cor_observed)) {
+          text_x <- max(alpha_div_raw_common$Observed, na.rm = TRUE) * 0.8
+          text_y <- min(alpha_div_rare_common$Observed, na.rm = TRUE) * 1.2
+          text(text_x, text_y, paste("r =", round(cor_observed, 3)))
+        } else {
+          text_x <- mean(range(alpha_div_raw_common$Observed, na.rm = TRUE))
+          text_y <- min(alpha_div_rare_common$Observed, na.rm = TRUE) * 1.2
+          text(text_x, text_y, "No correlation\n(insufficient variation)")
+        }
+        
+        # Plot for Shannon Index
         plot(alpha_div_raw_common$Shannon, alpha_div_rare_common$Shannon,
              xlab = "Raw", ylab = "Rarefied", main = "Shannon Index",
              pch = 19, col = alpha("darkgreen", 0.7))
         abline(0, 1, lty = 2, col = "red")
-        text(max(alpha_div_raw_common$Shannon, na.rm = TRUE) * 0.8, 
-             min(alpha_div_rare_common$Shannon, na.rm = TRUE) * 1.2,
-             paste("r =", round(cor_shannon, 3)))
+        
+        # Add correlation text if applicable
+        if (!is.na(cor_shannon)) {
+          text_x <- max(alpha_div_raw_common$Shannon, na.rm = TRUE) * 0.8
+          text_y <- min(alpha_div_rare_common$Shannon, na.rm = TRUE) * 1.2
+          text(text_x, text_y, paste("r =", round(cor_shannon, 3)))
+        } else {
+          text_x <- mean(range(alpha_div_raw_common$Shannon, na.rm = TRUE))
+          text_y <- min(alpha_div_rare_common$Shannon, na.rm = TRUE) * 1.2
+          text(text_x, text_y, "No correlation\n(insufficient variation)")
+        }
+        
         par(mfrow = c(1, 1))
       }
     }
