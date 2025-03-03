@@ -2716,28 +2716,147 @@ download_ref_db <- function(db_name) {
   
   # Setup for IDTAXA/DECIPHER SILVA classifier
   else if (db_name == "IDTAXA_SILVA") {
-    silva_idtaxa <- file.path("ref_db", "SILVA_SSU_r138_2019.RData")
+    # Use a consistent filename for the SILVA IDTAXA training set
+    silva_idtaxa <- file.path("ref_db", "SILVA_SSU_r138_IDTAXA.RData")
     
-    if (!file.exists(silva_idtaxa)) {
+    # Force download a fresh copy if we previously had issues
+    force_download <- file.exists(silva_idtaxa) && 
+                     (file.exists("results/idtaxa_unclassified_sequences.rds") || 
+                      exists("trainingSet") && !inherits(trainingSet, "TrainingSet"))
+    
+    if (force_download) {
+      cat("Previous IDTAXA issues detected. Re-downloading fresh SILVA training set...\n")
+      if (file.exists(silva_idtaxa)) {
+        # Rename the old file for backup
+        backup_file <- paste0(silva_idtaxa, ".backup.", format(Sys.time(), "%Y%m%d%H%M%S"))
+        file.rename(silva_idtaxa, backup_file)
+        cat("Backed up previous training set to:", backup_file, "\n")
+      }
+    }
+    
+    if (!file.exists(silva_idtaxa) || force_download) {
       cat("Downloading SILVA SSU r138 for IDTAXA...\n")
       
-      # Create temporary directory for download
-      temp_dir <- tempdir()
-      download_url <- "https://www2.decipher.codes/data/Downloads/TrainingSets/SILVA_SSU_r138_2_2024.RData"
+      # Try multiple download sources in case one fails
+      download_urls <- c(
+        "https://www2.decipher.codes/Classification/TrainingSets/SILVA_SSU_r138_2019.RData",
+        "https://zenodo.org/record/3986799/files/SILVA_SSU_r138_2019.RData",
+        "https://github.com/benjjneb/dada2/files/10403520/SILVA_SSU_r138_2019.RData.gz"
+      )
       
-      tryCatch({
-        # Set extended timeout
-        options(timeout = max(600, getOption("timeout")))
-        download.file(download_url, silva_idtaxa, mode = "wb")
-        cat("Download successful!\n")
-      }, error = function(e) {
-        cat("Error downloading SILVA for IDTAXA:", conditionMessage(e), "\n")
-        cat("Please download it manually from:", download_url, "\n")
+      download_success <- FALSE
+      
+      for (download_url in download_urls) {
+        if (download_success) break
+        
+        cat("Trying download from:", download_url, "\n")
+        tryCatch({
+          # Set extended timeout
+          options(timeout = max(900, getOption("timeout")))
+          
+          # Create a temporary file for download
+          temp_file <- tempfile(fileext = ".RData")
+          
+          # Download to temp file first to avoid corrupted downloads
+          download.file(download_url, temp_file, mode = "wb")
+          
+          # Check if the download worked by trying to load it
+          temp_env <- new.env()
+          load(temp_file, envir = temp_env)
+          
+          # Verify trainingSet exists in the downloaded file
+          if (!exists("trainingSet", envir = temp_env) || 
+              !inherits(temp_env$trainingSet, "TrainingSet")) {
+            cat("Downloaded file doesn't contain valid training set. Trying next source...\n")
+            next
+          }
+          
+          # If it loaded correctly, copy to final location
+          file.copy(temp_file, silva_idtaxa, overwrite = TRUE)
+          unlink(temp_file)
+          
+          cat("Download successful and verified!\n")
+          download_success <- TRUE
+          
+        }, error = function(e) {
+          cat("Error downloading from this source:", conditionMessage(e), "\n")
+          cat("Trying next source...\n")
+        })
+      }
+      
+      if (!download_success) {
+        cat("All download attempts failed.\n")
+        cat("Please download the SILVA training set manually from one of these URLs:\n")
+        for (url in download_urls) {
+          cat("  -", url, "\n")
+        }
         cat("and save it to:", silva_idtaxa, "\n")
-        stop("Download failed. Please download files manually.")
-      })
+        
+        # As a fallback, try to create a training set from scratch if DECIPHER is available
+        if (requireNamespace("DECIPHER", quietly = TRUE)) {
+          cat("Attempting to create a basic IDTAXA training set from scratch...\n")
+          
+          # This is a last resort option - will be very slow but might work
+          tryCatch({
+            # Try to create a basic training set
+            # First check if we have the SILVA_SEED_r138.RData file
+            seed_file <- file.path("ref_db", "SILVA_SEED_r138.RData")
+            seed_url <- "https://zenodo.org/record/3986799/files/SILVA_SEED_r138.RData"
+            
+            if (!file.exists(seed_file)) {
+              cat("Downloading SILVA SEED alignment file...\n")
+              download.file(seed_url, seed_file, mode = "wb")
+            }
+            
+            # Load the seed alignment
+            load(seed_file)
+            
+            if (!exists("SILVA_SEED_r138")) {
+              stop("SILVA_SEED_r138 object not found in the loaded file")
+            }
+            
+            # Create a simplified training set
+            cat("Creating training set from SILVA SEED (this will take some time)...\n")
+            trainingSet <- DECIPHER::LearnTaxa(SILVA_SEED_r138$train, 
+                                             SILVA_SEED_r138$taxonomy)
+            
+            # Save the created training set
+            save(trainingSet, file = silva_idtaxa)
+            cat("Basic training set created successfully. This is not as comprehensive as the official version.\n")
+            download_success <- TRUE
+            
+          }, error = function(e) {
+            cat("Failed to create training set:", conditionMessage(e), "\n")
+          })
+        }
+        
+        if (!download_success) {
+          stop("Unable to obtain a valid IDTAXA training set.")
+        }
+      }
     } else {
       cat("Using existing SILVA IDTAXA training set\n")
+      
+      # Verify the existing training set
+      temp_env <- new.env()
+      load_result <- tryCatch({
+        load(silva_idtaxa, envir = temp_env)
+        TRUE
+      }, error = function(e) {
+        cat("Error loading existing training set:", conditionMessage(e), "\n")
+        FALSE
+      })
+      
+      if (load_result && (!exists("trainingSet", envir = temp_env) || 
+                          !inherits(temp_env$trainingSet, "TrainingSet"))) {
+        cat("Existing file doesn't contain a valid training set. Will download fresh copy.\n")
+        # Rename the old file for backup
+        backup_file <- paste0(silva_idtaxa, ".corrupt.", format(Sys.time(), "%Y%m%d%H%M%S"))
+        file.rename(silva_idtaxa, backup_file)
+        cat("Backed up corrupt training set to:", backup_file, "\n")
+        # Call the function recursively to download a new copy
+        return(download_ref_db("IDTAXA_SILVA"))
+      }
     }
     
     return(list(
@@ -3212,45 +3331,137 @@ if (taxonomy_methods$IDTAXA_SILVA) {
   
   # Load the training set with proper error handling
   cat("Loading IDTAXA training set...\n")
-  tryCatch({
-    load(idtaxa_files$train)
+  
+  # Create a new environment to load the training set into
+  # This prevents variable name collisions with existing objects
+  training_env <- new.env()
+  
+  load_result <- tryCatch({
+    # Load the training set into the isolated environment
+    load(idtaxa_files$train, envir = training_env)
+    TRUE
+  }, error = function(e) {
+    cat("ERROR loading training set file:", conditionMessage(e), "\n")
+    cat("The file may be corrupted. Will attempt to download a fresh copy.\n")
     
-    # Verify that the trainingSet object was loaded correctly
-    if (!exists("trainingSet") || !inherits(trainingSet, "TrainingSet")) {
-      cat("WARNING: trainingSet object not found or incorrect type after loading database.\n")
+    # Delete the corrupted file
+    if (file.exists(idtaxa_files$train)) {
+      backup_file <- paste0(idtaxa_files$train, ".corrupted.", format(Sys.time(), "%Y%m%d%H%M%S"))
+      file.rename(idtaxa_files$train, backup_file)
+      cat("Renamed corrupted file to:", backup_file, "\n")
+    }
+    
+    # Try to download the file again
+    new_files <- download_ref_db("IDTAXA_SILVA")
+    
+    # Try loading again with the new file
+    tryCatch({
+      load(new_files$train, envir = training_env)
+      cat("Successfully loaded newly downloaded training set!\n")
+      TRUE
+    }, error = function(e2) {
+      cat("ERROR: Failed to load even after re-downloading:", conditionMessage(e2), "\n")
+      FALSE
+    })
+  })
+  
+  if (!load_result) {
+    stop("Cannot proceed with IDTAXA classification due to training set loading errors.")
+  }
+  
+  # List objects in the training set file
+  training_objs <- ls(envir = training_env)
+  cat("Objects in training set file:", paste(training_objs, collapse=", "), "\n")
+  
+  # Check if trainingSet exists in the loaded environment
+  if ("trainingSet" %in% training_objs) {
+    # Check that it's the right type
+    if (inherits(training_env$trainingSet, "TrainingSet")) {
+      # Copy to our main environment
+      trainingSet <- training_env$trainingSet
+      cat("IDTAXA training set loaded successfully!\n")
       
-      # Check what was actually loaded
-      loaded_objects <- ls()
-      cat("Objects loaded from the database file:", paste(loaded_objects, collapse=", "), "\n")
-      
-      # Look for alternative training set objects
-      possible_training_sets <- loaded_objects[grep("train|Training", loaded_objects, ignore.case=TRUE)]
-      if (length(possible_training_sets) > 0) {
-        cat("Possible training set objects:", paste(possible_training_sets, collapse=", "), "\n")
-        # Try to use the first one that looks like a training set
-        for (obj_name in possible_training_sets) {
-          if (inherits(get(obj_name), "TrainingSet")) {
-            cat("Using", obj_name, "as the training set.\n")
-            trainingSet <- get(obj_name)
-            break
-          }
-        }
-      }
-      
-      # If still no training set, stop with error
-      if (!exists("trainingSet") || !inherits(trainingSet, "TrainingSet")) {
-        stop("Cannot proceed: Valid IDTAXA training set not found in the loaded database.")
+      # Display information about the training set
+      if (!is.null(trainingSet$taxa) && length(trainingSet$taxa) > 0) {
+        cat("Training set has", length(trainingSet$taxa), "reference sequences\n")
+      } else {
+        cat("WARNING: Training set loaded but appears to be empty or incomplete\n")
       }
     } else {
-      cat("IDTAXA training set loaded successfully!\n")
-      # Display some information about the training set
-      cat("Training set has", length(trainingSet$taxa), "reference sequences\n")
+      cat("WARNING: Object named 'trainingSet' exists but is not a proper TrainingSet object\n")
+      stop("Cannot proceed: Invalid training set object")
     }
-  }, error = function(e) {
-    cat("ERROR loading training set:", conditionMessage(e), "\n")
-    cat("This is likely due to an issue with the training set file. Try downloading it again.\n")
-    stop("Cannot proceed with IDTAXA classification due to training set loading error.")
-  })
+  } else {
+    # Look for alternative objects that might be the training set
+    possible_training_sets <- grep("train|taxa|classifier", training_objs, ignore.case=TRUE, value=TRUE)
+    
+    if (length(possible_training_sets) > 0) {
+      cat("Looking for alternative training set objects:", paste(possible_training_sets, collapse=", "), "\n")
+      
+      # Try each possible object
+      for (obj_name in possible_training_sets) {
+        obj <- get(obj_name, envir=training_env)
+        if (inherits(obj, "TrainingSet")) {
+          cat("Found valid training set in object:", obj_name, "\n")
+          trainingSet <- obj
+          break
+        }
+      }
+    }
+    
+    # If we still don't have a training set, try to build one if possible
+    if (!exists("trainingSet") || !inherits(trainingSet, "TrainingSet")) {
+      cat("No valid training set found in file. Attempting to rebuild...\n")
+      
+      # Check if DECIPHER is available
+      if (!requireNamespace("DECIPHER", quietly = TRUE)) {
+        stop("DECIPHER package is required but not available")
+      }
+      
+      # Look for potential raw data to build a training set
+      if (any(c("sequences", "taxonomy", "aln") %in% training_objs)) {
+        cat("Found raw data that might be used to build a training set\n")
+        
+        # Try to extract sequences and taxonomy
+        sequences <- NULL
+        taxonomy <- NULL
+        
+        # Check various possible combinations
+        if (all(c("sequences", "taxonomy") %in% training_objs)) {
+          sequences <- training_env$sequences
+          taxonomy <- training_env$taxonomy
+        } else if ("aln" %in% training_objs && "taxonomy" %in% training_objs) {
+          sequences <- training_env$aln
+          taxonomy <- training_env$taxonomy
+        }
+        
+        # Try to build training set if we have the necessary components
+        if (!is.null(sequences) && !is.null(taxonomy)) {
+          cat("Attempting to build training set from raw data...\n")
+          tryCatch({
+            trainingSet <- DECIPHER::LearnTaxa(sequences, taxonomy)
+            cat("Successfully built new training set!\n")
+            
+            # Save for future use
+            save(trainingSet, file=idtaxa_files$train)
+            cat("Saved rebuilt training set for future use\n")
+          }, error = function(e) {
+            cat("Failed to build training set:", conditionMessage(e), "\n")
+            stop("Cannot proceed: Unable to create valid training set")
+          })
+        } else {
+          stop("Cannot proceed: No valid training set found and couldn't build one")
+        }
+      } else {
+        stop("Cannot proceed: No valid training set or raw data found")
+      }
+    }
+  }
+  
+  # Final check to ensure we have a valid training set
+  if (!exists("trainingSet") || !inherits(trainingSet, "TrainingSet")) {
+    stop("Cannot proceed: No valid IDTAXA training set available despite attempts to fix the issue")
+  }
   
   # Convert ASV sequences to DNAStringSet
   dna_seqs <- Biostrings::DNAStringSet(getSequences(seqtab.nochim))
