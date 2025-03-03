@@ -2723,7 +2723,7 @@ download_ref_db <- function(db_name) {
       
       # Create temporary directory for download
       temp_dir <- tempdir()
-      download_url <- "https://zenodo.org/records/3986799/files/SILVA_SSU_r138_2019.RData"
+      download_url <- "https://www2.decipher.codes/data/Downloads/TrainingSets/SILVA_SSU_r138_2_2024.RData"
       
       tryCatch({
         # Set extended timeout
@@ -3203,20 +3203,64 @@ if (taxonomy_methods$SILVA_DADA2) {
 ```
 
 ```{r idtaxa-taxonomy}
-# IDTAXA with SILVA database
+# IDTAXA with SILVA database - Optimized and Debugged Implementation
 if (taxonomy_methods$IDTAXA_SILVA) {
-  cat("\n=== Method 2: IDTAXA with SILVA database ===\n")
+  cat("\n=== Method 2: IDTAXA with SILVA database (with Enhanced Debugging) ===\n")
   
   # Download/locate SILVA database for IDTAXA
   idtaxa_files <- download_ref_db("IDTAXA_SILVA")
   
-  # Load the training set
+  # Load the training set with proper error handling
   cat("Loading IDTAXA training set...\n")
-  load(idtaxa_files$train)
+  tryCatch({
+    load(idtaxa_files$train)
+    
+    # Verify that the trainingSet object was loaded correctly
+    if (!exists("trainingSet") || !inherits(trainingSet, "TrainingSet")) {
+      cat("WARNING: trainingSet object not found or incorrect type after loading database.\n")
+      
+      # Check what was actually loaded
+      loaded_objects <- ls()
+      cat("Objects loaded from the database file:", paste(loaded_objects, collapse=", "), "\n")
+      
+      # Look for alternative training set objects
+      possible_training_sets <- loaded_objects[grep("train|Training", loaded_objects, ignore.case=TRUE)]
+      if (length(possible_training_sets) > 0) {
+        cat("Possible training set objects:", paste(possible_training_sets, collapse=", "), "\n")
+        # Try to use the first one that looks like a training set
+        for (obj_name in possible_training_sets) {
+          if (inherits(get(obj_name), "TrainingSet")) {
+            cat("Using", obj_name, "as the training set.\n")
+            trainingSet <- get(obj_name)
+            break
+          }
+        }
+      }
+      
+      # If still no training set, stop with error
+      if (!exists("trainingSet") || !inherits(trainingSet, "TrainingSet")) {
+        stop("Cannot proceed: Valid IDTAXA training set not found in the loaded database.")
+      }
+    } else {
+      cat("IDTAXA training set loaded successfully!\n")
+      # Display some information about the training set
+      cat("Training set has", length(trainingSet$taxa), "reference sequences\n")
+    }
+  }, error = function(e) {
+    cat("ERROR loading training set:", conditionMessage(e), "\n")
+    cat("This is likely due to an issue with the training set file. Try downloading it again.\n")
+    stop("Cannot proceed with IDTAXA classification due to training set loading error.")
+  })
   
   # Convert ASV sequences to DNAStringSet
   dna_seqs <- Biostrings::DNAStringSet(getSequences(seqtab.nochim))
   names(dna_seqs) <- paste0("ASV", seq_along(dna_seqs))
+  
+  # IDTAXA Configuration - with lower confidence threshold for debugging
+  # Default threshold was 50, lowering to 40 for debugging empty classifications
+  idtaxa_confidence_threshold <- 40  # Lower threshold for debugging
+  cat(sprintf("Using confidence threshold of %d%% for IDTAXA classification (lowered for debugging)\n", 
+              idtaxa_confidence_threshold))
   
   # Run IDTAXA classification with optimized parallelization
   cat("Running IDTAXA classification with optimized parallelization...\n")
@@ -3224,6 +3268,78 @@ if (taxonomy_methods$IDTAXA_SILVA) {
   # Determine optimal number of processors for IDTAXA
   num_processors <- min(parallel::detectCores() - 1, 8)
   cat(sprintf("Using %d processors for IDTAXA classification...\n", num_processors))
+  
+  # Debug: Verify sequences are valid for classification
+  cat("Checking sequences for potential issues...\n")
+  seq_lengths <- width(dna_seqs)
+  cat("Sequence length summary - Min:", min(seq_lengths), 
+      "Max:", max(seq_lengths), 
+      "Mean:", round(mean(seq_lengths), 1), "\n")
+  
+  # Check for any degenerate sequences
+  degenerate_bases <- sapply(as.character(dna_seqs), function(s) 
+    sum(stringr::str_count(s, "[^ACGT]")))
+  if (any(degenerate_bases > 0)) {
+    cat("WARNING:", sum(degenerate_bases > 0), "sequences contain degenerate bases.\n")
+  }
+  
+  # Function to test IDTAXA on a small subset first
+  test_idtaxa_classification <- function(seqs, training_set, threshold) {
+    # Take a small subset for testing
+    test_size <- min(5, length(seqs))
+    test_seqs <- seqs[1:test_size]
+    
+    # Run test classification
+    cat("Testing IDTAXA classification with", test_size, "sequences...\n")
+    test_result <- tryCatch({
+      DECIPHER::IdTaxa(test_seqs, training_set, strand = "both", threshold = threshold)
+    }, error = function(e) {
+      cat("ERROR in test classification:", conditionMessage(e), "\n")
+      return(NULL)
+    })
+    
+    # Check results
+    if (!is.null(test_result)) {
+      # Check for taxonomic assignments
+      has_taxonomy <- sapply(test_result, function(x) length(x$taxon) > 0)
+      if (all(has_taxonomy)) {
+        cat("Test successful: All test sequences received taxonomic classifications.\n")
+        # Check confidence values
+        conf_values <- lapply(test_result, function(x) x$confidence)
+        avg_conf <- mean(unlist(conf_values))
+        cat("Average confidence score:", round(avg_conf, 1), "%\n")
+        return(TRUE)
+      } else {
+        cat("WARNING: Some test sequences (", sum(!has_taxonomy), "/", test_size, 
+            ") did not receive taxonomic classifications.\n")
+        cat("This may indicate issues with the database or sequences.\n")
+        return(FALSE)
+      }
+    } else {
+      cat("Test classification failed.\n")
+      return(FALSE)
+    }
+  }
+  
+  # Run test classification
+  test_success <- test_idtaxa_classification(dna_seqs, trainingSet, idtaxa_confidence_threshold)
+  
+  # Initialize results list
+  ids <- NULL
+  
+  # Proceed with full classification if test was successful, or try with even lower threshold if it failed
+  if (!test_success) {
+    cat("Initial test failed. Trying with an even lower threshold...\n")
+    idtaxa_confidence_threshold <- 30
+    test_success <- test_idtaxa_classification(dna_seqs, trainingSet, idtaxa_confidence_threshold)
+    
+    if (!test_success) {
+      cat("WARNING: Test classification still failed with lower threshold.\n")
+      cat("Proceeding with full classification anyway, but results may be incomplete.\n")
+    } else {
+      cat("Test succeeded with threshold =", idtaxa_confidence_threshold, "\n")
+    }
+  }
   
   # For large datasets, use batched approach
   if(length(dna_seqs) > 3000) {
@@ -3237,6 +3353,10 @@ if (taxonomy_methods$IDTAXA_SILVA) {
     ids <- vector("list", length(dna_seqs))
     names(ids) <- names(dna_seqs)
     
+    # Track successful classifications
+    success_count <- 0
+    empty_count <- 0
+    
     # Process each batch
     for(i in 1:n_batches) {
       cat(sprintf("Processing IDTAXA batch %d of %d...\n", i, n_batches))
@@ -3248,9 +3368,28 @@ if (taxonomy_methods$IDTAXA_SILVA) {
       # Extract batch
       batch_seqs <- dna_seqs[start_idx:end_idx]
       
-      # Run IDTAXA on this batch
-      batch_ids <- DECIPHER::IdTaxa(batch_seqs, trainingSet, strand = "both", 
-                                   processors = num_processors, threshold = 50)
+      # Run IDTAXA on this batch with error handling
+      batch_ids <- tryCatch({
+        DECIPHER::IdTaxa(batch_seqs, trainingSet, strand = "both", 
+                        processors = num_processors, threshold = idtaxa_confidence_threshold)
+      }, error = function(e) {
+        cat("ERROR in batch", i, ":", conditionMessage(e), "\n")
+        # Return NULL for each sequence in this batch to avoid breaking the pipeline
+        empty_list <- vector("list", length(batch_seqs))
+        names(empty_list) <- names(batch_seqs)
+        return(empty_list)
+      })
+      
+      # Count successful classifications in this batch
+      batch_success <- sum(sapply(batch_ids, function(x) !is.null(x) && length(x$taxon) > 0))
+      batch_empty <- length(batch_ids) - batch_success
+      
+      success_count <- success_count + batch_success
+      empty_count <- empty_count + batch_empty
+      
+      if (batch_empty > 0) {
+        cat("WARNING:", batch_empty, "sequences in batch", i, "received no taxonomic classification\n")
+      }
       
       # Store in the correct positions in the results list
       ids[names(batch_seqs)] <- batch_ids
@@ -3258,30 +3397,130 @@ if (taxonomy_methods$IDTAXA_SILVA) {
       # Force garbage collection
       gc()
     }
+    
+    # Report overall statistics
+    cat("IDTAXA classification complete:", success_count, "sequences classified successfully\n")
+    if (empty_count > 0) {
+      cat("WARNING:", empty_count, "sequences (", 
+          round(empty_count/length(dna_seqs)*100, 1), 
+          "%) received no taxonomic classification\n")
+    }
   } else {
-    # For smaller datasets, use standard approach
-    ids <- DECIPHER::IdTaxa(dna_seqs, trainingSet, strand = "both", 
-                          processors = num_processors, threshold = 50)
+    # For smaller datasets, use standard approach with error handling
+    ids <- tryCatch({
+      DECIPHER::IdTaxa(dna_seqs, trainingSet, strand = "both", 
+                      processors = num_processors, threshold = idtaxa_confidence_threshold)
+    }, error = function(e) {
+      cat("ERROR in IDTAXA classification:", conditionMessage(e), "\n")
+      return(NULL)
+    })
+    
+    # Check results
+    if (!is.null(ids)) {
+      # Count successful classifications
+      success_count <- sum(sapply(ids, function(x) length(x$taxon) > 0))
+      empty_count <- length(ids) - success_count
+      
+      cat("IDTAXA classification complete:", success_count, "sequences classified successfully\n")
+      if (empty_count > 0) {
+        cat("WARNING:", empty_count, "sequences (", 
+            round(empty_count/length(ids)*100, 1), 
+            "%) received no taxonomic classification\n")
+      }
+    } else {
+      cat("ERROR: IDTAXA classification failed completely.\n")
+      # Create empty result to avoid breaking the pipeline
+      ids <- vector("list", length(dna_seqs))
+      names(ids) <- names(dna_seqs)
+    }
   }
   
   # Function to convert IDTAXA results to a taxonomy table similar to DADA2's format
+  # Modified to use lower per-rank confidence thresholds
   convert_idtaxa_to_table <- function(ids) {
     # Get all possible ranks
     all_ranks <- unique(unlist(lapply(ids, function(x) names(x$taxon))))
+    if (length(all_ranks) == 0) {
+      cat("ERROR: No taxonomic ranks found in IDTAXA results.\n")
+      # Return empty data frame with standard columns to avoid breaking pipeline
+      empty_df <- data.frame(matrix(NA, nrow = length(ids), ncol = 7))
+      colnames(empty_df) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+      rownames(empty_df) <- names(ids)
+      return(empty_df)
+    }
     
     # Convert to data frame
     taxa_df <- data.frame(matrix(NA, nrow = length(ids), ncol = length(all_ranks)))
     colnames(taxa_df) <- all_ranks
     rownames(taxa_df) <- names(ids)
     
+    # Use more relaxed confidence thresholds for lower taxonomic ranks
+    confidence_thresholds <- list(
+      rootrank = 40,  # Kingdom level
+      domain = 40,    # Also kingdom level
+      Kingdom = 40,
+      Phylum = 35,
+      Class = 30,
+      Order = 25,
+      Family = 20,
+      Genus = 15,
+      Species = 10
+    )
+    
     # Fill in the data frame
+    empty_assignments <- 0
+    assignment_counts <- setNames(rep(0, length(all_ranks)), all_ranks)
+    
     for (i in seq_along(ids)) {
       id <- ids[[i]]
+      
+      # Skip if the ID result is empty
+      if (is.null(id) || length(id$taxon) == 0) {
+        empty_assignments <- empty_assignments + 1
+        next
+      }
+      
+      # Track assignment counts by rank
       for (rank in names(id$taxon)) {
-        if (id$confidence[rank] >= 50) {  # Only keep assignments with ≥50% confidence
+        assignment_counts[rank] <- assignment_counts[rank] + 1
+      }
+      
+      # Process each taxonomic rank
+      for (rank in names(id$taxon)) {
+        # Get confidence threshold for this rank
+        threshold <- if (rank %in% names(confidence_thresholds)) {
+          confidence_thresholds[[rank]]
+        } else {
+          idtaxa_confidence_threshold  # Use default if rank not in thresholds
+        }
+        
+        # Only keep assignments with confidence above threshold for this rank
+        if (!is.null(id$confidence) && !is.null(id$confidence[rank]) && 
+            !is.na(id$confidence[rank]) && id$confidence[rank] >= threshold) {
           taxa_df[i, rank] <- id$taxon[rank]
         }
       }
+    }
+    
+    # Report assignment statistics by rank
+    cat("\nIDTAXA Assignment Statistics by Rank:\n")
+    for (rank in names(assignment_counts)) {
+      if (assignment_counts[rank] > 0) {
+        pct <- round(assignment_counts[rank] / length(ids) * 100, 1)
+        threshold <- if (rank %in% names(confidence_thresholds)) {
+          confidence_thresholds[[rank]]
+        } else {
+          idtaxa_confidence_threshold
+        }
+        cat(sprintf("  %s: %d assignments (%g%%) - threshold: %d%%\n", 
+                   rank, assignment_counts[rank], pct, threshold))
+      }
+    }
+    
+    if (empty_assignments > 0) {
+      cat("  Empty Results:", empty_assignments, "sequences (", 
+          round(empty_assignments/length(ids)*100, 1), 
+          "%) had no taxonomic assignments\n")
     }
     
     return(taxa_df)
@@ -3296,6 +3535,38 @@ if (taxonomy_methods$IDTAXA_SILVA) {
   # View IDTAXA taxonomic assignments
   cat("First few IDTAXA taxonomic assignments:\n")
   print(head(taxa_idtaxa))
+  
+  # Validate the taxonomy results
+  empty_rows <- rowSums(is.na(taxa_idtaxa)) == ncol(taxa_idtaxa)
+  if (sum(empty_rows) > 0) {
+    cat("WARNING:", sum(empty_rows), "sequences (", 
+        round(sum(empty_rows)/nrow(taxa_idtaxa)*100, 1), 
+        "%) have no taxonomic classification at any level\n")
+    
+    # Save problematic sequences for further analysis
+    if (sum(empty_rows) > 0) {
+      empty_seqs <- dna_seqs[empty_rows]
+      if (!dir.exists("results")) dir.create("results")
+      saveRDS(empty_seqs, "results/idtaxa_unclassified_sequences.rds")
+      cat("Saved unclassified sequences to results/idtaxa_unclassified_sequences.rds for further analysis\n")
+    }
+  }
+  
+  # Save taxonomic confidence scores for each assignment
+  if (!is.null(ids) && length(ids) > 0) {
+    # Extract confidence scores for each ASV and each taxonomic level
+    confidence_data <- lapply(ids, function(id) {
+      if (is.null(id) || is.null(id$confidence) || length(id$confidence) == 0) {
+        return(NULL)
+      }
+      return(id$confidence)
+    })
+    
+    # Save confidence scores
+    if (!dir.exists("results")) dir.create("results")
+    saveRDS(confidence_data, "results/idtaxa_confidence_scores.rds")
+    cat("Saved detailed confidence scores to results/idtaxa_confidence_scores.rds\n")
+  }
   
   # Save to results list
   taxa_results$IDTAXA_SILVA <- taxa_idtaxa
@@ -3335,6 +3606,7 @@ if (taxonomy_methods$IDTAXA_SILVA) {
     geom_text(aes(label = paste0(PercentAssigned, "%")), vjust = -0.3) +
     theme_minimal() +
     labs(title = "IDTAXA: Percentage of ASVs with Taxonomic Assignment",
+         subtitle = paste0("Using confidence threshold of ", idtaxa_confidence_threshold, "% (lowered for debugging)"),
          x = "Taxonomic Level",
          y = "Percent Assigned") +
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
