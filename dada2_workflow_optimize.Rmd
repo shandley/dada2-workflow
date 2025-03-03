@@ -4189,18 +4189,44 @@ if (can_do_rarefaction) {
           }
           
           # Calculate richness at this depth for each sample
-          richness <- vegan::rarefy(abundances, depth)
+          richness <- suppressWarnings(vegan::rarefy(abundances, depth))
           
-          # Create results for each sample
-          result_df <- data.frame(
-            depth = depth,
-            richness = richness,
-            sample = rownames(abundances),
-            stringsAsFactors = FALSE
-          )
+          # Create results for each sample with safety checks
+          sample_names <- rownames(abundances)
           
-          # Filter out samples with insufficient reads
-          result_df <- result_df[!is.na(result_df$richness), ]
+          # Handle potential length mismatches for safer data frame creation
+          if (length(richness) != length(sample_names)) {
+            # Use which() instead of logical indexing to avoid "logical subscript too long" errors
+            valid_indices <- which(!is.na(richness))
+            
+            if (length(valid_indices) > 0) {
+              result_df <- data.frame(
+                depth = depth,
+                richness = richness[valid_indices],
+                sample = sample_names[valid_indices],
+                stringsAsFactors = FALSE
+              )
+            } else {
+              # No valid samples for this depth
+              result_df <- data.frame(
+                depth = numeric(0), 
+                richness = numeric(0), 
+                sample = character(0),
+                stringsAsFactors = FALSE
+              )
+            }
+          } else {
+            # Normal case - create data frame then filter NA values
+            result_df <- data.frame(
+              depth = depth,
+              richness = richness,
+              sample = sample_names,
+              stringsAsFactors = FALSE
+            )
+            
+            # Use which() for safer NA filtering
+            result_df <- result_df[which(!is.na(result_df$richness)), ]
+          }
           return(result_df)
         })
         
@@ -4219,17 +4245,42 @@ if (can_do_rarefaction) {
       for (i in seq_along(depths)) {
         depth <- depths[i]
         
-        # Calculate richness at this depth for each sample
-        richness <- vegan::rarefy(abundances, depth)
+        # Calculate richness at this depth for each sample with warnings suppressed
+        richness <- suppressWarnings(vegan::rarefy(abundances, depth))
         
-        # Store the results
-        for (j in seq_along(richness)) {
-          if(!is.na(richness[j])) {  # Skip samples with insufficient reads
-            rarefaction_curves <- rbind(rarefaction_curves, 
-                                      data.frame(depth = depth,
-                                               richness = richness[j],
-                                               sample = rownames(abundances)[j],
-                                               stringsAsFactors = FALSE))
+        # Create results with safety checks
+        sample_names <- rownames(abundances)
+        
+        # Handle potential length mismatches
+        if (length(richness) != length(sample_names)) {
+          # Get valid indices using which() to avoid "logical subscript too long" errors
+          valid_indices <- which(!is.na(richness))
+          
+          if (length(valid_indices) > 0) {
+            # Create a data frame for valid samples directly
+            depth_data <- data.frame(
+              depth = depth,
+              richness = richness[valid_indices],
+              sample = sample_names[valid_indices],
+              stringsAsFactors = FALSE
+            )
+            
+            # Add to master data frame
+            rarefaction_curves <- rbind(rarefaction_curves, depth_data)
+          }
+        } else {
+          # Normal case - create single data frame for all valid samples at this depth
+          valid_indices <- which(!is.na(richness))
+          if (length(valid_indices) > 0) {
+            depth_data <- data.frame(
+              depth = depth,
+              richness = richness[valid_indices],
+              sample = rownames(abundances)[valid_indices],
+              stringsAsFactors = FALSE
+            )
+            
+            # Add to master data frame
+            rarefaction_curves <- rbind(rarefaction_curves, depth_data)
           }
         }
         
