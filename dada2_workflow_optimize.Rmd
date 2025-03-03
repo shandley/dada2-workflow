@@ -2758,28 +2758,62 @@ download_ref_db <- function(db_name) {
 
 # Get standard taxonomy names across databases
 standardize_taxonomy <- function(taxa_df, method) {
+  # Convert to data frame if it's a matrix
+  if(is.matrix(taxa_df)) {
+    taxa_df <- as.data.frame(taxa_df)
+  }
+  
   # Make all column names consistent
   standard_cols <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
   
+  # Print debugging info
+  cat("Method:", method, "\n")
+  cat("Original columns:", paste(colnames(taxa_df), collapse=", "), "\n")
+  
   # RDP specific standardization
-  if (method == "RDP") {
+  if (method == "RDP_DADA2") {
     # RDP sometimes uses Root instead of Kingdom
     if ("Root" %in% colnames(taxa_df)) {
       colnames(taxa_df)[colnames(taxa_df) == "Root"] <- "Kingdom"
     }
   }
   
-  # Ensure all standard columns exist, filling with NA if missing
-  for (col in standard_cols) {
-    if (!col %in% colnames(taxa_df)) {
-      taxa_df[[col]] <- NA
+  # Convert all column names to standard case
+  colnames(taxa_df) <- toupper(colnames(taxa_df))
+  
+  # Map common variations to standard names
+  col_map <- c(
+    "KINGDOM" = "Kingdom",
+    "DOMAIN" = "Kingdom",
+    "ROOT" = "Kingdom",
+    "PHYLUM" = "Phylum",
+    "CLASS" = "Class",
+    "ORDER" = "Order",
+    "FAMILY" = "Family",
+    "GENUS" = "Genus",
+    "SPECIES" = "Species"
+  )
+  
+  for(old_col in names(col_map)) {
+    if(old_col %in% colnames(taxa_df)) {
+      colnames(taxa_df)[colnames(taxa_df) == old_col] <- col_map[old_col]
     }
   }
   
-  # Select only standard columns and in the right order
-  taxa_df <- taxa_df[, standard_cols]
+  # Ensure all standard columns exist, filling with NA if missing
+  result_df <- data.frame(matrix(NA, nrow=nrow(taxa_df), ncol=length(standard_cols)))
+  colnames(result_df) <- standard_cols
   
-  return(taxa_df)
+  # Copy data from original to standardized columns
+  for(col in standard_cols) {
+    if(col %in% colnames(taxa_df)) {
+      result_df[[col]] <- taxa_df[[col]]
+    }
+  }
+  
+  cat("Standardized columns:", paste(colnames(result_df), collapse=", "), "\n")
+  
+  return(result_df)
 }
 
 # This function will be used to summarize taxonomy assignment across methods
@@ -2793,32 +2827,53 @@ summarize_taxonomy <- function(taxa_list) {
     Order = numeric(),
     Family = numeric(),
     Genus = numeric(),
-    Species = numeric()
+    Species = numeric(),
+    stringsAsFactors = FALSE
   )
+  
+  # Define standard levels
+  standard_levels <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
   
   # Calculate assignments for each method
   for (method_name in names(taxa_list)) {
+    cat("Processing method:", method_name, "\n")
+    
+    # Get this taxonomy result
     taxa_df <- taxa_list[[method_name]]
+    cat("Original dimensions:", paste(dim(taxa_df), collapse="×"), "\n")
+    cat("Original columns:", paste(colnames(taxa_df), collapse=", "), "\n")
     
-    # First ensure standardized taxonomy before calculating percentages
-    std_taxa_df <- standardize_taxonomy(taxa_df, method_name)
+    # Convert to data frame if it's a matrix
+    if(is.matrix(taxa_df)) {
+      taxa_df <- as.data.frame(taxa_df, stringsAsFactors = FALSE)
+    }
     
-    # Calculate percentage assigned at each level
+    # Create the row for this method
     method_row <- c(method_name)
-    for (level in c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")) {
-      percent <- round(sum(!is.na(std_taxa_df[[level]])) / nrow(std_taxa_df) * 100, 1)
+    
+    # Calculate percentage for each level
+    for(level in standard_levels) {
+      if(level %in% colnames(taxa_df)) {
+        # If column exists, calculate percentage of non-NA values
+        percent <- round(sum(!is.na(taxa_df[[level]])) / nrow(taxa_df) * 100, 1)
+      } else {
+        # If column doesn't exist, percentage is 0
+        percent <- 0
+        cat("Warning: Level", level, "not found in method", method_name, "\n")
+      }
       method_row <- c(method_row, percent)
     }
     
     # Add to summary data frame
     summary_df <- rbind(summary_df, method_row)
+    cat("Processed", method_name, "successfully\n")
   }
   
   # Set column names
-  colnames(summary_df) <- c("Method", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+  colnames(summary_df) <- c("Method", standard_levels)
   
   # Convert percentage columns to numeric
-  for (col in colnames(summary_df)[-1]) {
+  for (col in standard_levels) {
     summary_df[[col]] <- as.numeric(summary_df[[col]])
   }
   
@@ -2901,6 +2956,11 @@ taxa_results <- list()
 # with more stringent thresholds typically applied at lower taxonomic
 # levels where assignment uncertainty is higher.
 # ===================================================================
+
+# Initialize empty taxa_results list if not already created
+if(!exists("taxa_results")) {
+  taxa_results <- list()
+}
 
 # DADA2 with SILVA database (default method)
 if (taxonomy_methods$SILVA_DADA2) {
@@ -3177,6 +3237,18 @@ if (taxonomy_methods$RDP_DADA2) {
   cat("First few RDP taxonomic assignments:\n")
   print(head(taxa_rdp))
   
+  # Make sure columns follow the standard naming
+  standard_cols <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+  for(col in standard_cols) {
+    if(!(col %in% colnames(taxa_rdp))) {
+      cat("Adding missing column:", col, "\n")
+      taxa_rdp[, col] <- NA
+    }
+  }
+  
+  # Make sure only standard columns are kept
+  taxa_rdp <- taxa_rdp[, standard_cols]
+  
   # Save to results list
   taxa_results$RDP_DADA2 <- taxa_rdp
   
@@ -3212,6 +3284,15 @@ if (taxonomy_methods$RDP_DADA2) {
 # Compare taxonomy assignments from different methods
 if (length(taxa_results) > 1) {
   cat("\n=== Comparing Taxonomy Assignments Across Methods ===\n")
+  
+  # Debug: Print information about taxa_results
+  cat("Number of taxonomy methods:", length(taxa_results), "\n")
+  cat("Method names:", paste(names(taxa_results), collapse=", "), "\n")
+  
+  # Debug: Print dimensions of each taxonomy result
+  for(method in names(taxa_results)) {
+    cat("Method:", method, "Dimensions:", paste(dim(taxa_results[[method]]), collapse="×"), "\n")
+  }
   
   # Create taxonomy assignment summary across methods
   taxonomy_summary <- summarize_taxonomy(taxa_results)
