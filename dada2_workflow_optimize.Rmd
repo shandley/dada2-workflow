@@ -4779,18 +4779,35 @@ cat("Saved enhanced workflow summary to results/workflow_summary.rds\n")
 ```{r generate-report, eval=params$generate_report}
 # Only execute this block if report generation is requested via parameters
 
-# Create reports directory if it doesn't exist
-if(!dir.exists(params$output_dir)) {
-  dir.create(params$output_dir, recursive = TRUE)
-  cat("Created reports directory:", params$output_dir, "\n")
-}
-
 # Current date for report filename
 report_date <- format(Sys.Date(), "%Y%m%d")
 
-# Create output filename
-output_file <- file.path(params$output_dir, 
-                         paste0(params$output_file, "_", report_date))
+# Check if output directory parameter exists, otherwise use default
+output_dir <- if (exists("params") && 
+                   !is.null(params$output_dir) && 
+                   params$output_dir != "") {
+  params$output_dir
+} else {
+  "reports"  # Default output directory
+}
+
+# Make sure the output directory exists
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+  cat("Created output directory:", output_dir, "\n")
+}
+
+# Check if output file parameter exists, otherwise use default
+output_file_base <- if (exists("params") && 
+                        !is.null(params$output_file) && 
+                        params$output_file != "") {
+  params$output_file
+} else {
+  "dada2_workflow_report"  # Default report name
+}
+
+# Create full output filename
+output_file <- file.path(output_dir, paste0(output_file_base, "_", report_date))
 
 # Generate the report
 # First, get the current file path explicitly
@@ -4801,11 +4818,21 @@ if (is.null(current_file) || current_file == "") {
   cat("Warning: Could not detect current file. Using", current_file, "instead.\n")
 }
 
+# Check output format and use a sensible default if needed
+output_format <- if (exists("params") && 
+                     !is.null(params$output_format) && 
+                     params$output_format != "") {
+  params$output_format
+} else {
+  "html_document"  # Use HTML as the default format
+}
+cat("Using output format:", output_format, "\n")
+
 # Try to generate the report with better error trapping
 report_result <- tryCatch({
   rmarkdown::render(
     input = current_file,
-    output_format = params$output_format,
+    output_format = output_format,
     output_file = output_file,
     params = list(
       generate_report = FALSE  # Prevent infinite recursion
