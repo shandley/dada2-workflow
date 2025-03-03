@@ -2851,7 +2851,7 @@ plot_taxonomy_comparison <- function(summary_df) {
 # Set to TRUE/FALSE to enable/disable methods
 taxonomy_methods <- list(
   SILVA_DADA2 = TRUE,      # DADA2's implementation with SILVA database
-  RDP_DADA2 = FALSE        # DADA2's implementation with RDP database
+  RDP_DADA2 = TRUE         # DADA2's implementation with RDP database
 )
 
 # Storage for taxonomy results
@@ -3154,7 +3154,7 @@ if (taxonomy_methods$SILVA_DADA2) {
 
 # This section has been removed to simplify taxonomy assignment
 
-```{r rdp-taxonomy, eval=taxonomy_methods$RDP_DADA2}
+```{r rdp-taxonomy}
 # DADA2 with RDP database (optional method)
 if (taxonomy_methods$RDP_DADA2) {
   cat("\n=== Method 3: DADA2 with RDP database ===\n")
@@ -3205,7 +3205,7 @@ if (taxonomy_methods$RDP_DADA2) {
 }
 ```
 
-```{r taxonomy-comparison, eval=FALSE}
+```{r taxonomy-comparison}
 # Compare taxonomy assignments from different methods
 if (length(taxa_results) > 1) {
   cat("\n=== Comparing Taxonomy Assignments Across Methods ===\n")
