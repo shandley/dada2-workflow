@@ -4189,43 +4189,37 @@ if (can_do_rarefaction) {
           }
           
           # Calculate richness at this depth for each sample
-          richness <- suppressWarnings(vegan::rarefy(abundances, depth))
+          # Handle cases where the depth is greater than some samples' total counts
+          valid_samples <- rowSums(abundances) >= depth
           
-          # Create results for each sample with safety checks
-          sample_names <- rownames(abundances)
-          
-          # Handle potential length mismatches for safer data frame creation
-          if (length(richness) != length(sample_names)) {
-            # Use which() instead of logical indexing to avoid "logical subscript too long" errors
-            valid_indices <- which(!is.na(richness))
-            
-            if (length(valid_indices) > 0) {
-              result_df <- data.frame(
-                depth = depth,
-                richness = richness[valid_indices],
-                sample = sample_names[valid_indices],
-                stringsAsFactors = FALSE
-              )
-            } else {
-              # No valid samples for this depth
-              result_df <- data.frame(
-                depth = numeric(0), 
-                richness = numeric(0), 
-                sample = character(0),
-                stringsAsFactors = FALSE
-              )
-            }
-          } else {
-            # Normal case - create data frame then filter NA values
+          if (sum(valid_samples) == 0) {
+            # Skip when no samples have enough reads for this depth
             result_df <- data.frame(
-              depth = depth,
+              depth = numeric(0), 
+              richness = numeric(0), 
+              sample = character(0),
+              stringsAsFactors = FALSE
+            )
+          } else {
+            # Only calculate for samples with sufficient reads
+            valid_abundances <- abundances[valid_samples, , drop = FALSE]
+            valid_sample_names <- rownames(valid_abundances)
+            
+            # Now safely calculate richness only for valid samples
+            richness <- suppressWarnings(vegan::rarefy(valid_abundances, depth))
+            
+            # Create results dataframe directly from valid results
+            result_df <- data.frame(
+              depth = rep(depth, length(richness)),
               richness = richness,
-              sample = sample_names,
+              sample = valid_sample_names,
               stringsAsFactors = FALSE
             )
             
-            # Use which() for safer NA filtering
-            result_df <- result_df[which(!is.na(result_df$richness)), ]
+            # Filter any remaining NA values (should be rare with this approach)
+            if (any(is.na(result_df$richness))) {
+              result_df <- result_df[!is.na(result_df$richness), ]
+            }
           }
           return(result_df)
         })
@@ -4245,41 +4239,32 @@ if (can_do_rarefaction) {
       for (i in seq_along(depths)) {
         depth <- depths[i]
         
-        # Calculate richness at this depth for each sample with warnings suppressed
-        richness <- suppressWarnings(vegan::rarefy(abundances, depth))
+        # Handle cases where the depth is greater than some samples' total counts
+        valid_samples <- rowSums(abundances) >= depth
         
-        # Create results with safety checks
-        sample_names <- rownames(abundances)
-        
-        # Handle potential length mismatches
-        if (length(richness) != length(sample_names)) {
-          # Get valid indices using which() to avoid "logical subscript too long" errors
-          valid_indices <- which(!is.na(richness))
+        if (sum(valid_samples) > 0) {
+          # Only calculate for samples with sufficient reads
+          valid_abundances <- abundances[valid_samples, , drop = FALSE]
+          valid_sample_names <- rownames(valid_abundances)
           
-          if (length(valid_indices) > 0) {
-            # Create a data frame for valid samples directly
-            depth_data <- data.frame(
-              depth = depth,
-              richness = richness[valid_indices],
-              sample = sample_names[valid_indices],
-              stringsAsFactors = FALSE
-            )
-            
-            # Add to master data frame
-            rarefaction_curves <- rbind(rarefaction_curves, depth_data)
+          # Now safely calculate richness only for valid samples
+          richness <- suppressWarnings(vegan::rarefy(valid_abundances, depth))
+          
+          # Create a data frame for valid samples
+          depth_data <- data.frame(
+            depth = rep(depth, length(richness)),
+            richness = richness,
+            sample = valid_sample_names,
+            stringsAsFactors = FALSE
+          )
+          
+          # Filter any NA values (should be rare with this approach)
+          if (any(is.na(depth_data$richness))) {
+            depth_data <- depth_data[!is.na(depth_data$richness), ]
           }
-        } else {
-          # Normal case - create single data frame for all valid samples at this depth
-          valid_indices <- which(!is.na(richness))
-          if (length(valid_indices) > 0) {
-            depth_data <- data.frame(
-              depth = depth,
-              richness = richness[valid_indices],
-              sample = rownames(abundances)[valid_indices],
-              stringsAsFactors = FALSE
-            )
-            
-            # Add to master data frame
+          
+          # Only add to master data frame if we have valid results
+          if (nrow(depth_data) > 0) {
             rarefaction_curves <- rbind(rarefaction_curves, depth_data)
           }
         }
