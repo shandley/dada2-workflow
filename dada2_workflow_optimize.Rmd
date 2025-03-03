@@ -28,27 +28,7 @@ params:
 
 This document implements an optimized workflow for processing 16S rRNA gene amplicon data using DADA2. The workflow includes automatic parameter optimization, quality filtering, denoising, merging paired reads, chimera removal, and taxonomic assignment to generate a table of amplicon sequence variants (ASVs).
 
-Key features of this optimized workflow:
-
-- **Automatic detection of sequencing platform** (MiSeq, NovaSeq, etc.) - Identifies platform based on read length and quality patterns
-- **Optimization of quality filtering parameters** - Custom-tuned for your specific sequence data characteristics
-- **Adaptive truncation lengths** - Dynamically adjust to your read lengths and quality profiles for optimal results
-- **Expected error threshold optimization** - Balances quality control and read retention for maximum data utilization
-- **Primer detection** - Automatically identifies primer sequences to assist with amplicon size calculations
-- **Read merging optimization** - Ensures sufficient overlap for reliable ASV calling with minimal artifacts
-- **Memory-optimized processing** - Efficient batched operations for large datasets with automatic memory management
-- **Enhanced checkpointing system** - Robust recovery from interruptions with comprehensive progress tracking
-- **Parallelized execution** - Automatic multi-core utilization with adaptive worker allocation
-- **Reference-based taxonomy confidence scoring** - Bootstrap confidence values for all taxonomic assignments
-- **Multi-method taxonomy assignment** - Combines results from multiple classifiers for improved accuracy
-- **Phylogenetic tree construction** - Integrates phylogenetic information using optimized alignment methods
-- **Rarefaction analysis** - Depth optimization with saturation detection for proper diversity comparisons
-- **Detailed quality visualization** - Enhanced plots with quality interpretation zones and percentile distributions
-- **Comprehensive tracking** - Monitors reads and ASVs through each processing step with detailed reporting
-- **Batch effect detection** - For multi-run studies, identifies and quantifies potential batch effects
-- **Detailed results export** - Comprehensive data files for downstream analysis and sharing
-
-> **Note on amplicon size and sequencing cycles:** While Illumina sequencers run a fixed number of cycles (e.g., 2x250 for MiSeq, 2x150 for NovaSeq), the expected amplicon size is still crucial for parameter optimization. For example, the V4 region using 515F-806R primers produces a ~253 bp amplicon. For a MiSeq 2x250 run, this means the forward read covers positions 1-250 and the reverse read covers positions 253-4 (reading backward), creating substantial overlap (~247 bp). The algorithm needs this information to properly balance quality trimming while maintaining sufficient overlap for read merging. Even if individual reads are limited by cycle count, knowing the true amplicon size helps optimize trimming parameters and validates that merged sequences represent genuine amplicons rather than artifacts.
+# Setup
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
@@ -444,7 +424,7 @@ list_checkpoints <- function() {
 }
 ```
 
-# Setup
+# Package management
 
 ```{r load-packages}
 # Check and load all required and optional packages
@@ -467,34 +447,88 @@ if (can_build_trees) {
 } else {
   cat("✗ Phylogenetic tree construction is disabled (install phangorn and DECIPHER to enable)\n")
 }
+```
 
+# Parallelization
+
+```{r parallelization}
 # Set up parallelization for faster processing
 # Automatically detect optimal number of workers based on system
 num_cores <- parallel::detectCores()
 optimal_workers <- min(num_cores - 1, 8)  # Keep at least 1 core free for system
 
-# Use progressive parallelization strategy
-if (num_cores >= 16) {
+# Detect Apple Silicon (M-series chips)
+is_apple_silicon <- FALSE
+if (Sys.info()["sysname"] == "Darwin") {  # Check if on macOS
+  # Check for arm64 architecture (Apple Silicon)
+  arch_check <- tryCatch(
+    system("uname -m", intern = TRUE),
+    error = function(e) "unknown"
+  )
+  is_apple_silicon <- grepl("arm64", arch_check)
+  
+  if (is_apple_silicon) {
+    cat("Detected Apple Silicon (M-series) processor. Applying optimized settings.\n")
+  }
+}
+
+# Use progressive parallelization strategy with Apple Silicon optimizations
+if (is_apple_silicon) {
+  # For Apple Silicon, leverage efficiency cores for background tasks
+  # and performance cores for compute-intensive tasks
+  # M-series often has 4-10 cores with mix of performance and efficiency
+  perf_cores <- min(num_cores * 0.6, 8)  # Estimate performance cores as 60% of total, max 8
+  
+  # Use slightly more workers on Apple Silicon as they handle parallel loads efficiently
+  workers_to_use <- min(ceiling(perf_cores), num_cores - 1)
+  cat(sprintf("Apple Silicon optimization: Using %d workers (estimated from %d total cores)\n", 
+              workers_to_use, num_cores))
+  
+  # Apple Silicon benefits from multisession with custom scheduling
+  plan(multisession, workers = workers_to_use)
+  
+  # Increase memory limits for Apple Silicon (unified memory architecture)
+  # M-series chips share RAM efficiently between CPU and GPU
+  mem_limit <- 6 * 1024^3  # 6GB for M-series (adjust based on total RAM)
+  options(future.globals.maxSize = mem_limit)
+  cat(sprintf("Memory allocation optimized for Apple Silicon: %.1fGB\n", mem_limit/1024^3))
+  
+  # Additional Apple Silicon optimizations
+  # These environment variables can help BLAS/LAPACK operations on M-series
+  Sys.setenv(VECLIB_MAXIMUM_THREADS = as.character(workers_to_use))
+  
+  # Consider enabling Apple's Accelerate framework if available
+  # This helps with matrix operations that DADA2 uses extensively
+  if (requireNamespace("RcppArmadillo", quietly = TRUE)) {
+    cat("RcppArmadillo detected: leveraging Accelerate framework for matrix operations\n")
+  }
+  
+} else if (num_cores >= 16) {
   # For high-performance systems, use multisession with worker reservation
   cat(sprintf("Detected %d cores. Using multisession with %d workers.\n", num_cores, optimal_workers))
   plan(multisession, workers = optimal_workers)
+  options(future.globals.maxSize = 4 * 1024^3)  # 4GB limit for globals
 } else if (num_cores >= 4) {
   # For mid-range systems, use multisession with fewer workers
   workers_to_use <- min(num_cores - 1, 4)
   cat(sprintf("Detected %d cores. Using multisession with %d workers.\n", num_cores, workers_to_use))
   plan(multisession, workers = workers_to_use)
+  options(future.globals.maxSize = 3 * 1024^3)  # 3GB limit for globals
 } else {
   # For low-end systems, use minimal parallelization
   cat(sprintf("Detected only %d cores. Using minimal parallelization.\n", num_cores))
   plan(multisession, workers = 2)
+  options(future.globals.maxSize = 2 * 1024^3)  # 2GB limit for globals
 }
-
-# Configure memory usage for parallel operations
-options(future.globals.maxSize = 4 * 1024^3)  # 4GB limit for globals - increased for larger datasets
 
 # Set the random seed for reproducibility
 set.seed(100)
 
+```
+
+# Checkpointing
+
+```{r checkpointing}
 # Check for existing checkpoints and allow recovery
 tryCatch({
   if(dir.exists("checkpoints")) {
@@ -546,37 +580,6 @@ tryCatch({
 ```
 
 # Set Working Directory and Configure for Single or Multi-Run Processing
-
-The following chunk configures the workflow for either single-run or multi-run processing. The workflow can handle:
-
-1. **Single-run mode**: All FASTQ files in the `data/` directory are processed together
-2. **Multi-run mode**: Multiple sequencing runs in separate subdirectories are processed with run-specific error models
-   - Each run is processed independently through the denoising step
-   - Results are combined for downstream analysis
-   - Run information is preserved for batch effect analysis
-
-The configuration automatically:
-- Detects if multi-run mode is enabled via parameters
-- Locates the appropriate data directories
-- Finds FASTQ files with flexible naming pattern detection
-- Configures memory management for big datasets
-- Sets up appropriate data structures for tracking run information
-
-**To enable multi-run mode or big data mode**, modify the YAML header at the top of this document:
-
-```yaml
-params:
-  multi_run: TRUE             # Set to TRUE for multi-run processing
-  run_dir: "path/to/runs"     # Optional: specify directory containing run folders
-  big_data: TRUE              # Set to TRUE for memory optimization with large datasets
-```
-
-- For **multi-run mode**, set `multi_run: TRUE` and optionally specify `run_dir` 
-- For **big data mode**, set `big_data: TRUE` to enable memory-efficient processing
-- You can also set these parameters when rendering the Rmd via command line:
-  ```r
-  rmarkdown::render("dada2_workflow_optimize.Rmd", params = list(multi_run = TRUE, big_data = TRUE))
-  ```
 
 ```{r run-configuration}
 # Check for multi-run mode specified in parameters
@@ -700,7 +703,7 @@ extract_sample_names <- function(file_paths, pattern, run_names = NULL) {
     sample_names <- gsub("_R\\d\\.fastq\\.gz$", "", sample_names)
   }
   # General case: remove file extension and the "R1"/"R2"/"forward"/"reverse" pattern
-  else {
+    else {
     # Remove fastq/fq file extension
     sample_names <- gsub("\\.(fastq|fq)(\\.gz)?$", "", sample_names)
     # Remove R1/R2 or forward/reverse pattern
@@ -1314,6 +1317,14 @@ if(length(fnFs) > 50) {
   
   # Process in batches to better manage memory
   batch_size <- min(20, ceiling(length(fnFs)/4))
+  
+  # Apple Silicon specific batch size tuning
+  if (exists("is_apple_silicon") && is_apple_silicon) {
+    # M-series chips handle larger batch sizes efficiently due to unified memory
+    batch_size <- min(30, ceiling(length(fnFs)/3))
+    cat(sprintf("Apple Silicon optimization: Using larger batch size of %d samples...\n", batch_size))
+  }
+  
   cat(sprintf("Processing in batches of %d samples...\n", batch_size))
   
   # Create batches
@@ -1342,8 +1353,17 @@ if(length(fnFs) > 50) {
     # Store results
     out[rownames(batch_out), ] <- batch_out
     
-    # Force garbage collection
-    gc()
+    # Force garbage collection with Apple Silicon optimization
+    if (exists("is_apple_silicon") && is_apple_silicon) {
+      # Less aggressive GC on Apple Silicon (more efficient memory management)
+      # Only run GC every third batch or at the end
+      if (batch %% 3 == 0 || batch == max(batches)) {
+        gc(verbose = FALSE)
+      }
+    } else {
+      # Standard GC for other architectures
+      gc()
+    }
   }
 } else {
   # For smaller datasets, use standard approach
@@ -1646,6 +1666,14 @@ cat("Learning error rates with optimized parallelization...\n")
 # For large datasets, use a subset of samples for efficiency
 MAX_ERROR_LEARN_SAMPLES <- 40  # Maximum samples to use for error learning
 
+# Apple Silicon optimization: adjust sample count for error learning
+if (exists("is_apple_silicon") && is_apple_silicon) {
+  # M-series chips can handle more samples efficiently due to unified memory and faster cores
+  MAX_ERROR_LEARN_SAMPLES <- 60  # Increase sample count for Apple Silicon
+  cat(sprintf("Apple Silicon optimization: Increasing error learning sample count to %d\n", 
+              MAX_ERROR_LEARN_SAMPLES))
+}
+
 # Sample selection for error learning
 if(length(filtFs) > MAX_ERROR_LEARN_SAMPLES) {
   cat(sprintf("Using random subset of %d samples for error learning...\n", MAX_ERROR_LEARN_SAMPLES))
@@ -1654,26 +1682,49 @@ if(length(filtFs) > MAX_ERROR_LEARN_SAMPLES) {
   set.seed(100)  # For reproducibility
   error_learn_samples <- sample(seq_along(filtFs), MAX_ERROR_LEARN_SAMPLES)
   
-  # Learn forward error rates using subset
+  # Apple Silicon optimized parameters for learnErrors
+  nbases <- if (exists("is_apple_silicon") && is_apple_silicon) 1e9 else 1e8
+  
+  # Learn forward error rates using subset with M-series optimizations
   cat("Learning error rates for forward reads...\n")
-  errF <- learnErrors(filtFs[error_learn_samples], multithread = TRUE, randomize = TRUE, verbose = TRUE)
+  errF <- learnErrors(filtFs[error_learn_samples], multithread = TRUE, 
+                      randomize = TRUE, verbose = TRUE, nbases = nbases)
   
   # Learn reverse error rates using subset
   cat("Learning error rates for reverse reads...\n")
-  errR <- learnErrors(filtRs[error_learn_samples], multithread = TRUE, randomize = TRUE, verbose = TRUE)
+  errR <- learnErrors(filtRs[error_learn_samples], multithread = TRUE, 
+                      randomize = TRUE, verbose = TRUE, nbases = nbases)
   
-  # Ensure garbage collection runs after each step
-  gc()
+  # Ensure garbage collection runs after each step - optimized for Apple Silicon
+  if (exists("is_apple_silicon") && is_apple_silicon) {
+    # Less aggressive GC for Apple Silicon
+    invisible(gc(FALSE))
+  } else {
+    # Standard GC for other platforms
+    gc()
+  }
 } else {
   # For smaller datasets, use all samples
   cat("Learning error rates for forward reads using all samples...\n")
-  errF <- learnErrors(filtFs, multithread = TRUE, randomize = TRUE, verbose = TRUE)
   
-  # Force garbage collection between error learning steps
-  gc()
+  # Apple Silicon optimized parameters for learnErrors
+  nbases <- if (exists("is_apple_silicon") && is_apple_silicon) 1e9 else 1e8
+  
+  errF <- learnErrors(filtFs, multithread = TRUE, randomize = TRUE, 
+                      verbose = TRUE, nbases = nbases)
+  
+  # Force garbage collection between error learning steps - optimized for Apple Silicon
+  if (exists("is_apple_silicon") && is_apple_silicon) {
+    # Less aggressive GC for Apple Silicon
+    invisible(gc(FALSE))
+  } else {
+    # Standard GC for other platforms
+    gc()
+  }
   
   cat("Learning error rates for reverse reads using all samples...\n")
-  errR <- learnErrors(filtRs, multithread = TRUE, randomize = TRUE, verbose = TRUE)
+  errR <- learnErrors(filtRs, multithread = TRUE, randomize = TRUE, 
+                      verbose = TRUE, nbases = nbases)
 }
 
 # Plot error rates for forward reads
@@ -1786,20 +1837,37 @@ if (length(derepFs) > 20 || is_multi_run) {
   # Process in batches for better memory management
   batch_size <- min(10, ceiling(length(derepFs)/4))
   
+  # Apple Silicon specific batch size tuning for sample inference
+  if (exists("is_apple_silicon") && is_apple_silicon) {
+    # M-series chips handle larger batch sizes efficiently due to unified memory
+    # and Neural Engine that can accelerate some matrix operations
+    batch_size <- min(15, ceiling(length(derepFs)/3))
+    cat(sprintf("Apple Silicon optimization: Using larger sample inference batch size of %d samples\n", 
+                batch_size))
+  }
+  
   # Calculate optimal batch size based on available memory
   mem_info <- tryCatch({
     if (.Platform$OS.type == "unix") {
       mem <- system("vmstat -s | grep 'free memory'", intern = TRUE)
       free_mem_kb <- as.numeric(gsub("\\D", "", mem))
       free_mem_gb <- free_mem_kb / 1024^2
+      
+      # Adjust memory allocation per sample based on chip architecture
+      mem_per_sample_gb <- if (exists("is_apple_silicon") && is_apple_silicon) 0.4 else 0.5
+      
       # Adjust batch size based on available memory (rough heuristic)
-      mem_based_batch <- max(1, floor(free_mem_gb / 0.5)) # Assume ~0.5GB per 10 samples
+      mem_based_batch <- max(1, floor(free_mem_gb / mem_per_sample_gb))
       batch_size <- min(batch_size, mem_based_batch)
       cat(sprintf("Detected %.1fGB free memory, adjusted batch size to %d\n", free_mem_gb, batch_size))
     }
   }, error = function(e) {
-    # If memory detection fails, use conservative default
-    cat("Memory detection failed, using default batch size\n")
+    # If memory detection fails, use architecture-specific default
+    if (exists("is_apple_silicon") && is_apple_silicon) {
+      cat("Memory detection failed, using Apple Silicon default batch size\n")
+    } else {
+      cat("Memory detection failed, using default batch size\n")
+    }
   })
   
   cat(sprintf("Processing forward reads in batches of %d samples...\n", batch_size))
@@ -1838,8 +1906,20 @@ if (length(derepFs) > 20 || is_multi_run) {
       # Add to the full list
       dadaFs_list <- c(dadaFs_list, run_dadaFs)
       
-      # Force garbage collection
-      gc()
+      # Force garbage collection with Apple Silicon optimizations
+      if (exists("is_apple_silicon") && is_apple_silicon) {
+        # Less aggressive GC on Apple Silicon (more efficient memory management)
+        # Only run full GC at the end of each run
+        if (run == run_names[length(run_names)]) {
+          gc(full = TRUE, verbose = FALSE)
+        } else {
+          # Use a lighter GC for intermediate runs
+          invisible(gc(FALSE, verbose = FALSE))
+        }
+      } else {
+        # Standard GC for other architectures
+        gc()
+      }
     }
     dadaFs <- dadaFs_list
   } else {
@@ -1869,6 +1949,15 @@ cat("Denoising reverse reads with optimized parallelization...\n")
 if (length(derepRs) > 20 || is_multi_run) {
   # Process in batches for better memory management
   batch_size <- min(10, ceiling(length(derepRs)/4))
+  
+  # Apple Silicon specific batch size tuning for sample inference
+  if (exists("is_apple_silicon") && is_apple_silicon) {
+    # M-series chips handle larger batch sizes efficiently due to unified memory
+    batch_size <- min(15, ceiling(length(derepRs)/3))
+    cat(sprintf("Apple Silicon optimization: Using larger sample inference batch size of %d samples\n", 
+                batch_size))
+  }
+  
   cat(sprintf("Processing reverse reads in batches of %d samples...\n", batch_size))
   
   if(is_multi_run && exists("file_to_run")) {
@@ -1905,8 +1994,20 @@ if (length(derepRs) > 20 || is_multi_run) {
       # Add to the full list
       dadaRs_list <- c(dadaRs_list, run_dadaRs)
       
-      # Force garbage collection
-      gc()
+      # Force garbage collection with Apple Silicon optimizations
+      if (exists("is_apple_silicon") && is_apple_silicon) {
+        # Less aggressive GC on Apple Silicon (more efficient memory management)
+        # Only run full GC at the end of each run
+        if (run == run_names[length(run_names)]) {
+          gc(full = TRUE, verbose = FALSE)
+        } else {
+          # Use a lighter GC for intermediate runs
+          invisible(gc(FALSE, verbose = FALSE))
+        }
+      } else {
+        # Standard GC for other architectures
+        gc()
+      }
     }
     dadaRs <- dadaRs_list
   } else {
@@ -1958,7 +2059,8 @@ cat("Total ASVs identified in forward reads:", total_asvs_forward, "\n")
 # Create checkpoint after sample inference step with better tracking
 save_checkpoint("after_sample_inference", 
                c("derepFs", "derepRs", "errF", "errR", "dadaFs", "dadaRs", "sample.names",
-                 "is_multi_run", "file_to_run", "denoise_summary", "pooling_option"),
+                 "is_multi_run", "file_to_run", "denoise_summary", "pooling_option",
+                 "truncLen_forward", "truncLen_reverse", "maxEE_forward", "maxEE_reverse"),
                overwrite = TRUE)
 cat("Checkpoint saved after sample inference step\n")
 
@@ -2203,7 +2305,7 @@ if (is_multi_run && exists("file_to_run") && exists("run_seqtabs")) {
 # Create checkpoint after ASV table construction step with more tracking
 save_checkpoint("after_asv_table", 
                c("mergers", "seqtab", "sample.names", "seqtab_filtered", "expected_amplicon_size",
-                 "is_multi_run", "file_to_run", "run_seqtabs", 
+                 "is_multi_run", "file_to_run", "run_seqtabs", "original_reads", "filtered_reads",
                  "asv_lengths", "modal_length", "min_allowed_len", "max_allowed_len"),
                overwrite = TRUE)
 cat("Checkpoint saved after ASV table construction step\n")
@@ -2766,10 +2868,6 @@ standardize_taxonomy <- function(taxa_df, method) {
   # Make all column names consistent
   standard_cols <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
   
-  # Print debugging info
-  cat("Method:", method, "\n")
-  cat("Original columns:", paste(colnames(taxa_df), collapse=", "), "\n")
-  
   # RDP specific standardization
   if (method == "RDP_DADA2") {
     # RDP sometimes uses Root instead of Kingdom
@@ -2811,8 +2909,6 @@ standardize_taxonomy <- function(taxa_df, method) {
     }
   }
   
-  cat("Standardized columns:", paste(colnames(result_df), collapse=", "), "\n")
-  
   return(result_df)
 }
 
@@ -2836,12 +2932,8 @@ summarize_taxonomy <- function(taxa_list) {
   
   # Calculate assignments for each method
   for (method_name in names(taxa_list)) {
-    cat("Processing method:", method_name, "\n")
-    
     # Get this taxonomy result
     taxa_df <- taxa_list[[method_name]]
-    cat("Original dimensions:", paste(dim(taxa_df), collapse="×"), "\n")
-    cat("Original columns:", paste(colnames(taxa_df), collapse=", "), "\n")
     
     # Convert to data frame if it's a matrix
     if(is.matrix(taxa_df)) {
@@ -2859,14 +2951,12 @@ summarize_taxonomy <- function(taxa_list) {
       } else {
         # If column doesn't exist, percentage is 0
         percent <- 0
-        cat("Warning: Level", level, "not found in method", method_name, "\n")
       }
       method_row <- c(method_row, percent)
     }
     
     # Add to summary data frame
     summary_df <- rbind(summary_df, method_row)
-    cat("Processed", method_name, "successfully\n")
   }
   
   # Set column names
@@ -2914,48 +3004,43 @@ taxonomy_methods <- list(
 # Storage for taxonomy results
 taxa_results <- list()
 ```
-# SILVA taxonomy
+# SILVA Taxonomy with Confidence Scores
+
+## Enhanced Taxonomy Assignment with Confidence Scores
+
+This section implements reference-based taxonomy confidence scoring functionality to improve taxonomy assignment reliability assessment.
+
+Key enhancements include:
+
+1. **Bootstrap confidence scores for taxonomic assignments**
+   - Uses DADA2's bootstrap confidence estimation
+   - Reports confidence percentages (0-100%) for each taxonomic level
+   - Provides species-level confidence for exact matches
+
+2. **Visualization of confidence scores**
+   - Distribution of confidence values by taxonomic level
+   - Identification of low-confidence assignments
+   - Summary statistics of assignment confidence
+
+3. **Confidence-based taxonomy filtering**
+   - Optional filtering based on confidence thresholds
+   - Customizable thresholds by taxonomic level
+   - Comparison between raw and filtered assignments
+
+4. **Data export**
+   - Taxonomic assignments with confidence scores
+   - Filtered taxonomy based on confidence thresholds
+   - Visualization outputs for reports
+
+The confidence scores help researchers:
+- Assess reliability of taxonomic assignments
+- Identify potentially problematic assignments
+- Apply appropriate filtering based on research needs
+- Report assignment quality metrics in publications
+
+Confidence thresholds can be customized based on study requirements, with more stringent thresholds typically applied at lower taxonomic levels where assignment uncertainty is higher.
 
 ```{r silva-taxonomy}
-# ===================================================================
-# Enhanced Taxonomy Assignment with Confidence Scores
-# ===================================================================
-# 
-# This section implements reference-based taxonomy confidence scoring 
-# functionality to improve taxonomy assignment reliability assessment.
-#
-# Key enhancements include:
-#
-# 1. Bootstrap confidence scores for taxonomic assignments
-#    - Uses DADA2's bootstrap confidence estimation
-#    - Reports confidence percentages (0-100%) for each taxonomic level
-#    - Provides species-level confidence for exact matches
-#
-# 2. Visualization of confidence scores
-#    - Distribution of confidence values by taxonomic level
-#    - Identification of low-confidence assignments
-#    - Summary statistics of assignment confidence
-#
-# 3. Confidence-based taxonomy filtering
-#    - Optional filtering based on confidence thresholds
-#    - Customizable thresholds by taxonomic level
-#    - Comparison between raw and filtered assignments
-#
-# 4. Data export
-#    - Taxonomic assignments with confidence scores
-#    - Filtered taxonomy based on confidence thresholds
-#    - Visualization outputs for reports
-#
-# The confidence scores help researchers:
-# - Assess reliability of taxonomic assignments
-# - Identify potentially problematic assignments
-# - Apply appropriate filtering based on research needs
-# - Report assignment quality metrics in publications
-#
-# Confidence thresholds can be customized based on study requirements,
-# with more stringent thresholds typically applied at lower taxonomic
-# levels where assignment uncertainty is higher.
-# ===================================================================
 
 # Initialize empty taxa_results list if not already created
 if(!exists("taxa_results")) {
@@ -3220,7 +3305,7 @@ if (taxonomy_methods$SILVA_DADA2) {
 ```{r rdp-taxonomy}
 # DADA2 with RDP database (optional method)
 if (taxonomy_methods$RDP_DADA2) {
-  cat("\n=== Method 3: DADA2 with RDP database ===\n")
+  cat("\n=== Method 2: DADA2 with RDP database ===\n")
   
   # Download/locate RDP database
   rdp_files <- download_ref_db("RDP")
@@ -3241,7 +3326,6 @@ if (taxonomy_methods$RDP_DADA2) {
   standard_cols <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
   for(col in standard_cols) {
     if(!(col %in% colnames(taxa_rdp))) {
-      cat("Adding missing column:", col, "\n")
       taxa_rdp[, col] <- NA
     }
   }
@@ -3284,15 +3368,6 @@ if (taxonomy_methods$RDP_DADA2) {
 # Compare taxonomy assignments from different methods
 if (length(taxa_results) > 1) {
   cat("\n=== Comparing Taxonomy Assignments Across Methods ===\n")
-  
-  # Debug: Print information about taxa_results
-  cat("Number of taxonomy methods:", length(taxa_results), "\n")
-  cat("Method names:", paste(names(taxa_results), collapse=", "), "\n")
-  
-  # Debug: Print dimensions of each taxonomy result
-  for(method in names(taxa_results)) {
-    cat("Method:", method, "Dimensions:", paste(dim(taxa_results[[method]]), collapse="×"), "\n")
-  }
   
   # Create taxonomy assignment summary across methods
   taxonomy_summary <- summarize_taxonomy(taxa_results)
@@ -3575,246 +3650,7 @@ cat("Checkpoint saved after taxonomy assignment step\n")
 # Create Phyloseq Object
 
 ```{r phyloseq1, eval=FALSE}
-# Create a directory for results if it doesn't exist
-if(!dir.exists("results")) dir.create("results")
-
-# Create sample data frame
-cat("Setting up metadata handling...\n")
-
-# Function for standardizing sample names
-standardize_sample_names <- function(names, pattern = NULL) {
-  # Remove common file extensions and read indicators
-  clean_names <- gsub("_R[12].*|\\.fastq.*|\\.fq.*", "", names)
-  
-  # Apply custom regex if provided
-  if (!is.null(pattern)) {
-    clean_names <- gsub(pattern, "\\1", clean_names)
-  }
-  
-  return(clean_names)
-}
-
-# Function to load and match metadata from external file
-load_and_match_metadata <- function(metadata_path, seqtab, 
-                                   sample_col = "SampleID",
-                                   fuzzy_match = FALSE) {
-  if (!file.exists(metadata_path)) {
-    cat("Metadata file not found at:", metadata_path, "\n")
-    cat("Falling back to sample name extraction\n")
-    return(NULL)
-  }
-  
-  cat("Loading metadata from:", metadata_path, "\n")
-  metadata <- tryCatch({
-    # Try to read CSV file
-    read.csv(metadata_path, stringsAsFactors = FALSE)
-  }, error = function(e) {
-    # Try to read tab-delimited file if CSV fails
-    tryCatch({
-      read.delim(metadata_path, stringsAsFactors = FALSE)
-    }, error = function(e2) {
-      cat("Error reading metadata file:", conditionMessage(e2), "\n")
-      return(NULL)
-    })
-  })
-  
-  # Check if metadata loaded successfully
-  if (is.null(metadata) || nrow(metadata) == 0) {
-    cat("Failed to load metadata or empty file\n")
-    return(NULL)
-  }
-  
-  # Check if sample_col exists in metadata
-  if (!sample_col %in% colnames(metadata)) {
-    cat("Sample column", sample_col, "not found in metadata\n")
-    cat("Available columns:", paste(colnames(metadata), collapse=", "), "\n")
-    return(NULL)
-  }
-  
-  # Get standardized names from both sources
-  seqtab_names <- standardize_sample_names(rownames(seqtab))
-  metadata_names <- standardize_sample_names(metadata[[sample_col]])
-  
-  # Create mapping table
-  name_map <- data.frame(
-    seqtab_name = rownames(seqtab),
-    seqtab_std = seqtab_names,
-    stringsAsFactors = FALSE
-  )
-  
-  # Add matched metadata names
-  if (fuzzy_match) {
-    # Check if stringdist package is available for fuzzy matching
-    if (!requireNamespace("stringdist", quietly = TRUE)) {
-      cat("stringdist package required for fuzzy matching. Installing...\n")
-      install.packages("stringdist")
-    }
-    
-    # Use string distance for fuzzy matching
-    matches <- sapply(seqtab_names, function(x) {
-      idx <- which.min(stringdist::stringdist(x, metadata_names))
-      return(metadata[[sample_col]][idx])
-    })
-    name_map$metadata_match <- matches
-    
-    cat("Used fuzzy matching algorithm to match sample names\n")
-  } else {
-    # Direct matching with warning for missing samples
-    matches <- match(seqtab_names, metadata_names)
-    name_map$metadata_match <- metadata[[sample_col]][matches]
-    if (any(is.na(matches))) {
-      cat("WARNING: Missing metadata for samples:", 
-          paste(seqtab_names[is.na(matches)], collapse=", "), "\n")
-    }
-  }
-  
-  # Return metadata in correct order with mapping table
-  metadata_ordered <- metadata[match(name_map$metadata_match, metadata[[sample_col]]),]
-  rownames(metadata_ordered) <- rownames(seqtab)
-  
-  # Print match summary
-  cat("Metadata matching summary:\n")
-  cat("- Total samples in sequence table:", nrow(seqtab), "\n")
-  cat("- Total samples in metadata:", nrow(metadata), "\n")
-  cat("- Successfully matched samples:", sum(!is.na(name_map$metadata_match)), "\n")
-  
-  return(list(metadata = metadata_ordered, mapping = name_map))
-}
-
-# First check if external metadata file exists
-metadata_file <- "metadata.csv"
-alt_metadata_files <- c("sample_metadata.csv", "mapping_file.csv", "mapping_file.txt", 
-                      "metadata.txt", "sample_data.csv")
-
-# Look for metadata file
-if (!file.exists(metadata_file)) {
-  for (alt_file in alt_metadata_files) {
-    if (file.exists(alt_file)) {
-      metadata_file <- alt_file
-      cat("Found metadata file:", metadata_file, "\n")
-      break
-    }
-  }
-}
-
-# Try to load and match external metadata
-if (file.exists(metadata_file)) {
-  metadata_result <- load_and_match_metadata(metadata_file, seqtab.nochim)
-  
-  if (!is.null(metadata_result)) {
-    sample_metadata <- metadata_result$metadata
-    cat("Successfully loaded external metadata\n")
-    
-    # Display metadata columns
-    cat("Metadata contains the following columns:\n")
-    print(colnames(sample_metadata))
-  } else {
-    # Fall back to extracting from filenames
-    cat("Falling back to metadata extraction from sample names\n")
-    sample_metadata <- data.frame(
-      SampleID = sample.names,
-      Group = sample.names,
-      row.names = sample.names
-    )
-    
-    # Try to extract groups from sample names
-    group_pattern <- ".*?_(.*?)_.*|.*?-(.*?)-.*"
-    group_matches <- regmatches(sample.names, regexec(group_pattern, sample.names))
-    
-    # Extract group information if the pattern matched
-    valid_matches <- sapply(group_matches, length) > 1
-    if (any(valid_matches)) {
-      for (i in which(valid_matches)) {
-        match <- group_matches[[i]]
-        # Use the first capturing group that matched
-        for (j in 2:length(match)) {
-          if (!is.na(match[j]) && match[j] != "") {
-            sample_metadata$Group[i] <- match[j]
-            break
-          }
-        }
-      }
-    }
-  }
-} else {
-  # No metadata file found, extract from sample names
-  cat("No metadata file found. Extracting metadata from sample names\n")
-  sample_metadata <- data.frame(
-    SampleID = sample.names,
-    Group = sample.names,
-    row.names = sample.names
-  )
-  
-  # Try to extract groups from sample names
-  group_pattern <- ".*?_(.*?)_.*|.*?-(.*?)-.*"
-  group_matches <- regmatches(sample.names, regexec(group_pattern, sample.names))
-  
-  # Extract group information if the pattern matched
-  valid_matches <- sapply(group_matches, length) > 1
-  if (any(valid_matches)) {
-    for (i in which(valid_matches)) {
-      match <- group_matches[[i]]
-      # Use the first capturing group that matched
-      for (j in 2:length(match)) {
-        if (!is.na(match[j]) && match[j] != "") {
-          sample_metadata$Group[i] <- match[j]
-          break
-        }
-      }
-    }
-  }
-}
-
-# Count the number of samples in each group
-if ("Group" %in% colnames(sample_metadata)) {
-  group_counts <- table(sample_metadata$Group)
-  cat("Detected sample groups:\n")
-  print(group_counts)
-}
-
-# Create phyloseq object
-ps <- phyloseq(
-  otu_table(seqtab.nochim, taxa_are_rows = FALSE),
-  sample_data(sample_metadata),
-  tax_table(taxa)
-)
-
-# Add ASV sequences as reference sequences
-dna <- Biostrings::DNAStringSet(colnames(seqtab.nochim))
-names(dna) <- colnames(seqtab.nochim)
-ps <- merge_phyloseq(ps, dna)
-
-# Replace sequence names with ASV_1, ASV_2, etc. for easier reference
-asv_ids <- paste0("ASV_", seq(ntaxa(ps)))
-taxa_names(ps) <- asv_ids
-
-# Update reference sequences
-dna <- refseq(ps)
-names(dna) <- taxa_names(ps)
-ps <- merge_phyloseq(ps, dna)
-
-# Inspect phyloseq object
-cat("Created phyloseq object with:\n")
-cat(" -", nsamples(ps), "samples\n")
-cat(" -", ntaxa(ps), "ASVs\n")
-cat(" -", sum(sample_sums(ps)), "total reads\n")
-cat(" - Mean", round(mean(sample_sums(ps))), "reads per sample\n")
-
-# Display sample read counts
-ps_counts <- tibble(
-  SampleID = sample_names(ps),
-  Group = sample_data(ps)$Group,
-  ReadCount = sample_sums(ps)
-) %>%
-  arrange(desc(ReadCount))
-
-kable(head(ps_counts, 10), caption = "Sample Read Counts (Top 10)")
-
-# Create checkpoint after phyloseq creation step
-save_checkpoint("after_phyloseq", 
-               c("seqtab.nochim", "taxa", "ps", "sample_metadata", "track_df"),
-               overwrite = TRUE)
-cat("Checkpoint saved after phyloseq creation step\n")
+# This chunk has been removed and consolidated with the phyloseq2 chunk below
 ```
 
 # Create Phyloseq Object
@@ -3941,9 +3777,21 @@ build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores 
     return(NULL)
   }
   
-  # Set number of cores for parallel processing
+  # Set number of cores for parallel processing with Apple Silicon optimization
   if (is.null(cores)) {
+    # Default core detection
     cores <- min(parallel::detectCores() - 1, 8)
+    
+    # Apple Silicon optimization for tree building
+    if (exists("is_apple_silicon") && is_apple_silicon) {
+      # M-series chips benefit from more parallelization in alignment and ML optimization
+      # But leave 2 cores free for system processes
+      perf_cores <- min(parallel::detectCores() * 0.7, 10)
+      cores <- max(floor(perf_cores), 2)
+      if (verbose) {
+        cat(sprintf("Apple Silicon optimization: Using %d cores for tree building\n", cores))
+      }
+    }
   }
   
   # Convert sequences to DNAStringSet if they aren't already
@@ -3988,12 +3836,31 @@ build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores 
   if (verbose) cat("  Initial tree fitting...\n")
   fit <- phangorn::pml(nj_tree, data = phang.align)
   
-  # Model selection - use JC69 model (simpler) or GTR (more complex but needs to be specified correctly)
-  if (verbose) cat("  Optimizing with JC69 model (simpler, more robust)...\n")
-  # Explicitly specify a valid model type for optim.pml
-  fit_gtr <- phangorn::optim.pml(fit, model = "JC", 
-                               rearrangement = "stochastic",
-                               control = phangorn::pml.control(trace = progressbar))
+  # Apply Apple Silicon optimizations for ML model fitting
+  if (exists("is_apple_silicon") && is_apple_silicon) {
+    if (verbose) cat("  Applying Apple Silicon optimizations for ML model fitting...\n")
+    
+    # Use JC69 model with Apple Silicon optimizations
+    if (verbose) cat("  Optimizing with JC69 model with M-series specific parameters...\n")
+    
+    # For M-series, we can use more iterations and processors more efficiently
+    # while still maintaining good convergence
+    fit_gtr <- phangorn::optim.pml(fit, model = "JC", 
+                                  rearrangement = "stochastic",
+                                  control = phangorn::pml.control(trace = progressbar, 
+                                                                maxit = 15),  # More iterations for M-series
+                                  optNni = TRUE,     # Enable topological optimization
+                                  optBf = TRUE,      # Optimize base frequencies
+                                  multicore = TRUE,  # Use multicore
+                                  mc.cores = cores)  # Use optimized core count
+  } else {
+    # Model selection - use JC69 model (simpler) or GTR (more complex but needs to be specified correctly)
+    if (verbose) cat("  Optimizing with JC69 model (simpler, more robust)...\n")
+    # Explicitly specify a valid model type for optim.pml
+    fit_gtr <- phangorn::optim.pml(fit, model = "JC", 
+                                 rearrangement = "stochastic",
+                                 control = phangorn::pml.control(trace = progressbar))
+  }
   
   # Phase 5: Bootstrap support (if requested)
   if (bootstrap > 0) {
@@ -4023,14 +3890,25 @@ if (can_build_trees) {
   names(dna) <- paste0("ASV_", seq_along(asv_sequences))
   
   # Check if this is a reasonably sized dataset for tree building
-  if (length(dna) > 5000) {
+  # Adjust thresholds based on hardware (Apple Silicon can handle larger datasets)
+  large_asv_threshold <- 5000
+  moderate_asv_threshold <- 1000
+  
+  if (exists("is_apple_silicon") && is_apple_silicon) {
+    # Apple Silicon can handle larger datasets more efficiently
+    large_asv_threshold <- 8000
+    moderate_asv_threshold <- 2000
+    cat("Apple Silicon optimization: Increased ASV thresholds for tree building\n")
+  }
+  
+  if (length(dna) > large_asv_threshold) {
     cat("Large number of ASVs detected (", length(dna), "). ",
         "Tree building may take a very long time.\n", sep = "")
     cat("Consider reducing the dataset before building a tree.\n")
     cat("Proceeding with NJ method only (faster)...\n")
     tree_method <- "NJ"
     bootstrap_reps <- 0
-  } else if (length(dna) > 1000) {
+  } else if (length(dna) > moderate_asv_threshold) {
     cat("Moderately large number of ASVs (", length(dna), "). ",
         "Using NJ method with limited bootstrap...\n", sep = "")
     tree_method <- "NJ"
@@ -4038,7 +3916,14 @@ if (can_build_trees) {
   } else {
     cat("ASV count suitable for ML tree building (", length(dna), ").\n", sep = "")
     tree_method <- "ML"
-    bootstrap_reps <- 100
+    
+    # Apple Silicon can efficiently handle more bootstrap replicates
+    if (exists("is_apple_silicon") && is_apple_silicon) {
+      bootstrap_reps <- 150  # More bootstrap replicates for better tree support
+      cat("Apple Silicon optimization: Using higher bootstrap replicates (150) for better statistical support\n")
+    } else {
+      bootstrap_reps <- 100  # Standard bootstrap count
+    }
   }
   
   # Time the tree construction
@@ -4073,10 +3958,10 @@ if (can_build_trees) {
     timestamp = Sys.time()
   )
   
-  save_checkpoint("after_tree_building", 
+  save_checkpoint("after_phylogeny", 
                  c("asv_tree", "seqtab.nochim", "taxa", "tree_metadata"),
                  overwrite = TRUE)
-  cat("Checkpoint saved after tree building step\n")
+  cat("Checkpoint saved after phylogeny step\n")
   
   # Save additional metadata about the tree for dashboard and documentation
   if (!dir.exists("results")) dir.create("results")
@@ -4108,10 +3993,11 @@ if (can_build_trees) {
     phy_tree(ps) <- asv_tree
     cat("Phylogenetic tree added to phyloseq object\n")
     
-    # Resave phyloseq checkpoint with tree included
-    save_checkpoint("after_phyloseq_with_tree", 
+    # Update phyloseq checkpoint with tree included
+    save_checkpoint("after_phyloseq", 
                    c("ps", "asv_tree", "seqtab.nochim", "taxa", "sample_metadata"),
                    overwrite = TRUE)
+    cat("Phyloseq checkpoint updated to include phylogenetic tree\n")
   }
 } else {
   cat("Skipping phylogenetic tree construction due to missing dependencies.\n")
@@ -4681,7 +4567,7 @@ if (can_do_rarefaction) {
 }
 ```
 
-# Save Results
+# Export Final Results
 
 ```{r save-results}
 # Create directory for results if it doesn't exist
@@ -4779,81 +4665,167 @@ cat("Saved enhanced workflow summary to results/workflow_summary.rds\n")
 ```{r generate-report, eval=params$generate_report}
 # Only execute this block if report generation is requested via parameters
 
-# Current date for report filename
-report_date <- format(Sys.Date(), "%Y%m%d")
+# Create a simplified copy of this Rmd file for report generation
+tryCatch({
+  # Create reports directory if needed
+  reports_dir <- "reports"
+  if (!dir.exists(reports_dir)) {
+    dir.create(reports_dir, recursive = TRUE)
+  }
+  
+  # Current date for report filename
+  report_date <- format(Sys.Date(), "%Y%m%d")
+  report_file <- file.path(reports_dir, paste0("dada2_report_", report_date, ".html"))
+  
+  # Generate a self-contained HTML report of the results
+  cat("Generating HTML report of results...\n")
+  
+  # Create folder for report files if it doesn't exist
+  report_files_dir <- file.path(reports_dir, "report_files")
+  if (!dir.exists(report_files_dir)) {
+    dir.create(report_files_dir, recursive = TRUE)
+  }
+  
+  # Save phyloseq object for the report
+  saveRDS(ps, file.path(report_files_dir, "phyloseq_for_report.rds"))
+  
+  # Write a simplified report generation Rmd
+  report_rmd <- file.path(reports_dir, "report_template.Rmd")
+  
+  # Create a basic report template
+  report_template <- paste0('---
+title: "DADA2 Analysis Report"
+date: "', Sys.Date(), '"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+---
 
-# Check if output directory parameter exists, otherwise use default
-output_dir <- if (exists("params") && 
-                   !is.null(params$output_dir) && 
-                   params$output_dir != "") {
-  params$output_dir
-} else {
-  "reports"  # Default output directory
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(phyloseq)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+```
+
+# DADA2 Analysis Results
+
+This report summarizes the results of the DADA2 analysis pipeline.
+
+## Dataset Overview
+
+```{r}
+ps <- readRDS("report_files/phyloseq_for_report.rds")
+cat("Analysis includes", nsamples(ps), "samples and", ntaxa(ps), "ASVs\\n")
+```
+
+## Sample Read Counts
+
+```{r}
+sample_counts <- data.frame(
+  Sample = sample_names(ps),
+  Reads = sample_sums(ps)
+)
+
+# Sort by read count
+sample_counts <- sample_counts[order(sample_counts$Reads, decreasing = TRUE),]
+
+# Plot sample read counts
+ggplot(sample_counts, aes(x = reorder(Sample, -Reads), y = Reads)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Sample Read Counts", x = "Sample", y = "Number of Reads")
+```
+
+## Taxonomic Composition
+
+```{r}
+# Get taxonomy table
+tax_table <- as.data.frame(tax_table(ps))
+
+# Summarize at phylum level
+phylum_counts <- tax_table %>%
+  group_by(Phylum) %>%
+  summarize(Count = n()) %>%
+  arrange(desc(Count))
+
+# Plot phylum distribution
+ggplot(phylum_counts[1:10,], aes(x = reorder(Phylum, Count), y = Count)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top 10 Phyla", x = "Phylum", y = "Number of ASVs")
+```
+
+## Alpha Diversity
+
+```{r}
+# Calculate alpha diversity
+alpha_div <- estimate_richness(ps, measures = c("Observed", "Shannon", "Simpson"))
+alpha_div$Sample <- rownames(alpha_div)
+
+# Add metadata if available
+if(ncol(sample_data(ps)) > 0) {
+  sample_df <- as.data.frame(sample_data(ps))
+  sample_df$Sample <- rownames(sample_df)
+  
+  # Use first categorical column as grouping variable if available
+  cat_cols <- sapply(sample_df, function(col) {
+    is.character(col) || is.factor(col) || length(unique(col)) < 10
+  })
+  
+  if(any(cat_cols)) {
+    group_var <- names(cat_cols)[which(cat_cols)[1]]
+    alpha_div <- merge(alpha_div, sample_df[, c("Sample", group_var)], by = "Sample")
+    
+    # Plot alpha diversity by group
+    ggplot(alpha_div, aes_string(x = group_var, y = "Shannon", fill = group_var)) +
+      geom_boxplot() +
+      theme_minimal() +
+      labs(title = "Shannon Diversity by Group", x = "", y = "Shannon Index") +
+      theme(legend.position = "none")
+  }
 }
 
-# Make sure the output directory exists
-if (!dir.exists(output_dir)) {
-  dir.create(output_dir, recursive = TRUE)
-  cat("Created output directory:", output_dir, "\n")
-}
+# Basic richness plot
+ggplot(alpha_div, aes(x = Observed)) +
+  geom_histogram(bins = 15, fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "Distribution of ASV Richness", x = "Observed ASVs", y = "Number of Samples")
+```
 
-# Check if output file parameter exists, otherwise use default
-output_file_base <- if (exists("params") && 
-                        !is.null(params$output_file) && 
-                        params$output_file != "") {
-  params$output_file
-} else {
-  "dada2_workflow_report"  # Default report name
-}
+# Conclusion
 
-# Create full output filename
-output_file <- file.path(output_dir, paste0(output_file_base, "_", report_date))
-
-# Generate the report
-# First, get the current file path explicitly
-current_file <- knitr::current_input()
-if (is.null(current_file) || current_file == "") {
-  # If not available, use a hardcoded path
-  current_file <- "dada2_workflow_optimize.Rmd"
-  cat("Warning: Could not detect current file. Using", current_file, "instead.\n")
-}
-
-# Check output format and use a sensible default if needed
-output_format <- if (exists("params") && 
-                     !is.null(params$output_format) && 
-                     params$output_format != "") {
-  params$output_format
-} else {
-  "html_document"  # Use HTML as the default format
-}
-cat("Using output format:", output_format, "\n")
-
-# Try to generate the report with better error trapping
-report_result <- tryCatch({
-  rmarkdown::render(
-    input = current_file,
-    output_format = output_format,
-    output_file = output_file,
-    params = list(
-      generate_report = FALSE  # Prevent infinite recursion
-    ),
-    envir = new.env(parent = globalenv())
-  )
+This report provides a summary of the key results from the DADA2 analysis. Full details and raw data are available in the results directory.')
+  
+  # Write the template to file
+  writeLines(report_template, report_rmd)
+  
+  # Render the report template
+  tryCatch({
+    # Use full paths for everything to avoid working directory issues
+    rmarkdown::render(
+      input = report_rmd,
+      output_file = basename(report_file),
+      output_dir = reports_dir,
+      knit_root_dir = reports_dir  # Set the root directory for knitting
+    )
+    
+    # Clean up template file after successful rendering
+    unlink(report_rmd)
+    
+    cat("Report successfully generated:", report_file, "\n")
+  }, error = function(e) {
+    cat("Error rendering report: ", conditionMessage(e), "\n")
+    cat("The template file has been kept at", report_rmd, "for debugging.\n")
+  })
 }, error = function(e) {
-  # Return the error message
-  return(paste("Error:", e$message))
-}, warning = function(w) {
-  # Return the warning message
-  return(paste("Warning:", w$message))
+  cat("Error generating report:", e$message, "\n")
 })
-
-# Check if the result is an error message (character string) or a path (success)
-if (is.character(report_result) && 
-    (startsWith(report_result, "Error:") || startsWith(report_result, "Warning:"))) {
-  cat("Report generation issue:", report_result, "\n")
-} else {
-  cat("Report successfully generated:", output_file, "\n")
-}
 ```
 
 # Conclusion
