@@ -4806,7 +4806,9 @@ report_result <- try({
 }, silent = TRUE)
 
 if(inherits(report_result, "try-error")) {
-  cat("Error generating report:", conditionMessage(report_result), "\n")
+  # Get error message more safely
+  error_msg <- if (is.character(report_result)) report_result else "Unknown error"
+  cat("Error generating report:", error_msg, "\n")
 } else {
   cat("Report successfully generated:", output_file, "\n")
 }
