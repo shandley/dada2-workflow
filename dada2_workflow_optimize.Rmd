@@ -4793,9 +4793,18 @@ output_file <- file.path(params$output_dir,
                          paste0(params$output_file, "_", report_date))
 
 # Generate the report
-report_result <- try({
+# First, get the current file path explicitly
+current_file <- knitr::current_input()
+if (is.null(current_file) || current_file == "") {
+  # If not available, use a hardcoded path
+  current_file <- "dada2_workflow_optimize.Rmd"
+  cat("Warning: Could not detect current file. Using", current_file, "instead.\n")
+}
+
+# Try to generate the report with better error trapping
+report_result <- tryCatch({
   rmarkdown::render(
-    input = knitr::current_input(),  # Use current file as input
+    input = current_file,
     output_format = params$output_format,
     output_file = output_file,
     params = list(
@@ -4803,12 +4812,18 @@ report_result <- try({
     ),
     envir = new.env(parent = globalenv())
   )
-}, silent = TRUE)
+}, error = function(e) {
+  # Return the error message
+  return(paste("Error:", e$message))
+}, warning = function(w) {
+  # Return the warning message
+  return(paste("Warning:", w$message))
+})
 
-if(inherits(report_result, "try-error")) {
-  # Get error message more safely
-  error_msg <- if (is.character(report_result)) report_result else "Unknown error"
-  cat("Error generating report:", error_msg, "\n")
+# Check if the result is an error message (character string) or a path (success)
+if (is.character(report_result) && 
+    (startsWith(report_result, "Error:") || startsWith(report_result, "Warning:"))) {
+  cat("Report generation issue:", report_result, "\n")
 } else {
   cat("Report successfully generated:", output_file, "\n")
 }
