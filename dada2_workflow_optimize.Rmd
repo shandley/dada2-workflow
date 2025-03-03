@@ -4444,9 +4444,12 @@ if (can_do_rarefaction) {
         if (plateau_reached) {
           # Find where the curve first flattens (slope drops below threshold)
           relative_slopes <- slopes / max_richness
-          plateau_idx <- which(relative_slopes < threshold)[1]
-          if (!is.na(plateau_idx)) {
-            plateau_depth <- depths[plateau_idx]
+          # Check if any values meet the condition before accessing the first element
+          if (any(relative_slopes < threshold, na.rm=TRUE)) {
+            plateau_idx <- which(relative_slopes < threshold)[1]
+            if (!is.na(plateau_idx)) {
+              plateau_depth <- depths[plateau_idx]
+            }
           }
         }
         
