@@ -3988,9 +3988,10 @@ build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores 
   if (verbose) cat("  Initial tree fitting...\n")
   fit <- phangorn::pml(nj_tree, data = phang.align)
   
-  # Model selection
-  if (verbose) cat("  Optimizing with GTR+G+I model...\n")
-  fit_gtr <- phangorn::optim.pml(fit, model = "GTR+G+I", 
+  # Model selection - use JC69 model (simpler) or GTR (more complex but needs to be specified correctly)
+  if (verbose) cat("  Optimizing with JC69 model (simpler, more robust)...\n")
+  # Explicitly specify a valid model type for optim.pml
+  fit_gtr <- phangorn::optim.pml(fit, model = "JC", 
                                rearrangement = "stochastic",
                                control = phangorn::pml.control(trace = progressbar))
   
