@@ -4157,124 +4157,79 @@ if (can_do_rarefaction) {
     depths <- seq(1, max_depth, by = step_size)
     depths <- unique(c(depths, max_depth))
     
-    # Calculate rarefaction at each depth for each sample
-    rarefaction_curves <- data.frame(depth = numeric(), 
-                                    richness = numeric(), 
-                                    sample = character(),
+    # Initialize the results data frame
+    rarefaction_curves <- data.frame(depth = numeric(0), 
+                                    richness = numeric(0), 
+                                    sample = character(0),
                                     stringsAsFactors = FALSE)
     
-    # Use parallel processing if available
-    if (exists("parallel_cores") && parallel_cores > 1 && 
-        requireNamespace("future.apply", quietly = TRUE) && 
-        requireNamespace("future", quietly = TRUE)) {
+    # Process samples one by one to avoid dimension mismatches
+    sample_names <- rownames(abundances)
+    
+    cat("Processing", length(sample_names), "samples...\n")
+    
+    for (s in seq_along(sample_names)) {
+      sample_name <- sample_names[s]
+      sample_counts <- abundances[s, ]
+      sample_sum <- sum(sample_counts)
       
-      cat("Using parallel processing for rarefaction curves calculations...\n")
+      # Create vector of depths that are valid for this sample
+      valid_depths <- depths[depths <= sample_sum]
       
-      # Set up future plan for parallel processing
-      previous_plan <- future::plan(future::multisession, workers = parallel_cores)
-      on.exit(future::plan(previous_plan), add = TRUE)
-      
-      # Process in chunks to avoid memory issues
-      chunk_size <- min(10, length(depths))  # Adjust chunk size based on your data
-      depth_chunks <- split(depths, ceiling(seq_along(depths) / chunk_size))
-      
-      for (chunk_idx in seq_along(depth_chunks)) {
-        chunk <- depth_chunks[[chunk_idx]]
-        cat(sprintf("Processing depths chunk %d of %d...\n", chunk_idx, length(depth_chunks)))
-        
-        # Process this chunk in parallel
-        chunk_results <- future.apply::future_lapply(chunk, function(depth) {
-          if(!requireNamespace("vegan", quietly = TRUE)) {
-            return(NULL)  # Skip if vegan not available
-          }
-          
-          # Calculate richness at this depth for each sample
-          # Handle cases where the depth is greater than some samples' total counts
-          valid_samples <- rowSums(abundances) >= depth
-          
-          if (sum(valid_samples) == 0) {
-            # Skip when no samples have enough reads for this depth
-            result_df <- data.frame(
-              depth = numeric(0), 
-              richness = numeric(0), 
-              sample = character(0),
-              stringsAsFactors = FALSE
-            )
-          } else {
-            # Only calculate for samples with sufficient reads
-            valid_abundances <- abundances[valid_samples, , drop = FALSE]
-            valid_sample_names <- rownames(valid_abundances)
-            
-            # Now safely calculate richness only for valid samples
-            richness <- suppressWarnings(vegan::rarefy(valid_abundances, depth))
-            
-            # Create results dataframe directly from valid results
-            result_df <- data.frame(
-              depth = rep(depth, length(richness)),
-              richness = richness,
-              sample = valid_sample_names,
-              stringsAsFactors = FALSE
-            )
-            
-            # Filter any remaining NA values (should be rare with this approach)
-            if (any(is.na(result_df$richness))) {
-              result_df <- result_df[!is.na(result_df$richness), ]
-            }
-          }
-          return(result_df)
-        })
-        
-        # Combine results from this chunk
-        for (result in chunk_results) {
-          if (!is.null(result)) {
-            rarefaction_curves <- rbind(rarefaction_curves, result)
-          }
-        }
-        
-        # Force garbage collection to free memory
-        gc()
+      if (length(valid_depths) == 0) {
+        cat("Skipping sample", sample_name, "with insufficient reads\n")
+        next
       }
-    } else {
-      # Non-parallel processing
-      for (i in seq_along(depths)) {
-        depth <- depths[i]
-        
-        # Handle cases where the depth is greater than some samples' total counts
-        valid_samples <- rowSums(abundances) >= depth
-        
-        if (sum(valid_samples) > 0) {
-          # Only calculate for samples with sufficient reads
-          valid_abundances <- abundances[valid_samples, , drop = FALSE]
-          valid_sample_names <- rownames(valid_abundances)
+      
+      # Process each valid depth for this sample
+      for (depth in valid_depths) {
+        # Use vegan's rarecurve directly on a single sample
+        # This is different from using rarefy on multiple samples
+        tryCatch({
+          # Convert sample to presence/absence
+          sample_pa <- sample_counts > 0
           
-          # Now safely calculate richness only for valid samples
-          richness <- suppressWarnings(vegan::rarefy(valid_abundances, depth))
+          # Count richness at this depth using simple random sampling
+          # Avoid vegan's rarefy function since that's triggering the error
+          n_trials <- 10  # Number of random samples to average
+          richness_vals <- numeric(n_trials)
           
-          # Create a data frame for valid samples
-          depth_data <- data.frame(
-            depth = rep(depth, length(richness)),
+          for (i in 1:n_trials) {
+            # Randomly sample from the abundance vector
+            # This is a simplification of what rarefy does
+            random_sample <- sample(rep(seq_along(sample_counts), sample_counts), 
+                                   size = depth, replace = FALSE)
+            # Count unique taxa
+            richness_vals[i] <- length(unique(random_sample))
+          }
+          
+          # Calculate mean richness across trials
+          richness <- mean(richness_vals)
+          
+          # Add to results
+          sample_result <- data.frame(
+            depth = depth,
             richness = richness,
-            sample = valid_sample_names,
+            sample = sample_name,
             stringsAsFactors = FALSE
           )
           
-          # Filter any NA values (should be rare with this approach)
-          if (any(is.na(depth_data$richness))) {
-            depth_data <- depth_data[!is.na(depth_data$richness), ]
-          }
-          
-          # Only add to master data frame if we have valid results
-          if (nrow(depth_data) > 0) {
-            rarefaction_curves <- rbind(rarefaction_curves, depth_data)
-          }
-        }
-        
-        # Progress indicator
-        if(i %% 10 == 0 || i == length(depths)) {
-          cat(sprintf("Processed %d of %d depths...\n", i, length(depths)))
-        }
+          rarefaction_curves <- rbind(rarefaction_curves, sample_result)
+        }, error = function(e) {
+          cat("Error processing sample", sample_name, "at depth", depth, ":", 
+              conditionMessage(e), "\n")
+        })
+      }
+      
+      # Progress indicator
+      if (s %% 5 == 0 || s == length(sample_names)) {
+        cat(sprintf("Processed %d of %d samples...\n", s, length(sample_names)))
       }
     }
+    
+    # Sort results by sample and depth
+    rarefaction_curves <- rarefaction_curves[order(rarefaction_curves$sample, 
+                                                 rarefaction_curves$depth), ]
     
     # Add sample metadata if available
     if(!is.null(sample_data) && nrow(sample_data) > 0) {
