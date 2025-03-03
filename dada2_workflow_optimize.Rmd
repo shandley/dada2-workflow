@@ -2739,9 +2739,9 @@ download_ref_db <- function(db_name) {
       
       # Try multiple download sources in case one fails
       download_urls <- c(
-        "https://www2.decipher.codes/Classification/TrainingSets/SILVA_SSU_r138_2019.RData",
-        "https://zenodo.org/record/3986799/files/SILVA_SSU_r138_2019.RData",
-        "https://github.com/benjjneb/dada2/files/10403520/SILVA_SSU_r138_2019.RData.gz"
+        "https://github.com/benjjneb/dada2/raw/master/data/silva_nr99_v138.1_train_set.fa.gz",
+        "https://zenodo.org/records/4587955/files/silva_nr99_v138.1_train_set.fa.gz",
+        "https://www2.decipher.codes/Classification/TrainingSets/SILVA_SSU_r138_2019.RData"
       )
       
       download_success <- FALSE
@@ -2801,7 +2801,7 @@ download_ref_db <- function(db_name) {
             # Try to create a basic training set
             # First check if we have the SILVA_SEED_r138.RData file
             seed_file <- file.path("ref_db", "SILVA_SEED_r138.RData")
-            seed_url <- "https://zenodo.org/record/3986799/files/SILVA_SEED_r138.RData"
+            seed_url <- "https://github.com/ANPD-Data/RefData/raw/main/SILVA_SEED_r138.RData"
             
             if (!file.exists(seed_file)) {
               cat("Downloading SILVA SEED alignment file...\n")
@@ -3326,8 +3326,17 @@ if (taxonomy_methods$SILVA_DADA2) {
 if (taxonomy_methods$IDTAXA_SILVA) {
   cat("\n=== Method 2: IDTAXA with SILVA database (with Enhanced Debugging) ===\n")
   
+  # Track if we used IDTAXA or had to fall back to DADA2's assignTaxonomy
+  used_fallback <- FALSE
+  
   # Download/locate SILVA database for IDTAXA
-  idtaxa_files <- download_ref_db("IDTAXA_SILVA")
+  tryCatch({
+    idtaxa_files <- download_ref_db("IDTAXA_SILVA")
+  }, error = function(e) {
+    cat("ERROR with IDTAXA database download:", conditionMessage(e), "\n")
+    cat("Will fall back to standard DADA2 taxonomy assignment instead of IDTAXA\n")
+    used_fallback <- TRUE
+  })
   
   # Load the training set with proper error handling
   cat("Loading IDTAXA training set...\n")
@@ -3418,84 +3427,217 @@ if (taxonomy_methods$IDTAXA_SILVA) {
         stop("DECIPHER package is required but not available")
       }
       
-      # Look for potential raw data to build a training set
-      if (any(c("sequences", "taxonomy", "aln") %in% training_objs)) {
-        cat("Found raw data that might be used to build a training set\n")
+      # Use alternative approach: convert DADA2 SILVA training set for use with IDTAXA
+      cat("Attempting to use DADA2's SILVA training set as fallback...\n")
+      
+      # First check if we can use DADA2's built-in SILVA training set
+      silva_train_dada2 <- system.file("extdata", "silva_nr99_v138.1_train_set.fa.gz", package="dada2")
+      
+      if (file.exists(silva_train_dada2) && nzchar(silva_train_dada2)) {
+        cat("Found DADA2's SILVA training set:", silva_train_dada2, "\n")
+        cat("Converting DADA2's SILVA training set to IDTAXA format...\n")
         
-        # Try to extract sequences and taxonomy
-        sequences <- NULL
-        taxonomy <- NULL
-        
-        # Check various possible combinations
-        if (all(c("sequences", "taxonomy") %in% training_objs)) {
-          sequences <- training_env$sequences
-          taxonomy <- training_env$taxonomy
-        } else if ("aln" %in% training_objs && "taxonomy" %in% training_objs) {
-          sequences <- training_env$aln
-          taxonomy <- training_env$taxonomy
-        }
-        
-        # Try to build training set if we have the necessary components
-        if (!is.null(sequences) && !is.null(taxonomy)) {
-          cat("Attempting to build training set from raw data...\n")
-          tryCatch({
-            trainingSet <- DECIPHER::LearnTaxa(sequences, taxonomy)
-            cat("Successfully built new training set!\n")
-            
-            # Save for future use
-            save(trainingSet, file=idtaxa_files$train)
-            cat("Saved rebuilt training set for future use\n")
-          }, error = function(e) {
-            cat("Failed to build training set:", conditionMessage(e), "\n")
-            stop("Cannot proceed: Unable to create valid training set")
+        tryCatch({
+          # Convert DADA2's SILVA training set to IDTAXA format
+          # First need to read in the DADA2 training set
+          dada2_seqs <- Biostrings::readDNAStringSet(silva_train_dada2)
+          
+          # Extract taxonomy from the headers
+          headers <- names(dada2_seqs)
+          taxonomy <- sapply(headers, function(x) {
+            # Format is typically: >AB01234.1.1 Bacteria;Proteobacteria;...
+            tax_string <- strsplit(x, " ", fixed=TRUE)[[1]][2]
+            return(tax_string)
           })
-        } else {
-          stop("Cannot proceed: No valid training set found and couldn't build one")
-        }
+          
+          # Fix names for DECIPHER
+          names(dada2_seqs) <- gsub(" .*", "", names(dada2_seqs))
+          
+          # Make taxonomy suitable for DECIPHER
+          tax_table <- data.frame(
+            Row.names = names(dada2_seqs),
+            Taxonomy = taxonomy
+          )
+          
+          # Train IDTAXA model
+          cat("Training IDTAXA with DADA2's SILVA data (this may take a while)...\n")
+          trainingSet <- DECIPHER::LearnTaxa(dada2_seqs, tax_table$Taxonomy)
+          
+          # Save for future use
+          save(trainingSet, file=idtaxa_files$train)
+          cat("Successfully created and saved new IDTAXA training set!\n")
+        }, error = function(e) {
+          cat("Failed to convert DADA2's SILVA training set:", conditionMessage(e), "\n")
+          
+          # Last resort: skip IDTAXA and use DADA2's assignTaxonomy directly
+          cat("WARNING: IDTAXA classification unavailable. Will fall back to DADA2's assignTaxonomy.\n")
+          
+          # Notify that we'll be skipping IDTAXA
+          taxonomy_methods$IDTAXA_SILVA <- FALSE
+          stop("Cannot create IDTAXA training set - will try DADA2's assignTaxonomy instead")
+        })
       } else {
-        stop("Cannot proceed: No valid training set or raw data found")
+        # Try manually downloading a SILVA fasta file
+        cat("Attempting to download SILVA reference directly...\n")
+        silva_url <- "https://zenodo.org/records/4587955/files/silva_nr99_v138.1_train_set.fa.gz"
+        temp_file <- tempfile(fileext = ".fa.gz")
+        
+        tryCatch({
+          download.file(silva_url, temp_file, mode="wb")
+          
+          # Read sequences
+          cat("Downloaded SILVA reference. Converting to IDTAXA format...\n")
+          dada2_seqs <- Biostrings::readDNAStringSet(temp_file)
+          
+          # Extract taxonomy from headers
+          headers <- names(dada2_seqs)
+          taxonomy <- sapply(headers, function(x) {
+            # Format is typically: >AB01234.1.1 Bacteria;Proteobacteria;...
+            parts <- strsplit(x, " ", fixed=TRUE)[[1]]
+            if (length(parts) > 1) {
+              return(parts[2])
+            } else {
+              return(NA)
+            }
+          })
+          
+          # Filter out NAs
+          valid_idx <- !is.na(taxonomy)
+          dada2_seqs <- dada2_seqs[valid_idx]
+          taxonomy <- taxonomy[valid_idx]
+          
+          # Fix names for DECIPHER
+          names(dada2_seqs) <- gsub(" .*", "", names(dada2_seqs))
+          
+          # Train IDTAXA model
+          cat("Training IDTAXA with downloaded SILVA data (this may take a while)...\n")
+          trainingSet <- DECIPHER::LearnTaxa(dada2_seqs, taxonomy)
+          
+          # Save for future use
+          save(trainingSet, file=idtaxa_files$train)
+          cat("Successfully created and saved new IDTAXA training set!\n")
+        }, error = function(e) {
+          cat("Failed to create training set from downloaded data:", conditionMessage(e), "\n")
+          
+          # Last resort: skip IDTAXA and use DADA2's assignTaxonomy directly
+          cat("WARNING: IDTAXA classification unavailable. Will fall back to DADA2's assignTaxonomy.\n")
+          
+          # Notify that we'll be skipping IDTAXA
+          taxonomy_methods$IDTAXA_SILVA <- FALSE
+          stop("Cannot create IDTAXA training set - will try DADA2's assignTaxonomy instead")
+        })
       }
     }
   }
   
   # Final check to ensure we have a valid training set
   if (!exists("trainingSet") || !inherits(trainingSet, "TrainingSet")) {
-    stop("Cannot proceed: No valid IDTAXA training set available despite attempts to fix the issue")
+    cat("ERROR: No valid IDTAXA training set available despite attempts to fix the issue\n")
+    cat("Falling back to DADA2's assignTaxonomy method instead\n")
+    used_fallback <- TRUE
   }
   
-  # Convert ASV sequences to DNAStringSet
-  dna_seqs <- Biostrings::DNAStringSet(getSequences(seqtab.nochim))
-  names(dna_seqs) <- paste0("ASV", seq_along(dna_seqs))
-  
-  # IDTAXA Configuration - with lower confidence threshold for debugging
-  # Default threshold was 50, lowering to 40 for debugging empty classifications
-  idtaxa_confidence_threshold <- 40  # Lower threshold for debugging
-  cat(sprintf("Using confidence threshold of %d%% for IDTAXA classification (lowered for debugging)\n", 
-              idtaxa_confidence_threshold))
-  
-  # Run IDTAXA classification with optimized parallelization
-  cat("Running IDTAXA classification with optimized parallelization...\n")
-  
-  # Determine optimal number of processors for IDTAXA
-  num_processors <- min(parallel::detectCores() - 1, 8)
-  cat(sprintf("Using %d processors for IDTAXA classification...\n", num_processors))
-  
-  # Debug: Verify sequences are valid for classification
-  cat("Checking sequences for potential issues...\n")
-  seq_lengths <- width(dna_seqs)
-  cat("Sequence length summary - Min:", min(seq_lengths), 
-      "Max:", max(seq_lengths), 
-      "Mean:", round(mean(seq_lengths), 1), "\n")
-  
-  # Check for any degenerate sequences
-  degenerate_bases <- sapply(as.character(dna_seqs), function(s) 
-    sum(stringr::str_count(s, "[^ACGT]")))
-  if (any(degenerate_bases > 0)) {
-    cat("WARNING:", sum(degenerate_bases > 0), "sequences contain degenerate bases.\n")
+  # Use DADA2's assignTaxonomy as a fallback if IDTAXA failed
+  if (used_fallback) {
+    # Skip IDTAXA and use DADA2's assignTaxonomy directly
+    cat("\n=== Using DADA2's assignTaxonomy as fallback ===\n")
+    
+    # First try to load SILVA reference from DADA2 package
+    silva_train <- system.file("extdata", "silva_nr99_v138.1_train_set.fa.gz", package="dada2")
+    silva_species <- system.file("extdata", "silva_species_assignment_v138.1.fa.gz", package="dada2")
+    
+    # Check if file exists within package
+    if (!file.exists(silva_train) || !file.exists(silva_species)) {
+      # Try downloading from online source if not in package
+      cat("SILVA references not found in DADA2 package. Attempting to download...\n")
+      
+      # Set download URLs
+      silva_url_base <- "https://zenodo.org/records/4587955/files/"
+      silva_train_url <- paste0(silva_url_base, "silva_nr99_v138.1_train_set.fa.gz")
+      silva_species_url <- paste0(silva_url_base, "silva_species_assignment_v138.1.fa.gz")
+      
+      # Local file paths
+      silva_train <- file.path("ref_db", "silva_train_set.fa.gz")
+      silva_species <- file.path("ref_db", "silva_species.fa.gz")
+      
+      # Download training set if needed
+      if (!file.exists(silva_train)) {
+        cat("Downloading SILVA taxonomy training file...\n")
+        tryCatch({
+          download.file(silva_train_url, silva_train, method="auto", mode="wb")
+          cat("Download successful!\n")
+        }, error = function(e) {
+          cat("Error downloading SILVA taxonomy file:", conditionMessage(e), "\n")
+          stop("Cannot proceed: Failed to obtain SILVA reference files")
+        })
+      }
+      
+      # Download species file if needed
+      if (!file.exists(silva_species)) {
+        cat("Downloading SILVA species assignment file...\n")
+        tryCatch({
+          download.file(silva_species_url, silva_species, method="auto", mode="wb")
+          cat("Download successful!\n")
+        }, error = function(e) {
+          cat("Error downloading SILVA species file:", conditionMessage(e), "\n")
+          stop("Cannot proceed: Failed to obtain SILVA reference files")
+        })
+      }
+    } else {
+      cat("Using SILVA references from DADA2 package\n")
+    }
+    
+    # Assign taxonomy using DADA2's method (with confidence scores)
+    cat("Assigning taxonomy using DADA2's assignTaxonomy...\n")
+    taxa_result <- assignTaxonomy(seqtab.nochim, silva_train, multithread=TRUE, outputBootstraps=TRUE)
+    
+    # Extract taxonomic assignments and bootstrap confidence values
+    taxa_idtaxa <- taxa_result$tax
+    taxa_idtaxa_confidence <- taxa_result$boot
+    
+    # Add species-level assignments
+    cat("Adding species-level assignments...\n")
+    taxa_idtaxa <- addSpecies(taxa_idtaxa, silva_species, allowMultiple=FALSE, tryRC=TRUE, verbose=TRUE)
+    
+    # Report success
+    cat("Taxonomy assignment completed using DADA2's methods as fallback for IDTAXA\n")
   }
   
-  # Function to test IDTAXA on a small subset first
-  test_idtaxa_classification <- function(seqs, training_set, threshold) {
+  # Only proceed with IDTAXA classification if we didn't use the fallback
+  if (!used_fallback) {
+    # Convert ASV sequences to DNAStringSet
+    dna_seqs <- Biostrings::DNAStringSet(getSequences(seqtab.nochim))
+    names(dna_seqs) <- paste0("ASV", seq_along(dna_seqs))
+    
+    # IDTAXA Configuration - with lower confidence threshold for debugging
+    # Default threshold was 50, lowering to 40 for debugging empty classifications
+    idtaxa_confidence_threshold <- 40  # Lower threshold for debugging
+    cat(sprintf("Using confidence threshold of %d%% for IDTAXA classification (lowered for debugging)\n", 
+                idtaxa_confidence_threshold))
+    
+    # Run IDTAXA classification with optimized parallelization
+    cat("Running IDTAXA classification with optimized parallelization...\n")
+    
+    # Determine optimal number of processors for IDTAXA
+    num_processors <- min(parallel::detectCores() - 1, 8)
+    cat(sprintf("Using %d processors for IDTAXA classification...\n", num_processors))
+  
+    # Debug: Verify sequences are valid for classification
+    cat("Checking sequences for potential issues...\n")
+    seq_lengths <- width(dna_seqs)
+    cat("Sequence length summary - Min:", min(seq_lengths), 
+        "Max:", max(seq_lengths), 
+        "Mean:", round(mean(seq_lengths), 1), "\n")
+    
+    # Check for any degenerate sequences
+    degenerate_bases <- sapply(as.character(dna_seqs), function(s) 
+      sum(stringr::str_count(s, "[^ACGT]")))
+    if (any(degenerate_bases > 0)) {
+      cat("WARNING:", sum(degenerate_bases > 0), "sequences contain degenerate bases.\n")
+    }
+  
+      # Function to test IDTAXA on a small subset first
+    test_idtaxa_classification <- function(seqs, training_set, threshold) {
     # Take a small subset for testing
     test_size <- min(5, length(seqs))
     test_seqs <- seqs[1:test_size]
@@ -3778,6 +3920,7 @@ if (taxonomy_methods$IDTAXA_SILVA) {
     saveRDS(confidence_data, "results/idtaxa_confidence_scores.rds")
     cat("Saved detailed confidence scores to results/idtaxa_confidence_scores.rds\n")
   }
+  } # End of if (!used_fallback) block
   
   # Save to results list
   taxa_results$IDTAXA_SILVA <- taxa_idtaxa
@@ -3812,18 +3955,32 @@ if (taxonomy_methods$IDTAXA_SILVA) {
   idtaxa_summary$TaxonomicLevel <- factor(idtaxa_summary$TaxonomicLevel, 
                                        levels = idtaxa_summary$TaxonomicLevel[order(idtaxa_summary$PercentAssigned, decreasing = TRUE)])
   
+  # Create the plot with appropriate subtitle depending on method used
+  plot_subtitle <- if (used_fallback) {
+    "Using DADA2's assignTaxonomy (IDTAXA fallback)"
+  } else {
+    paste0("Using confidence threshold of ", idtaxa_confidence_threshold, "% (lowered for debugging)")
+  }
+  
   idtaxa_plot <- ggplot(idtaxa_summary, aes(x = TaxonomicLevel, y = PercentAssigned)) +
     geom_bar(stat = "identity", fill = "forestgreen") +
     geom_text(aes(label = paste0(PercentAssigned, "%")), vjust = -0.3) +
     theme_minimal() +
     labs(title = "IDTAXA: Percentage of ASVs with Taxonomic Assignment",
-         subtitle = paste0("Using confidence threshold of ", idtaxa_confidence_threshold, "% (lowered for debugging)"),
+         subtitle = plot_subtitle,
          x = "Taxonomic Level",
          y = "Percent Assigned") +
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
     scale_y_continuous(limits = c(0, max(idtaxa_summary$PercentAssigned) * 1.1))
   
   print(idtaxa_plot)
+  
+  # Save a note about the method used for reference
+  if (used_fallback) {
+    if (!dir.exists("results")) dir.create("results")
+    cat("Used DADA2's assignTaxonomy as fallback due to IDTAXA issues\n", 
+        file="results/taxonomy_method_note.txt")
+  }
 }
 ```
 
