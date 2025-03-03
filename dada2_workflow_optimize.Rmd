@@ -2714,10 +2714,9 @@ download_ref_db <- function(db_name) {
     if (!file.exists(rdp_train) || !file.exists(rdp_species)) {
       cat("Downloading RDP training files...\n")
       
-      # URLs for RDP files
-      rdp_base_url <- "https://zenodo.org/records/4587955/files/"
-      rdp_train_url <- paste0(rdp_base_url, "rdp_train_set_18.fa.gz")
-      rdp_species_url <- paste0(rdp_base_url, "rdp_species_assignment_18.fa.gz")
+      # Updated URLs for RDP files from dada2 website
+      rdp_train_url <- "https://zenodo.org/record/4310151/files/rdp_train_set_18.fa.gz"
+      rdp_species_url <- "https://zenodo.org/record/4310151/files/rdp_species_assignment_18.fa.gz"
       
       # Download training files
       options(timeout = max(300, getOption("timeout")))
@@ -2801,10 +2800,13 @@ summarize_taxonomy <- function(taxa_list) {
   for (method_name in names(taxa_list)) {
     taxa_df <- taxa_list[[method_name]]
     
+    # First ensure standardized taxonomy before calculating percentages
+    std_taxa_df <- standardize_taxonomy(taxa_df, method_name)
+    
     # Calculate percentage assigned at each level
     method_row <- c(method_name)
-    for (level in colnames(taxa_df)[-1]) { # Skip the ASV_ID column
-      percent <- round(sum(!is.na(taxa_df[[level]])) / nrow(taxa_df) * 100, 1)
+    for (level in c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")) {
+      percent <- round(sum(!is.na(std_taxa_df[[level]])) / nrow(std_taxa_df) * 100, 1)
       method_row <- c(method_row, percent)
     }
     
@@ -2857,6 +2859,7 @@ taxonomy_methods <- list(
 # Storage for taxonomy results
 taxa_results <- list()
 ```
+# SILVA taxonomy
 
 ```{r silva-taxonomy}
 # ===================================================================
@@ -3152,7 +3155,7 @@ if (taxonomy_methods$SILVA_DADA2) {
 }
 ```
 
-# This section has been removed to simplify taxonomy assignment
+# RDP taxonomy
 
 ```{r rdp-taxonomy}
 # DADA2 with RDP database (optional method)
