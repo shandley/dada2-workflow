@@ -621,7 +621,13 @@ for (name in names(performance_options)) {
     if (is.logical(value)) {
       value <- ifelse(value, "TRUE", "FALSE")
     }
-    Sys.setenv(paste0("DADA2_", toupper(name)) = value)
+    # Create the environment variable name
+    env_var <- paste0("DADA2_", toupper(name))
+    env_value <- as.character(value)
+    # Set the environment variable directly using a named argument
+    env_args <- list()
+    env_args[[env_var]] <- env_value
+    do.call(Sys.setenv, env_args)
   }
 }
 
@@ -633,7 +639,13 @@ for (name in names(multi_run_options)) {
     if (is.logical(value)) {
       value <- ifelse(value, "TRUE", "FALSE")
     }
-    Sys.setenv(paste0("DADA2_", toupper(name)) = value)
+    # Create the environment variable name
+    env_var <- paste0("DADA2_", toupper(name))
+    env_value <- as.character(value)
+    # Set the environment variable directly using a named argument
+    env_args <- list()
+    env_args[[env_var]] <- env_value
+    do.call(Sys.setenv, env_args)
   }
 }
 

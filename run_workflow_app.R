@@ -339,9 +339,8 @@ ui <- dashboardPage(
                         class = "btn-lg btn-primary"),
             tags$br(), tags$br(),
             div(id = "progressBox", style = "display: none",
-              progressBar(id = "progressBar", value = 0, 
-                        title = "Running workflow...",
-                        display_pct = TRUE),
+              # Use a simple progress text instead of a progress bar
+              verbatimTextOutput("workflowStatus"),
               verbatimTextOutput("workflowLog")
             )
           )
@@ -605,10 +604,7 @@ server <- function(input, output, session) {
       if (file.exists(log_file)) {
         log_content <- readLines(log_file)
         
-        # Update the log display
-        output$workflowLog <- renderText({
-          paste(tail(log_content, 20), collapse = "\n")
-        })
+        # Log display is now handled with the progress update
         
         # Update progress based on keywords in the log
         if (any(grepl("Starting DADA2 workflow", log_content))) {
@@ -646,8 +642,15 @@ server <- function(input, output, session) {
                          type = "error", duration = NULL)
         }
         
-        # Update progress bar
-        updateProgressBar(session = session, id = "progressBar", value = progress_value)
+        # Update progress using a simple text output
+        output$workflowStatus <- renderText({
+          paste0("Progress: ", progress_value, "%")
+        })
+        
+        # Update log output
+        output$workflowLog <- renderText({
+          paste(tail(log_content, 20), collapse = "\n")
+        })
         
         # Continue updating if not done
         if (progress_value < 100 && !any(grepl("Error in DADA2 workflow", log_content))) {
