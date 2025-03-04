@@ -3688,7 +3688,8 @@ plot_taxonomy_comparison <- function(summary_df) {
 # Set to TRUE/FALSE to enable/disable methods
 taxonomy_methods <- list(
   SILVA_DADA2 = TRUE,      # DADA2's implementation with SILVA database
-  RDP_DADA2 = TRUE         # DADA2's implementation with RDP database
+  RDP_DADA2 = TRUE,        # DADA2's implementation with RDP database
+  IDTAXA = TRUE            # DECIPHER's IDTAXA implementation
 )
 
 # Storage for taxonomy results
@@ -4051,6 +4052,219 @@ if (taxonomy_methods$RDP_DADA2) {
   
   # Display RDP summary table
   kable(rdp_summary, caption = "RDP Taxonomic Assignment Summary")
+}
+```
+
+# IDTAXA Taxonomy
+
+```{r idtaxa-taxonomy}
+# DECIPHER's IDTAXA method for taxonomy assignment
+if (taxonomy_methods$IDTAXA) {
+  cat("\n=== Method 3: DECIPHER's IDTAXA algorithm ===\n")
+  
+  # Check if DECIPHER package is available
+  if (!requireNamespace("DECIPHER", quietly = TRUE)) {
+    cat("DECIPHER package is required for IDTAXA. Please install it with BiocManager::install('DECIPHER')\n")
+  } else {
+    # Download/prepare SILVA/RDP training set for IDTAXA
+    # We can reuse the SILVA database files already downloaded
+    if (exists("silva_files") && file.exists(silva_files$train)) {
+      cat("Using existing SILVA files for IDTAXA...\n")
+      
+      # Load the SILVA training set into DECIPHER format
+      cat("Loading SILVA training data for IDTAXA (this may take a few minutes)...\n")
+      silva_train_file <- silva_files$train
+      
+      # Use try-catch to handle potential errors gracefully
+      tryCatch({
+        # Load training set
+        trainingSet <- DECIPHER::ReadDNAStringSet(silva_train_file)
+        
+        # IDTAXA expects sequences in the format ">taxon<tab>sequence"
+        # We need to separate the taxonomy information from the sequence IDs
+        ids <- names(trainingSet)
+        
+        # Extract taxonomic information from the sequence headers
+        # This assumes SILVA format with semicolon-delimited taxonomy
+        taxid <- sapply(strsplit(ids, "\\s"), `[`, 1)
+        rank <- gsub("^.*\\;|\\s+.*$", "", ids) # Get last rank
+        
+        # Create taxonomy table
+        taxTable <- data.frame(
+          TaxID = taxid, 
+          Rank = rank, 
+          stringsAsFactors = FALSE
+        )
+        
+        # Format the taxonomy strings for IDTAXA
+        # Add root as the top level
+        taxonomy <- gsub(";$", "", ids)
+        taxonomy <- paste0("Root;", taxonomy)
+        
+        # Ensure tax paths are properly formatted
+        taxonomy <- gsub(";", ";", taxonomy) # Standardize delimiters
+        
+        # Create the IDTAXA-compatible training set
+        idtaxa_train <- DECIPHER::LearnTaxa(trainingSet, taxonomy)
+        
+        cat("IDTAXA training set created successfully\n")
+        
+        # Use IDTAXA for classification with hardware optimization
+        cat("Classifying ASVs with IDTAXA...\n")
+        
+        # Create DNAStringSet from ASV sequences
+        asv_seqs <- Biostrings::DNAStringSet(colnames(seqtab.nochim))
+        names(asv_seqs) <- paste0("ASV", seq_along(asv_seqs))
+        
+        # Apply hardware optimizations for IDTAXA
+        if (exists("hw_caps") && hw_caps$apple_silicon) {
+          cat("Applying Apple Silicon optimizations for IDTAXA...\n")
+          # For Apple Silicon, use more threads but less RAM per thread
+          idtaxa_threads <- max(1, hw_caps$optimal_workers)
+          idtaxa_threshold <- 60 # Slightly higher threshold for more precision on M-series
+        } else if (exists("hw_caps") && hw_caps$has_gpu) {
+          cat("Applying GPU-aware optimizations for IDTAXA...\n")
+          # For GPU systems, CPU can use more threads
+          idtaxa_threads <- max(1, hw_caps$optimal_workers)
+          idtaxa_threshold <- 50
+        } else {
+          # Default settings
+          idtaxa_threads <- parallel::detectCores() - 1
+          idtaxa_threads <- max(1, idtaxa_threads)
+          idtaxa_threshold <- 50 # Default confidence threshold
+        }
+        
+        # Run IDTAXA classification
+        taxa_idtaxa_raw <- DECIPHER::IdTaxa(
+          asv_seqs, 
+          idtaxa_train, 
+          strand = "both", 
+          threshold = idtaxa_threshold, 
+          processors = idtaxa_threads
+        )
+        
+        cat("IDTAXA classification complete\n")
+        
+        # Convert IDTAXA output to standard taxonomy matrix format
+        # IDTAXA returns a list with taxon assignments and confidences
+        n_asv <- length(taxa_idtaxa_raw)
+        taxa_idtaxa <- matrix(NA, nrow = n_asv, ncol = 7)
+        colnames(taxa_idtaxa) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+        rownames(taxa_idtaxa) <- names(asv_seqs)
+        
+        # Extract confidence values for reporting
+        confidence_idtaxa <- matrix(NA, nrow = n_asv, ncol = 7)
+        colnames(confidence_idtaxa) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+        rownames(confidence_idtaxa) <- names(asv_seqs)
+        
+        # Process each ASV classification result
+        for (i in 1:n_asv) {
+          # Get the taxonomic assignments and confidence values for this ASV
+          taxon <- taxa_idtaxa_raw[[i]]$taxon
+          confidence <- taxa_idtaxa_raw[[i]]$confidence
+          
+          # Remove "Root;" prefix if present
+          taxon <- gsub("^Root;", "", taxon)
+          
+          # Skip if no classification (should not happen with defaults)
+          if (length(taxon) == 0) next
+          
+          # Split the full taxonomy into ranks
+          tax_ranks <- strsplit(taxon, ";")[[1]]
+          conf_values <- confidence
+          
+          # Map to standard taxonomy levels
+          ranks <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+          
+          # Assign each taxonomic rank and its confidence
+          for (j in 1:min(length(tax_ranks), length(ranks))) {
+            taxa_idtaxa[i, ranks[j]] <- tax_ranks[j]
+            
+            # Store confidence value if available
+            if (j <= length(conf_values)) {
+              confidence_idtaxa[i, ranks[j]] <- conf_values[j]
+            }
+          }
+        }
+        
+        # Convert to data frame for easier handling
+        taxa_idtaxa <- as.data.frame(taxa_idtaxa)
+        confidence_idtaxa <- as.data.frame(confidence_idtaxa)
+        
+        # View IDTAXA taxonomic assignments
+        cat("First few IDTAXA taxonomic assignments:\n")
+        print(head(taxa_idtaxa))
+        
+        # View confidence scores
+        cat("\nCorresponding confidence scores (%):\n")
+        print(head(confidence_idtaxa))
+        
+        # Save to results list
+        taxa_results$IDTAXA <- taxa_idtaxa
+        taxa_results$IDTAXA_confidence <- confidence_idtaxa
+        
+        # Create a taxonomy summary for IDTAXA
+        idtaxa_summary <- data.frame(
+          TaxonomicLevel = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
+          AssignmentCount = c(
+            sum(!is.na(taxa_idtaxa[, "Kingdom"])),
+            sum(!is.na(taxa_idtaxa[, "Phylum"])),
+            sum(!is.na(taxa_idtaxa[, "Class"])),
+            sum(!is.na(taxa_idtaxa[, "Order"])),
+            sum(!is.na(taxa_idtaxa[, "Family"])),
+            sum(!is.na(taxa_idtaxa[, "Genus"])),
+            sum(!is.na(taxa_idtaxa[, "Species"]))
+          ),
+          PercentAssigned = c(
+            round(sum(!is.na(taxa_idtaxa[, "Kingdom"])) / nrow(taxa_idtaxa) * 100, 1),
+            round(sum(!is.na(taxa_idtaxa[, "Phylum"])) / nrow(taxa_idtaxa) * 100, 1),
+            round(sum(!is.na(taxa_idtaxa[, "Class"])) / nrow(taxa_idtaxa) * 100, 1),
+            round(sum(!is.na(taxa_idtaxa[, "Order"])) / nrow(taxa_idtaxa) * 100, 1),
+            round(sum(!is.na(taxa_idtaxa[, "Family"])) / nrow(taxa_idtaxa) * 100, 1),
+            round(sum(!is.na(taxa_idtaxa[, "Genus"])) / nrow(taxa_idtaxa) * 100, 1),
+            round(sum(!is.na(taxa_idtaxa[, "Species"])) / nrow(taxa_idtaxa) * 100, 1)
+          ),
+          MeanConfidence = c(
+            mean(confidence_idtaxa[, "Kingdom"], na.rm = TRUE),
+            mean(confidence_idtaxa[, "Phylum"], na.rm = TRUE),
+            mean(confidence_idtaxa[, "Class"], na.rm = TRUE),
+            mean(confidence_idtaxa[, "Order"], na.rm = TRUE),
+            mean(confidence_idtaxa[, "Family"], na.rm = TRUE),
+            mean(confidence_idtaxa[, "Genus"], na.rm = TRUE),
+            mean(confidence_idtaxa[, "Species"], na.rm = TRUE)
+          )
+        )
+        
+        # Display IDTAXA summary table
+        kable(idtaxa_summary, caption = "IDTAXA Taxonomic Assignment Summary with Confidence Scores")
+        
+        # Create a bar plot for IDTAXA results with confidence info
+        idtaxa_summary$TaxonomicLevel <- factor(idtaxa_summary$TaxonomicLevel, 
+                                             levels = idtaxa_summary$TaxonomicLevel[order(idtaxa_summary$PercentAssigned, decreasing = TRUE)])
+        
+        # Create the plot with confidence overlay
+        idtaxa_plot <- ggplot(idtaxa_summary, aes(x = TaxonomicLevel, y = PercentAssigned)) +
+          geom_bar(stat = "identity", fill = "darkgreen") +
+          geom_text(aes(label = paste0(PercentAssigned, "%")), vjust = -0.3) +
+          geom_text(aes(label = paste0("(", round(MeanConfidence, 1), "% conf.)")), vjust = 1.5, color = "darkblue") +
+          theme_minimal() +
+          labs(title = "IDTAXA: Percentage of ASVs with Taxonomic Assignment",
+               subtitle = "Mean confidence score shown in parentheses",
+               x = "Taxonomic Level",
+               y = "Percent Assigned") +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+          scale_y_continuous(limits = c(0, max(idtaxa_summary$PercentAssigned) * 1.2))
+        
+        print(idtaxa_plot)
+        
+      }, error = function(e) {
+        cat("Error during IDTAXA taxonomy assignment:", conditionMessage(e), "\n")
+        cat("IDTAXA classification not available. Please check DECIPHER installation and database files.\n")
+      })
+    } else {
+      cat("SILVA database files required for IDTAXA were not found. Please run the SILVA taxonomy method first.\n")
+    }
+  }
 }
 ```
 
