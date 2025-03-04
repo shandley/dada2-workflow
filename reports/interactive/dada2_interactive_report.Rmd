@@ -1,0 +1,770 @@
+---
+title: "DADA2 Interactive Results Dashboard"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    theme: cosmo
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(shiny)
+library(DT)
+library(plotly)
+library(dplyr)
+library(ggplot2)
+library(phyloseq)
+library(vegan)
+library(htmltools)
+
+# Load the saved phyloseq object
+ps_file <- "../../../checkpoints/after_phyloseq.rds"
+ps <- readRDS(ps_file)
+
+# Load rarefied data if available
+rare_file <- "../../../checkpoints/after_rarefaction.rds"
+if(file.exists(rare_file)) {
+  ps_rare <- readRDS(rare_file)
+} else {
+  ps_rare <- NULL
+}
+
+# Get ASV table and metadata
+asv_table <- as.data.frame(otu_table(ps))
+metadata <- as.data.frame(sample_data(ps))
+taxonomy <- as.data.frame(tax_table(ps))
+```
+
+Overview
+=======================================================================
+
+Row {data-height=150}
+-----------------------------------------------------------------------
+
+### Total ASVs
+
+```{r}
+renderValueBox({
+  valueBox(
+    value = ncol(asv_table),
+    caption = "Total ASVs",
+    icon = "fa-dna",
+    color = "primary"
+  )
+})
+```
+
+### Total Samples
+
+```{r}
+renderValueBox({
+  valueBox(
+    value = nrow(asv_table),
+    caption = "Total Samples",
+    icon = "fa-flask",
+    color = "info"
+  )
+})
+```
+
+### Total Reads
+
+```{r}
+renderValueBox({
+  valueBox(
+    value = paste0(format(sum(asv_table), big.mark = ","), " reads"),
+    caption = "Total Reads",
+    icon = "fa-align-left",
+    color = "success"
+  )
+})
+```
+
+### Average Reads per Sample
+
+```{r}
+renderValueBox({
+  valueBox(
+    value = paste0(format(round(mean(rowSums(asv_table))), big.mark = ","), " reads"),
+    caption = "Average Reads per Sample",
+    icon = "fa-calculator",
+    color = "warning"
+  )
+})
+```
+
+Row
+-----------------------------------------------------------------------
+
+### Sample Read Counts
+
+```{r}
+renderPlotly({
+  # Calculate read counts per sample
+  read_counts <- data.frame(
+    Sample = rownames(asv_table),
+    Reads = rowSums(asv_table)
+  )
+  
+  # Merge with metadata if available
+  if(!is.null(metadata) && nrow(metadata) > 0) {
+    read_counts$Sample <- rownames(read_counts)
+    metadata$Sample <- rownames(metadata)
+    if(ncol(metadata) > 1) {
+      cols_to_use <- colnames(metadata)[colnames(metadata) != "Sample"]
+      read_counts <- merge(read_counts, metadata[, c("Sample", cols_to_use[1])], by = "Sample")
+      group_var <- cols_to_use[1]
+    } else {
+      group_var <- NULL
+    }
+  } else {
+    group_var <- NULL
+  }
+  
+  # Create basic plot
+  p <- ggplot(read_counts, aes(x = reorder(Sample, -Reads), y = Reads)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    theme_minimal() +
+    labs(title = "Read Counts per Sample", x = "Sample", y = "Number of Reads") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  # Add color by group if available
+  if(!is.null(group_var)) {
+    p <- ggplot(read_counts, aes(x = reorder(Sample, -Reads), y = Reads, fill = .data[[group_var]])) +
+      geom_bar(stat = "identity") +
+      theme_minimal() +
+      labs(title = "Read Counts per Sample", x = "Sample", y = "Number of Reads") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  }
+  
+  ggplotly(p)
+})
+```
+
+Taxonomic Composition
+=======================================================================
+
+Row {.tabset}
+-----------------------------------------------------------------------
+
+### Phylum Level
+
+```{r}
+renderPlotly({
+  # Aggregate at phylum level
+  if(!"Phylum" %in% colnames(taxonomy)) {
+    return(plotly_empty() %>% add_annotations(text = "Phylum level taxonomy not available", showarrow = FALSE))
+  }
+  
+  # Calculate relative abundance
+  rel_abund <- sweep(asv_table, 1, rowSums(asv_table), "/") * 100
+  
+  # Create phylum-level summary
+  phylum_data <- data.frame(
+    ASV = colnames(rel_abund),
+    Phylum = taxonomy$Phylum,
+    stringsAsFactors = FALSE
+  )
+  
+  # Ensure no NAs
+  phylum_data$Phylum[is.na(phylum_data$Phylum)] <- "Unknown"
+  
+  # Calculate abundance per phylum
+  phylum_abund <- data.frame(matrix(0, nrow = nrow(rel_abund), ncol = length(unique(phylum_data$Phylum))))
+  colnames(phylum_abund) <- unique(phylum_data$Phylum)
+  rownames(phylum_abund) <- rownames(rel_abund)
+  
+  # Sum abundances by phylum
+  for(i in 1:ncol(rel_abund)) {
+    phylum <- phylum_data$Phylum[i]
+    phylum_abund[, phylum] <- phylum_abund[, phylum] + rel_abund[, i]
+  }
+  
+  # Reshape for plotting
+  phylum_long <- tidyr::pivot_longer(
+    cbind(Sample = rownames(phylum_abund), phylum_abund),
+    cols = -Sample,
+    names_to = "Phylum",
+    values_to = "Abundance"
+  )
+  
+  # Add metadata if available
+  if(!is.null(metadata) && nrow(metadata) > 0) {
+    metadata$Sample <- rownames(metadata)
+    if(ncol(metadata) > 1) {
+      cols_to_use <- colnames(metadata)[colnames(metadata) != "Sample"]
+      phylum_long <- merge(phylum_long, metadata[, c("Sample", cols_to_use[1])], by = "Sample")
+      group_var <- cols_to_use[1]
+    } else {
+      group_var <- NULL
+    }
+  } else {
+    group_var <- NULL
+  }
+  
+  # Plot
+  if(!is.null(group_var)) {
+    p <- ggplot(phylum_long, aes(x = Sample, y = Abundance, fill = Phylum)) +
+      geom_bar(stat = "identity") +
+      theme_minimal() +
+      labs(x = "Sample", y = "Relative Abundance (%)") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      facet_grid(. ~ .data[[group_var]], scales = "free_x", space = "free_x")
+  } else {
+    p <- ggplot(phylum_long, aes(x = Sample, y = Abundance, fill = Phylum)) +
+      geom_bar(stat = "identity") +
+      theme_minimal() +
+      labs(x = "Sample", y = "Relative Abundance (%)") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  }
+  
+  ggplotly(p)
+})
+```
+
+### Genus Level
+
+```{r}
+renderPlotly({
+  # Aggregate at genus level
+  if(!"Genus" %in% colnames(taxonomy)) {
+    return(plotly_empty() %>% add_annotations(text = "Genus level taxonomy not available", showarrow = FALSE))
+  }
+  
+  # Calculate relative abundance
+  rel_abund <- sweep(asv_table, 1, rowSums(asv_table), "/") * 100
+  
+  # Create genus-level summary
+  genus_data <- data.frame(
+    ASV = colnames(rel_abund),
+    Genus = taxonomy$Genus,
+    stringsAsFactors = FALSE
+  )
+  
+  # Ensure no NAs
+  genus_data$Genus[is.na(genus_data$Genus)] <- "Unknown"
+  
+  # Take top 15 genera
+  total_abund <- colSums(rel_abund)
+  genus_totals <- aggregate(total_abund, by = list(genus_data$Genus), FUN = sum)
+  colnames(genus_totals) <- c("Genus", "TotalAbund")
+  top_genera <- genus_totals[order(-genus_totals$TotalAbund), "Genus"][1:min(15, nrow(genus_totals))]
+  
+  # Calculate abundance per genus
+  genus_abund <- data.frame(matrix(0, nrow = nrow(rel_abund), ncol = length(top_genera) + 1))
+  colnames(genus_abund) <- c(top_genera, "Other")
+  rownames(genus_abund) <- rownames(rel_abund)
+  
+  # Sum abundances by genus
+  for(i in 1:ncol(rel_abund)) {
+    genus <- genus_data$Genus[i]
+    if(genus %in% top_genera) {
+      genus_abund[, genus] <- genus_abund[, genus] + rel_abund[, i]
+    } else {
+      genus_abund[, "Other"] <- genus_abund[, "Other"] + rel_abund[, i]
+    }
+  }
+  
+  # Reshape for plotting
+  genus_long <- tidyr::pivot_longer(
+    cbind(Sample = rownames(genus_abund), genus_abund),
+    cols = -Sample,
+    names_to = "Genus",
+    values_to = "Abundance"
+  )
+  
+  # Add metadata if available
+  if(!is.null(metadata) && nrow(metadata) > 0) {
+    metadata$Sample <- rownames(metadata)
+    if(ncol(metadata) > 1) {
+      cols_to_use <- colnames(metadata)[colnames(metadata) != "Sample"]
+      genus_long <- merge(genus_long, metadata[, c("Sample", cols_to_use[1])], by = "Sample")
+      group_var <- cols_to_use[1]
+    } else {
+      group_var <- NULL
+    }
+  } else {
+    group_var <- NULL
+  }
+  
+  # Plot
+  if(!is.null(group_var)) {
+    p <- ggplot(genus_long, aes(x = Sample, y = Abundance, fill = Genus)) +
+      geom_bar(stat = "identity") +
+      theme_minimal() +
+      labs(x = "Sample", y = "Relative Abundance (%)") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      facet_grid(. ~ .data[[group_var]], scales = "free_x", space = "free_x")
+  } else {
+    p <- ggplot(genus_long, aes(x = Sample, y = Abundance, fill = Genus)) +
+      geom_bar(stat = "identity") +
+      theme_minimal() +
+      labs(x = "Sample", y = "Relative Abundance (%)") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  }
+  
+  ggplotly(p)
+})
+```
+
+Alpha Diversity
+=======================================================================
+
+Row {.tabset}
+-----------------------------------------------------------------------
+
+### Rarefaction Curves
+
+```{r}
+renderPlotly({
+  # Create data for rarefaction curves
+  if(requireNamespace("vegan", quietly = TRUE)) {
+    # Generate rarefaction data
+    rare_steps <- min(20, min(rowSums(asv_table)))
+    if(rare_steps < 1) {
+      return(plotly_empty() %>% add_annotations(text = "Insufficient data for rarefaction curves", showarrow = FALSE))
+    }
+    
+    depths <- seq(from = 1, to = min(rowSums(asv_table)), length.out = rare_steps)
+    rarecurve_data <- matrix(nrow = length(depths), ncol = nrow(asv_table))
+    rownames(rarecurve_data) <- depths
+    colnames(rarecurve_data) <- rownames(asv_table)
+    
+    for(i in seq_along(depths)) {
+      for(j in 1:nrow(asv_table)) {
+        if(rowSums(asv_table)[j] >= depths[i]) {
+          rarecurve_data[i, j] <- vegan::rarefy(asv_table[j, , drop = FALSE], depths[i])
+        } else {
+          rarecurve_data[i, j] <- NA
+        }
+      }
+    }
+    
+    # Reshape for plotting
+    rarecurve_long <- data.frame()
+    for(j in 1:ncol(rarecurve_data)) {
+      sample_data <- data.frame(
+        Depth = as.numeric(rownames(rarecurve_data)),
+        Richness = rarecurve_data[, j],
+        Sample = colnames(rarecurve_data)[j]
+      )
+      rarecurve_long <- rbind(rarecurve_long, sample_data)
+    }
+    
+    # Add metadata if available
+    if(!is.null(metadata) && nrow(metadata) > 0) {
+      metadata$Sample <- rownames(metadata)
+      if(ncol(metadata) > 1) {
+        cols_to_use <- colnames(metadata)[colnames(metadata) != "Sample"]
+        rarecurve_long <- merge(rarecurve_long, metadata[, c("Sample", cols_to_use[1])], by = "Sample")
+        group_var <- cols_to_use[1]
+      } else {
+        group_var <- NULL
+      }
+    } else {
+      group_var <- NULL
+    }
+    
+    # Plot
+    if(!is.null(group_var)) {
+      p <- ggplot(rarecurve_long, aes(x = Depth, y = Richness, color = Sample, group = Sample)) +
+        geom_line() +
+        theme_minimal() +
+        labs(x = "Sequencing Depth", y = "ASV Richness") +
+        facet_wrap(~ .data[[group_var]])
+    } else {
+      p <- ggplot(rarecurve_long, aes(x = Depth, y = Richness, color = Sample, group = Sample)) +
+        geom_line() +
+        theme_minimal() +
+        labs(x = "Sequencing Depth", y = "ASV Richness")
+    }
+    
+    ggplotly(p)
+  } else {
+    return(plotly_empty() %>% add_annotations(text = "Package 'vegan' is required for rarefaction curves", showarrow = FALSE))
+  }
+})
+```
+
+### Alpha Diversity Metrics
+
+```{r}
+renderPlotly({
+  # Calculate alpha diversity metrics
+  richness <- specnumber(asv_table)
+  shannon <- diversity(asv_table, index = "shannon")
+  simpson <- diversity(asv_table, index = "simpson")
+  
+  # Combine into data frame
+  alpha_div <- data.frame(
+    Sample = names(richness),
+    Richness = richness,
+    Shannon = shannon,
+    Simpson = simpson
+  )
+  
+  # Add metadata if available
+  if(!is.null(metadata) && nrow(metadata) > 0) {
+    metadata$Sample <- rownames(metadata)
+    if(ncol(metadata) > 1) {
+      cols_to_use <- colnames(metadata)[colnames(metadata) != "Sample"]
+      alpha_div <- merge(alpha_div, metadata[, c("Sample", cols_to_use[1])], by = "Sample")
+      group_var <- cols_to_use[1]
+    } else {
+      group_var <- NULL
+    }
+  } else {
+    group_var <- NULL
+  }
+  
+  # Create dropdown for different metrics
+  selectInput("alpha_metric", "Select Metric:", 
+              choices = c("Richness", "Shannon", "Simpson"),
+              selected = "Shannon")
+  
+  # Render plot based on selection
+  output$alpha_plot <- renderPlotly({
+    metric <- input$alpha_metric
+    
+    if(!is.null(group_var)) {
+      p <- ggplot(alpha_div, aes(x = .data[[group_var]], y = .data[[metric]], fill = .data[[group_var]])) +
+        geom_boxplot(alpha = 0.7) +
+        geom_jitter(width = 0.2, height = 0) +
+        theme_minimal() +
+        labs(title = paste(metric, "Diversity"), x = group_var, y = metric)
+    } else {
+      p <- ggplot(alpha_div, aes(x = 1, y = .data[[metric]])) +
+        geom_boxplot(alpha = 0.7) +
+        geom_jitter(width = 0.2, height = 0) +
+        theme_minimal() +
+        labs(title = paste(metric, "Diversity"), x = "", y = metric) +
+        theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+    }
+    
+    ggplotly(p)
+  })
+  
+  plotOutput("alpha_plot")
+})
+```
+
+Beta Diversity
+=======================================================================
+
+Row
+-----------------------------------------------------------------------
+
+### PCoA Plot
+
+```{r}
+renderPlotly({
+  # Create distance matrix
+  if(requireNamespace("vegan", quietly = TRUE)) {
+    # Create relative abundance table
+    rel_abund <- sweep(asv_table, 1, rowSums(asv_table), "/")
+    
+    # Calculate Bray-Curtis distances
+    dist_matrix <- vegdist(rel_abund, method = "bray")
+    
+    # Perform PCoA
+    pcoa <- cmdscale(dist_matrix, k = 3, eig = TRUE)
+    
+    # Extract percent variation explained
+    eig_percent <- round(pcoa$eig / sum(pcoa$eig) * 100, 1)
+    
+    # Create plot data
+    pcoa_data <- data.frame(
+      Sample = rownames(asv_table),
+      PCo1 = pcoa$points[, 1],
+      PCo2 = pcoa$points[, 2],
+      PCo3 = pcoa$points[, 3]
+    )
+    
+    # Add metadata if available
+    if(!is.null(metadata) && nrow(metadata) > 0) {
+      metadata$Sample <- rownames(metadata)
+      if(ncol(metadata) > 1) {
+        cols_to_use <- colnames(metadata)[colnames(metadata) != "Sample"]
+        pcoa_data <- merge(pcoa_data, metadata[, c("Sample", cols_to_use[1])], by = "Sample")
+        group_var <- cols_to_use[1]
+      } else {
+        group_var <- NULL
+      }
+    } else {
+      group_var <- NULL
+    }
+    
+    # Plot
+    if(!is.null(group_var)) {
+      p <- ggplot(pcoa_data, aes(x = PCo1, y = PCo2, color = .data[[group_var]], label = Sample)) +
+        geom_point(size = 3, alpha = 0.7) +
+        theme_minimal() +
+        labs(x = paste0("PCo1 (", eig_percent[1], "%)"), 
+             y = paste0("PCo2 (", eig_percent[2], "%)"),
+             title = "PCoA of Bray-Curtis Distances")
+    } else {
+      p <- ggplot(pcoa_data, aes(x = PCo1, y = PCo2, label = Sample)) +
+        geom_point(size = 3, alpha = 0.7) +
+        theme_minimal() +
+        labs(x = paste0("PCo1 (", eig_percent[1], "%)"), 
+             y = paste0("PCo2 (", eig_percent[2], "%)"),
+             title = "PCoA of Bray-Curtis Distances")
+    }
+    
+    ggplotly(p, tooltip = c("label", "x", "y"))
+  } else {
+    return(plotly_empty() %>% add_annotations(text = "Package 'vegan' is required for PCoA", showarrow = FALSE))
+  }
+})
+```
+
+Row {.tabset}
+-----------------------------------------------------------------------
+
+### PERMANOVA Analysis
+
+```{r}
+renderPrint({
+  # Check if metadata with groups is available
+  if(!is.null(metadata) && ncol(metadata) > 1) {
+    # Get first non-Sample column as group variable
+    cols_to_use <- colnames(metadata)[colnames(metadata) != "Sample"]
+    group_var <- cols_to_use[1]
+    
+    # Create relative abundance table
+    rel_abund <- sweep(asv_table, 1, rowSums(asv_table), "/")
+    
+    # Calculate Bray-Curtis distances
+    dist_matrix <- vegdist(rel_abund, method = "bray")
+    
+    # Run PERMANOVA
+    perm_result <- adonis2(dist_matrix ~ metadata[, group_var], permutations = 999)
+    
+    # Print result
+    cat("PERMANOVA Results (Bray-Curtis):\n\n")
+    print(perm_result)
+    
+    # Interpretation
+    p_val <- perm_result[1, "Pr(>F)"]
+    r_squared <- perm_result[1, "R2"]
+    
+    cat("\nInterpretation:\n")
+    if(p_val < 0.05) {
+      cat(paste0("The ", group_var, " factor explains ", round(r_squared * 100, 1), 
+                "% of the variation in community composition and is statistically significant (p = ", 
+                round(p_val, 3), ")."))
+    } else {
+      cat(paste0("The ", group_var, " factor explains ", round(r_squared * 100, 1), 
+                "% of the variation in community composition but is not statistically significant (p = ", 
+                round(p_val, 3), ")."))
+    }
+  } else {
+    cat("PERMANOVA analysis requires metadata with at least one grouping variable.")
+  }
+})
+```
+
+### Distance Boxplot
+
+```{r}
+renderPlotly({
+  # Check if metadata with groups is available
+  if(!is.null(metadata) && ncol(metadata) > 1) {
+    # Get first non-Sample column as group variable
+    cols_to_use <- colnames(metadata)[colnames(metadata) != "Sample"]
+    group_var <- cols_to_use[1]
+    
+    # Create relative abundance table
+    rel_abund <- sweep(asv_table, 1, rowSums(asv_table), "/")
+    
+    # Calculate Bray-Curtis distances
+    dist_matrix <- vegdist(rel_abund, method = "bray")
+    
+    # Prepare distance data
+    dist_df <- data.frame(
+      Sample1 = rep(rownames(as.matrix(dist_matrix)), each = nrow(as.matrix(dist_matrix))),
+      Sample2 = rep(rownames(as.matrix(dist_matrix)), times = nrow(as.matrix(dist_matrix))),
+      Distance = as.vector(as.matrix(dist_matrix))
+    )
+    
+    # Remove self-comparisons
+    dist_df <- dist_df[dist_df$Sample1 != dist_df$Sample2,]
+    
+    # Add group information
+    metadata$Sample <- rownames(metadata)
+    dist_df <- merge(dist_df, metadata[, c("Sample", group_var)], by.x = "Sample1", by.y = "Sample")
+    colnames(dist_df)[ncol(dist_df)] <- paste0(group_var, "1")
+    
+    dist_df <- merge(dist_df, metadata[, c("Sample", group_var)], by.x = "Sample2", by.y = "Sample")
+    colnames(dist_df)[ncol(dist_df)] <- paste0(group_var, "2")
+    
+    # Create comparison type
+    dist_df$Comparison <- ifelse(dist_df[, paste0(group_var, "1")] == dist_df[, paste0(group_var, "2")],
+                                "Within Group", "Between Groups")
+    
+    # Plot
+    p <- ggplot(dist_df, aes(x = Comparison, y = Distance, fill = Comparison)) +
+      geom_boxplot() +
+      theme_minimal() +
+      labs(title = "Bray-Curtis Distances Within vs Between Groups",
+           y = "Bray-Curtis Distance")
+    
+    ggplotly(p)
+  } else {
+    return(plotly_empty() %>% add_annotations(text = "Distance boxplot requires metadata with at least one grouping variable", showarrow = FALSE))
+  }
+})
+```
+
+ASV Table
+=======================================================================
+
+```{r}
+renderDT({
+  # Combine ASV table with taxonomy
+  asv_with_tax <- cbind(
+    t(asv_table),
+    taxonomy
+  )
+  
+  # Create datatable
+  DT::datatable(
+    asv_with_tax,
+    options = list(
+      pageLength = 10,
+      scrollX = TRUE,
+      autoWidth = TRUE
+    ),
+    filter = "top",
+    class = "compact stripe"
+  )
+})
+```
+
+Automated Interpretation
+=======================================================================
+
+```{r}
+renderUI({
+  # Generate automated interpretation
+  insights <- list()
+  
+  # 1. Sample read depth variation
+  read_depths <- rowSums(asv_table)
+  min_reads <- min(read_depths)
+  max_reads <- max(read_depths)
+  mean_reads <- mean(read_depths)
+  cv_reads <- sd(read_depths) / mean_reads * 100
+  
+  insights$depth <- paste0(
+    "**Read Depth Variation:** Samples range from ", format(min_reads, big.mark = ","), 
+    " to ", format(max_reads, big.mark = ","), " reads (mean: ", format(round(mean_reads), big.mark = ","), 
+    " reads). The coefficient of variation is ", round(cv_reads, 1), "%."
+  )
+  
+  if(cv_reads > 50) {
+    insights$depth <- paste0(
+      insights$depth, 
+      " This indicates **high variation** in sequencing depth, which may impact analyses. Consider rarefaction or normalization."
+    )
+  } else if(cv_reads > 20) {
+    insights$depth <- paste0(
+      insights$depth, 
+      " This indicates **moderate variation** in sequencing depth. Normalization may be beneficial."
+    )
+  } else {
+    insights$depth <- paste0(
+      insights$depth, 
+      " This indicates **low variation** in sequencing depth, suggesting even sampling."
+    )
+  }
+  
+  # 2. Taxonomic composition summary
+  if("Phylum" %in% colnames(taxonomy)) {
+    phylum_counts <- table(taxonomy$Phylum)
+    top_phyla <- names(sort(phylum_counts, decreasing = TRUE)[1:min(3, length(phylum_counts))])
+    phyla_text <- paste(paste0("**", top_phyla, "**"), collapse = ", ")
+    
+    insights$taxa <- paste0(
+      "**Taxonomic Composition:** The most abundant phyla are ", phyla_text, 
+      ". In total, ", length(phylum_counts), " phyla were detected."
+    )
+  }
+  
+  # 3. Alpha diversity summary
+  richness <- specnumber(asv_table)
+  shannon <- diversity(asv_table, index = "shannon")
+  
+  insights$alpha <- paste0(
+    "**Alpha Diversity:** ASV richness ranges from ", min(richness), " to ", max(richness),
+    " (mean: ", round(mean(richness), 1), "). Shannon diversity ranges from ",
+    round(min(shannon), 2), " to ", round(max(shannon), 2), " (mean: ", round(mean(shannon), 2), ")."
+  )
+  
+  # 4. Group differences if metadata available
+  if(!is.null(metadata) && ncol(metadata) > 1) {
+    # Get first non-Sample column as group variable
+    cols_to_use <- colnames(metadata)[colnames(metadata) != "Sample"]
+    group_var <- cols_to_use[1]
+    
+    # Create relative abundance table
+    rel_abund <- sweep(asv_table, 1, rowSums(asv_table), "/")
+    
+    # Calculate Bray-Curtis distances
+    dist_matrix <- vegdist(rel_abund, method = "bray")
+    
+    # Run PERMANOVA
+    perm_result <- adonis2(dist_matrix ~ metadata[, group_var], permutations = 999)
+    
+    # Interpretation
+    p_val <- perm_result[1, "Pr(>F)"]
+    r_squared <- perm_result[1, "R2"]
+    
+    if(p_val < 0.05) {
+      insights$beta <- paste0(
+        "**Group Differences:** The ", group_var, " groups show **statistically significant differences** ",
+        "in microbial composition (PERMANOVA p = ", round(p_val, 3), "). The ", group_var, " factor explains ",
+        round(r_squared * 100, 1), "% of the variation in community composition."
+      )
+    } else {
+      insights$beta <- paste0(
+        "**Group Differences:** The ", group_var, " groups do **not** show statistically significant differences ",
+        "in microbial composition (PERMANOVA p = ", round(p_val, 3), "). The ", group_var, " factor explains only ",
+        round(r_squared * 100, 1), "% of the variation in community composition."
+      )
+    }
+  }
+  
+  # 5. Rare vs abundant taxa
+  asvs_by_prev <- rowSums(asv_table > 0)
+  rare_asvs <- sum(asvs_by_prev == 1)
+  common_asvs <- sum(asvs_by_prev >= nrow(asv_table)/2)
+  
+  insights$prevalence <- paste0(
+    "**Prevalence Patterns:** ", rare_asvs, " ASVs (", round(rare_asvs/ncol(asv_table)*100, 1),
+    "%) are detected in only a single sample. ", common_asvs, " ASVs (", 
+    round(common_asvs/ncol(asv_table)*100, 1), "%) are present in at least half of all samples."
+  )
+  
+  # Combine all insights
+  HTML(paste(
+    "<h3>Key Insights</h3>",
+    "<p>", insights$depth, "</p>",
+    "<p>", insights$taxa, "</p>",
+    "<p>", insights$alpha, "</p>",
+    if(!is.null(insights$beta)) paste0("<p>", insights$beta, "</p>") else "",
+    "<p>", insights$prevalence, "</p>",
+    "<h3>Recommendations</h3>",
+    "<p>Based on the analysis above, consider the following recommendations:</p>",
+    "<ul>",
+    if(cv_reads > 50) "<li>Perform rarefaction or normalization to address read depth variation</li>" else "",
+    "<li>Explore genus-level patterns for taxa of interest</li>",
+    "<li>Consider excluding singleton ASVs for robustness</li>",
+    if(!is.null(insights$beta) && grepl("statistically significant", insights$beta)) 
+      "<li>Investigate which specific taxa are driving differences between groups</li>" else "",
+    "</ul>"
+  ))
+})
+```
