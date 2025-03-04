@@ -4066,14 +4066,102 @@ if (taxonomy_methods$IDTAXA) {
   if (!requireNamespace("DECIPHER", quietly = TRUE)) {
     cat("DECIPHER package is required for IDTAXA. Please install it with BiocManager::install('DECIPHER')\n")
   } else {
-    # Download/prepare SILVA/RDP training set for IDTAXA
-    # We can reuse the SILVA database files already downloaded
-    if (exists("silva_files") && file.exists(silva_files$train)) {
-      cat("Using existing SILVA files for IDTAXA...\n")
+    # Function to check and download IDTAXA training set if needed
+    get_idtaxa_training_set <- function() {
+      # Check for pre-made IDTAXA training set
+      idtaxa_dir <- file.path("ref_db", "idtaxa")
+      idtaxa_training_file <- file.path(idtaxa_dir, "SILVA_SSU_r138_2_2024.RData")
+      
+      if (file.exists(idtaxa_training_file)) {
+        cat("Using existing IDTAXA training set:", idtaxa_training_file, "\n")
+        # Load training set
+        idtaxa_train <- NULL
+        load(idtaxa_training_file) # Loads 'trainingSet' object
+        return(trainingSet)
+      } else {
+        # Create idtaxa directory if it doesn't exist
+        if (!dir.exists(idtaxa_dir)) {
+          dir.create(idtaxa_dir, recursive = TRUE)
+        }
+        
+        # Try to download pre-formatted IDTAXA training set from the DECIPHER website
+        idtaxa_url <- "https://www2.decipher.codes/data/Downloads/TrainingSets/SILVA_SSU_r138_2_2024.RData"
+        
+        tryCatch({
+          cat("Downloading pre-formatted IDTAXA training set from DECIPHER website...\n")
+          options(timeout = max(300, getOption("timeout")))
+          download.file(idtaxa_url, idtaxa_training_file, mode = "wb")
+          
+          # Check that download was successful and file exists
+          if (file.exists(idtaxa_training_file)) {
+            cat("IDTAXA training set downloaded successfully\n")
+            load(idtaxa_training_file) # Loads 'trainingSet' object
+            return(trainingSet)
+          } else {
+            cat("Failed to download IDTAXA training set\n")
+            return(NULL)
+          }
+        }, error = function(e) {
+          cat("Error downloading IDTAXA training set from DECIPHER website:", conditionMessage(e), "\n")
+          cat("You can manually download the file from: https://www2.decipher.codes/Downloads.html\n")
+          cat("and save it to:", idtaxa_training_file, "\n")
+          return(NULL)
+        })
+      }
+    }
+    
+    # Try first approach: Use pre-formatted training set (most reliable)
+    idtaxa_train <- get_idtaxa_training_set()
+    
+    # If that fails, try alternative IDTAXA training sets
+    if (is.null(idtaxa_train)) {
+      # Try alternative version (r138_1)
+      cat("Trying alternative IDTAXA training set version...\n")
+      idtaxa_dir <- file.path("ref_db", "idtaxa")
+      idtaxa_training_file <- file.path(idtaxa_dir, "SILVA_SSU_r138_1_2023.RData")
+      
+      if (!file.exists(idtaxa_training_file)) {
+        if (!dir.exists(idtaxa_dir)) {
+          dir.create(idtaxa_dir, recursive = TRUE)
+        }
+        
+        idtaxa_url <- "https://www2.decipher.codes/data/Downloads/TrainingSets/SILVA_SSU_r138_1_2023.RData"
+        
+        tryCatch({
+          cat("Downloading alternative IDTAXA training set version...\n")
+          options(timeout = max(300, getOption("timeout")))
+          download.file(idtaxa_url, idtaxa_training_file, mode = "wb")
+          
+          if (file.exists(idtaxa_training_file)) {
+            cat("Alternative IDTAXA training set downloaded successfully\n")
+            load(idtaxa_training_file) # Loads 'trainingSet' object
+            idtaxa_train <- trainingSet
+          }
+        }, error = function(e) {
+          cat("Error downloading alternative IDTAXA training set:", conditionMessage(e), "\n")
+        })
+      } else {
+        cat("Using existing alternative IDTAXA training set:", idtaxa_training_file, "\n")
+        load(idtaxa_training_file) # Loads 'trainingSet' object
+        idtaxa_train <- trainingSet
+      }
+    }
+    
+    # If that still fails and SILVA database is available, try to create our own
+    if (is.null(idtaxa_train) && exists("silva_files") && file.exists(silva_files$train)) {
+      cat("Using existing SILVA files to create custom IDTAXA training set...\n")
       
       # Load the SILVA training set into DECIPHER format
       cat("Loading SILVA training data for IDTAXA (this may take a few minutes)...\n")
       silva_train_file <- silva_files$train
+    } 
+    # If SILVA isn't available but RDP is, use that instead
+    else if (is.null(idtaxa_train) && exists("rdp_files") && file.exists(rdp_files$train)) {
+      cat("SILVA files not available. Using existing RDP files to create custom IDTAXA training set...\n")
+      
+      # Load the RDP training set into DECIPHER format
+      cat("Loading RDP training data for IDTAXA (this may take a few minutes)...\n")
+      silva_train_file <- rdp_files$train
       
       # Use try-catch to handle potential errors gracefully
       tryCatch({
@@ -4109,31 +4197,92 @@ if (taxonomy_methods$IDTAXA) {
         
         cat("IDTAXA training set created successfully\n")
         
-        # Use IDTAXA for classification with hardware optimization
-        cat("Classifying ASVs with IDTAXA...\n")
-        
-        # Create DNAStringSet from ASV sequences
-        asv_seqs <- Biostrings::DNAStringSet(colnames(seqtab.nochim))
-        names(asv_seqs) <- paste0("ASV", seq_along(asv_seqs))
-        
-        # Apply hardware optimizations for IDTAXA
-        if (exists("hw_caps") && hw_caps$apple_silicon) {
-          cat("Applying Apple Silicon optimizations for IDTAXA...\n")
-          # For Apple Silicon, use more threads but less RAM per thread
-          idtaxa_threads <- max(1, hw_caps$optimal_workers)
-          idtaxa_threshold <- 60 # Slightly higher threshold for more precision on M-series
-        } else if (exists("hw_caps") && hw_caps$has_gpu) {
-          cat("Applying GPU-aware optimizations for IDTAXA...\n")
-          # For GPU systems, CPU can use more threads
-          idtaxa_threads <- max(1, hw_caps$optimal_workers)
-          idtaxa_threshold <- 50
-        } else {
-          # Default settings
-          idtaxa_threads <- parallel::detectCores() - 1
-          idtaxa_threads <- max(1, idtaxa_threads)
-          idtaxa_threshold <- 50 # Default confidence threshold
+        # Save for future use
+        idtaxa_dir <- file.path("ref_db", "idtaxa")
+        if (!dir.exists(idtaxa_dir)) {
+          dir.create(idtaxa_dir, recursive = TRUE)
         }
+        idtaxa_training_file <- file.path(idtaxa_dir, "SILVA_custom.RData")
+        trainingSet <- idtaxa_train  # Standardize variable name for saving
         
+        # Try to save with error handling
+        save_result <- tryCatch({
+          save(trainingSet, file = idtaxa_training_file)
+          TRUE
+        }, error = function(e) {
+          cat("Error saving IDTAXA training set:", conditionMessage(e), "\n")
+          FALSE
+        })
+        
+        if (save_result) {
+          cat("Saved IDTAXA training set for future use at:", idtaxa_training_file, "\n")
+        } else {
+          cat("Warning: Unable to save IDTAXA training set, it will need to be recreated next time\n")
+        }
+      }, error = function(e) {
+        cat("Error creating IDTAXA training set from SILVA:", conditionMessage(e), "\n")
+        idtaxa_train <- NULL
+      })
+    }
+    
+    # Only proceed if we have a valid training set
+    if (!is.null(idtaxa_train)) {
+      # Display information about which training set was used
+      cat("\nIDTAXA training set successfully loaded.\n")
+      
+      # Try to extract version info from the training set if available
+      taxonomy_source <- tryCatch({
+        if (exists("trainingSet") && !is.null(attr(trainingSet, "taxonomy"))) {
+          # Extract database version from the taxonomy attribute
+          db_info <- attr(trainingSet, "taxonomy")[1]
+          if (!is.null(db_info) && length(db_info) > 0) {
+            # Extract source info
+            if (grepl("SILVA", db_info)) {
+              "SILVA database"
+            } else if (grepl("RDP", db_info)) {
+              "RDP database"
+            } else {
+              "custom database"
+            }
+          } else {
+            "unknown source"
+          }
+        } else {
+          "unknown source"
+        }
+      }, error = function(e) {
+        "unknown source"
+      })
+      
+      cat("Using IDTAXA with", taxonomy_source, "for taxonomy classification.\n")
+      
+      # Use IDTAXA for classification with hardware optimization
+      cat("Classifying ASVs with IDTAXA...\n")
+      
+      # Create DNAStringSet from ASV sequences
+      asv_seqs <- Biostrings::DNAStringSet(colnames(seqtab.nochim))
+      names(asv_seqs) <- paste0("ASV", seq_along(asv_seqs))
+      
+      # Apply hardware optimizations for IDTAXA
+      if (exists("hw_caps") && hw_caps$apple_silicon) {
+        cat("Applying Apple Silicon optimizations for IDTAXA...\n")
+        # For Apple Silicon, use more threads but less RAM per thread
+        idtaxa_threads <- max(1, hw_caps$optimal_workers)
+        idtaxa_threshold <- 60 # Slightly higher threshold for more precision on M-series
+      } else if (exists("hw_caps") && hw_caps$has_gpu) {
+        cat("Applying GPU-aware optimizations for IDTAXA...\n")
+        # For GPU systems, CPU can use more threads
+        idtaxa_threads <- max(1, hw_caps$optimal_workers)
+        idtaxa_threshold <- 50
+      } else {
+        # Default settings
+        idtaxa_threads <- parallel::detectCores() - 1
+        idtaxa_threads <- max(1, idtaxa_threads)
+        idtaxa_threshold <- 50 # Default confidence threshold
+      }
+      
+      # Run IDTAXA classification with error handling
+      tryCatch({
         # Run IDTAXA classification
         taxa_idtaxa_raw <- DECIPHER::IdTaxa(
           asv_seqs, 
@@ -4240,7 +4389,7 @@ if (taxonomy_methods$IDTAXA) {
         
         # Create a bar plot for IDTAXA results with confidence info
         idtaxa_summary$TaxonomicLevel <- factor(idtaxa_summary$TaxonomicLevel, 
-                                             levels = idtaxa_summary$TaxonomicLevel[order(idtaxa_summary$PercentAssigned, decreasing = TRUE)])
+                                               levels = idtaxa_summary$TaxonomicLevel[order(idtaxa_summary$PercentAssigned, decreasing = TRUE)])
         
         # Create the plot with confidence overlay
         idtaxa_plot <- ggplot(idtaxa_summary, aes(x = TaxonomicLevel, y = PercentAssigned)) +
@@ -4262,7 +4411,15 @@ if (taxonomy_methods$IDTAXA) {
         cat("IDTAXA classification not available. Please check DECIPHER installation and database files.\n")
       })
     } else {
-      cat("SILVA database files required for IDTAXA were not found. Please run the SILVA taxonomy method first.\n")
+      cat("\n======================================================================\n")
+      cat("WARNING: No IDTAXA training set could be created or loaded.\n")
+      cat("IDTAXA classification is not available for this run.\n\n")
+      cat("To fix this issue:\n")
+      cat("1. Download IDTAXA training data from: https://www2.decipher.codes/Downloads.html\n")
+      cat("2. Save the file (SILVA_SSU_r138_2_2024.RData) to:\n")
+      cat("   ", file.path(getwd(), "ref_db", "idtaxa", "SILVA_SSU_r138_2_2024.RData"), "\n")
+      cat("3. Re-run this workflow to use IDTAXA for taxonomy classification\n")
+      cat("======================================================================\n")
     }
   }
 }
