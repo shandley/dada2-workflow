@@ -4268,17 +4268,22 @@ if (taxonomy_methods$IDTAXA) {
         cat("Applying Apple Silicon optimizations for IDTAXA...\n")
         # For Apple Silicon, use more threads but less RAM per thread
         idtaxa_threads <- max(1, hw_caps$optimal_workers)
-        idtaxa_threshold <- 60 # Slightly higher threshold for more precision on M-series
+        # IDTAXA threshold: 
+        # - Setting to 0 allows all taxonomic assignments regardless of confidence
+        # - Higher values (e.g., 50-60) require higher confidence, which might result in fewer assignments
+        # - We're lowering it to get assignments at all taxonomic levels, even with low confidence
+        idtaxa_threshold <- 0 # Allow all taxonomic assignments, regardless of confidence
+        cat("IDTAXA using lowest possible threshold to maximize taxonomic assignments\n")
       } else if (exists("hw_caps") && hw_caps$has_gpu) {
         cat("Applying GPU-aware optimizations for IDTAXA...\n")
         # For GPU systems, CPU can use more threads
         idtaxa_threads <- max(1, hw_caps$optimal_workers)
-        idtaxa_threshold <- 50
+        idtaxa_threshold <- 0 # Allow all taxonomic assignments, regardless of confidence
       } else {
         # Default settings
         idtaxa_threads <- parallel::detectCores() - 1
         idtaxa_threads <- max(1, idtaxa_threads)
-        idtaxa_threshold <- 50 # Default confidence threshold
+        idtaxa_threshold <- 0 # Allow all taxonomic assignments, regardless of confidence
       }
       
       # Run IDTAXA classification with error handling
@@ -4294,6 +4299,12 @@ if (taxonomy_methods$IDTAXA) {
         
         cat("IDTAXA classification complete\n")
         
+        # Show an example of the raw classification format to help with debugging
+        if (length(taxa_idtaxa_raw) > 0) {
+          cat("Example of raw IDTAXA output for first ASV:\n")
+          print(taxa_idtaxa_raw[[1]])
+        }
+        
         # Convert IDTAXA output to standard taxonomy matrix format
         # IDTAXA returns a list with taxon assignments and confidences
         n_asv <- length(taxa_idtaxa_raw)
@@ -4306,26 +4317,37 @@ if (taxonomy_methods$IDTAXA) {
         colnames(confidence_idtaxa) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
         rownames(confidence_idtaxa) <- names(asv_seqs)
         
+        cat("Processing", n_asv, "ASV classifications...\n")
+        
         # Process each ASV classification result
         for (i in 1:n_asv) {
           # Get the taxonomic assignments and confidence values for this ASV
           taxon <- taxa_idtaxa_raw[[i]]$taxon
           confidence <- taxa_idtaxa_raw[[i]]$confidence
           
-          # Remove "Root;" prefix if present
-          taxon <- gsub("^Root;", "", taxon)
-          
+          # Handle "Root;" prefix - don't remove it, as it's the Kingdom level
           # Skip if no classification (should not happen with defaults)
           if (length(taxon) == 0) next
+          
+          # Replace "Root" with "Bacteria" if we know it's a 16S dataset
+          if (grepl("^Root", taxon) && !is.null(primer_info) && 
+              grepl("16S|V[1-9]", primer_info, ignore.case=TRUE)) {
+            taxon <- sub("^Root", "Bacteria", taxon)
+            cat("Replaced Root with Bacteria for taxonomic assignment\n")
+          }
           
           # Split the full taxonomy into ranks
           tax_ranks <- strsplit(taxon, ";")[[1]]
           conf_values <- confidence
           
-          # Map to standard taxonomy levels
+          # Map to standard taxonomy levels - making sure to handle the Root prefix
           ranks <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
           
+          # The first element might be "Root" or we might have replaced it with "Bacteria"
+          # Either way, it should map to Kingdom level
+          
           # Assign each taxonomic rank and its confidence
+          # Start with the first element of tax_ranks as Kingdom, regardless of content
           for (j in 1:min(length(tax_ranks), length(ranks))) {
             taxa_idtaxa[i, ranks[j]] <- tax_ranks[j]
             
@@ -4333,6 +4355,11 @@ if (taxonomy_methods$IDTAXA) {
             if (j <= length(conf_values)) {
               confidence_idtaxa[i, ranks[j]] <- conf_values[j]
             }
+          }
+          
+          # Add a debug message to show first few assignments
+          if (i <= 6) {
+            cat("ASV", i, "taxonomic assignment:", paste(taxa_idtaxa[i,], collapse=", "), "\n")
           }
         }
         
