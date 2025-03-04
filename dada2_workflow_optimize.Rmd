@@ -613,11 +613,25 @@ get_available_memory <- function() {
         free_pages <- as.numeric(gsub("Pages free:\\s+", "", mem_info))
         page_size <- 4096  # Default page size on macOS
         free_mem_mb <- (free_pages * page_size) / (1024^2)
+        
+        # On macOS, also include inactive memory as it can be reclaimed
+        inactive_info <- system("vm_stat | grep 'Pages inactive:'", intern = TRUE)
+        inactive_pages <- as.numeric(gsub("Pages inactive:\\s+", "", inactive_info))
+        inactive_mem_mb <- (inactive_pages * page_size) / (1024^2)
+        
+        # Total available = free + inactive
+        return(free_mem_mb + inactive_mem_mb)
       } else {  # Linux
         mem_info <- system("free -m | grep 'Mem:'", intern = TRUE)
-        free_mem_mb <- as.numeric(strsplit(mem_info, "\\s+")[[1]][4])
+        mem_parts <- strsplit(mem_info, "\\s+")[[1]]
+        # On newer Linux, position 7 is "available" which is better than just "free"
+        if (length(mem_parts) >= 7) {
+          free_mem_mb <- as.numeric(mem_parts[7])
+        } else {
+          free_mem_mb <- as.numeric(mem_parts[4])
+        }
+        return(free_mem_mb)
       }
-      return(free_mem_mb)
     } else {  # Windows or unknown
       return(8000)  # Default to 8GB for unknown systems
     }
@@ -675,53 +689,8 @@ adaptive_gc <- function(force_full = FALSE) {
   }
 }
 
-# Smart matrix operation function that uses GPU when available
-optimized_matrix_op <- function(func, ..., use_gpu = TRUE) {
-  result <- NULL
-  
-  # Try GPU implementation if available and requested
-  if (use_gpu && exists("hw_caps") && hw_caps$has_gpu) {
-    tryCatch({
-      if (hw_caps$gpu_type == "torch-mps" || hw_caps$gpu_type == "torch-cuda") {
-        # TODO: Implement torch-based matrix operations
-        # This would be a placeholder for actual implementation
-        result <- func(...)
-      } else if (hw_caps$gpu_type == "gpuR") {
-        # TODO: Implement gpuR-based matrix operations
-        # This would be a placeholder for actual implementation
-        result <- func(...)
-      } else if (hw_caps$gpu_type == "tensorflow") {
-        # TODO: Implement tensorflow-based matrix operations
-        # This would be a placeholder for actual implementation
-        result <- func(...)
-      }
-    }, error = function(e) {
-      # On failure, fall back to CPU
-      cat("GPU matrix operation failed, falling back to CPU:", conditionMessage(e), "\n")
-      result <- NULL
-    })
-  }
-  
-  # If GPU failed or not available, use optimized CPU implementation
-  if (is.null(result)) {
-    if (exists("hw_caps") && hw_caps$apple_silicon) {
-      # Optimize for Apple Silicon
-      old_veclib_setting <- Sys.getenv("VECLIB_MAXIMUM_THREADS")
-      Sys.setenv(VECLIB_MAXIMUM_THREADS = as.character(hw_caps$optimal_workers))
-      
-      # Run the operation
-      result <- func(...)
-      
-      # Restore original setting
-      Sys.setenv(VECLIB_MAXIMUM_THREADS = old_veclib_setting)
-    } else {
-      # Standard CPU implementation
-      result <- func(...)
-    }
-  }
-  
-  return(result)
-}
+# Note: This function has been removed as it's not currently used in the workflow
+# If needed in the future, it can be implemented for hardware-accelerated matrix operations
 
 # Detect hardware and set up environment
 hw_caps <- detect_hardware_capabilities()
@@ -1582,7 +1551,7 @@ if(length(fnFs) > 50) {
   batch_size <- min(20, ceiling(length(fnFs)/4))
   
   # Apple Silicon specific batch size tuning
-  if (exists("is_apple_silicon") && is_apple_silicon) {
+  if (exists("hw_caps") && hw_caps$apple_silicon) {
     # M-series chips handle larger batch sizes efficiently due to unified memory
     batch_size <- min(30, ceiling(length(fnFs)/3))
     cat(sprintf("Apple Silicon optimization: Using larger batch size of %d samples...\n", batch_size))
@@ -1617,7 +1586,7 @@ if(length(fnFs) > 50) {
     out[rownames(batch_out), ] <- batch_out
     
     # Force garbage collection with Apple Silicon optimization
-    if (exists("is_apple_silicon") && is_apple_silicon) {
+    if (exists("hw_caps") && hw_caps$apple_silicon) {
       # Less aggressive GC on Apple Silicon (more efficient memory management)
       # Only run GC every third batch or at the end
       if (batch %% 3 == 0 || batch == max(batches)) {
@@ -2653,7 +2622,7 @@ if (length(dadaFs) > 20) {
   optimal_batch_size <- min(max(optimal_batch_size, 5), 30)
   
   # Apple Silicon specific optimizations
-  if (exists("is_apple_silicon") && is_apple_silicon) {
+  if (exists("hw_caps") && hw_caps$apple_silicon) {
     # M-series chips have unified memory which is more efficient
     optimal_batch_size <- min(optimal_batch_size * 1.5, 40)
     cat(sprintf("Apple Silicon optimization: Increased batch size to %.0f\n", optimal_batch_size))
@@ -2695,7 +2664,7 @@ if (length(dadaFs) > 20) {
     }
     
     # Smart garbage collection with Apple Silicon optimization
-    if (exists("is_apple_silicon") && is_apple_silicon) {
+    if (exists("hw_caps") && hw_caps$apple_silicon) {
       # Less aggressive GC on Apple Silicon to avoid expensive memory operations
       if (i %% 2 == 0 || i == length(batch_groups)) {
         # Use compact=TRUE to reduce memory fragmentation
@@ -2709,7 +2678,8 @@ if (length(dadaFs) > 20) {
     # Monitor memory usage (if possible) and adjust batch size dynamically
     if (i < length(batch_groups) && exists("get_available_memory")) {
       current_memory <- get_available_memory()
-      if (current_memory < reserved_memory_mb) {
+      memory_threshold <- reserved_memory_mb  # Use reserved memory as threshold
+      if (current_memory < memory_threshold) {
         # Memory is getting low, reduce batch size for next iteration
         cat("Memory pressure detected, reducing batch size for next iteration\n")
         next_batch_size <- max(floor(batch_size * 0.7), 3)
@@ -3055,7 +3025,7 @@ if(ncol(seqtab) > 1000) {
     # Monitor memory usage and adjust batch size dynamically if needed
     if (i < n_batches) {
       current_memory <- get_available_memory()
-      memory_threshold <- 0.3 * get_available_memory()  # 30% of total as threshold
+      memory_threshold <- 0.3 * current_memory  # 30% of available memory as threshold
       
       if (current_memory < memory_threshold) {
         # Memory is getting low, reduce batch size for next iterations
@@ -3072,6 +3042,9 @@ if(ncol(seqtab) > 1000) {
         # Update for next iterations
         batch_size <- new_batch_size
         n_batches <- i + remaining_batches
+        
+        # Force garbage collection to free memory immediately
+        adaptive_gc(TRUE)
       }
     }
   }
@@ -4533,7 +4506,7 @@ build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores 
   
   # Check for Apple Silicon Neural Engine acceleration if on macOS
   has_apple_neural_engine <- FALSE
-  if (Sys.info()["sysname"] == "Darwin" && exists("is_apple_silicon") && is_apple_silicon) {
+  if (Sys.info()["sysname"] == "Darwin" && exists("hw_caps") && hw_caps$apple_silicon) {
     if (requireNamespace("torch", quietly = TRUE)) {
       tryCatch({
         # Check if torch can use MPS (Metal Performance Shaders) backend
@@ -4557,7 +4530,7 @@ build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores 
     cores <- min(parallel::detectCores() - 1, 8)
     
     # Apple Silicon optimization for tree building
-    if (exists("is_apple_silicon") && is_apple_silicon) {
+    if (exists("hw_caps") && hw_caps$apple_silicon) {
       # M-series chips benefit from more parallelization in alignment and ML optimization
       # But leave 2 cores free for system processes
       perf_cores <- min(parallel::detectCores() * 0.7, 10)
@@ -4696,7 +4669,7 @@ build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores 
                                    rearrangement = "stochastic",
                                    control = phangorn::pml.control(trace = progressbar))
     })
-  } else if (exists("is_apple_silicon") && is_apple_silicon) {
+  } else if (exists("hw_caps") && hw_caps$apple_silicon) {
     if (verbose) cat("  Applying Apple Silicon optimizations for ML model fitting...\n")
     
     # Use JC69 model with Apple Silicon optimizations
@@ -4813,7 +4786,7 @@ if (can_build_trees) {
   if (requireNamespace("gpuR", quietly = TRUE) || 
       requireNamespace("tensorflow", quietly = TRUE) ||
       (requireNamespace("torch", quietly = TRUE) && 
-       exists("is_apple_silicon") && is_apple_silicon)) {
+       exists("hw_caps") && hw_caps$apple_silicon)) {
     has_gpu_capabilities <- TRUE
     cat("GPU acceleration capabilities detected!\n")
   }
@@ -4824,7 +4797,7 @@ if (can_build_trees) {
   moderate_asv_threshold <- 1000
   
   # Adjust thresholds based on hardware capabilities
-  if (exists("is_apple_silicon") && is_apple_silicon) {
+  if (exists("hw_caps") && hw_caps$apple_silicon) {
     # Apple Silicon can handle larger datasets more efficiently
     large_asv_threshold <- 8000
     moderate_asv_threshold <- 2000
@@ -4858,7 +4831,7 @@ if (can_build_trees) {
     if (has_gpu_capabilities) {
       bootstrap_reps <- 200  # More bootstrap replicates with GPU acceleration
       cat("GPU acceleration: Using higher bootstrap replicates (200) for better statistical support\n")
-    } else if (exists("is_apple_silicon") && is_apple_silicon) {
+    } else if (exists("hw_caps") && hw_caps$apple_silicon) {
       bootstrap_reps <- 150  # More bootstrap replicates for Apple Silicon
       cat("Apple Silicon optimization: Using higher bootstrap replicates (150) for better statistical support\n")
     } else {
@@ -5524,10 +5497,7 @@ tax_tab$ASV_ID <- rownames(tax_tab)
 write.csv(tax_tab, "results/taxonomy.csv", row.names = FALSE)
 cat("Saved taxonomy table to results/taxonomy.csv\n")
 
-# Save phyloseq object
-saveRDS(ps, "results/phyloseq_object.rds")
-cat("Saved phyloseq object to results/phyloseq_object.rds\n")
-
+# The phyloseq object has already been saved earlier, just confirm it contains latest changes
 # Check if the phyloseq object contains a tree and mention it in the message
 if (!is.null(phy_tree(ps, errorIfNULL = FALSE))) {
   cat("Note: The saved phyloseq object includes a phylogenetic tree\n")
