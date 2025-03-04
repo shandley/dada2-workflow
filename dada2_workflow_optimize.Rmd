@@ -1195,10 +1195,56 @@ if(is_multi_run && exists("file_to_run")) {
 First, we'll examine the quality profiles of the raw reads to get a baseline understanding of the data quality.
 
 ```{r quality-plots}
-# Plot quality profiles for a few forward reads
-forward_qual <- plotQualityProfile(fnFs[1:min(3, length(fnFs))])
-# Plot quality profiles for a few reverse reads
-reverse_qual <- plotQualityProfile(fnRs[1:min(3, length(fnRs))])
+# Function to efficiently sample and plot quality profiles
+efficient_quality_profile <- function(fastq_files, max_files = 3, max_reads = 10000) {
+  # Sample a subset of files for efficiency
+  n_files <- min(max_files, length(fastq_files))
+  sampled_files <- fastq_files[sample(length(fastq_files), n_files)]
+  
+  # Use future.apply for parallelization
+  if (requireNamespace("future.apply", quietly = TRUE)) {
+    # Process each file in parallel with sampling
+    cat("Using parallel processing for quality profiles...\n")
+    
+    # Set up parallel processing plan if not already set
+    if (!inherits(future::plan(), "multisession")) {
+      future::plan(future::multisession, workers = min(n_files, future::availableCores() - 1))
+    }
+    
+    # Process files in parallel with sampling
+    qual_plots <- future.apply::future_lapply(sampled_files, function(file) {
+      # Sample reads for faster processing
+      dada2::plotQualityProfile(file, n = max_reads, aggregate = TRUE)
+    })
+    
+    # Combine into a single plot with future::value to ensure proper extraction
+    combined_plot <- do.call(gridExtra::grid.arrange, c(lapply(qual_plots, future::value), ncol = 1))
+    return(combined_plot)
+  } else {
+    # Fall back to standard sequential processing with sampling
+    cat("Using sequential processing with sampling for quality profiles...\n")
+    return(dada2::plotQualityProfile(sampled_files, n = max_reads, aggregate = TRUE))
+  }
+}
+
+# Plot quality profiles with efficient sampling and parallelization
+cat("Generating quality plots with optimized sampling...\n")
+
+# Forward reads quality profile
+cat("Processing forward reads quality profile...\n")
+forward_qual <- efficient_quality_profile(
+  fnFs, 
+  max_files = min(3, length(fnFs)),
+  max_reads = 10000  # Sample 10,000 reads per file for faster processing
+)
+
+# Reverse reads quality profile
+cat("Processing reverse reads quality profile...\n")
+reverse_qual <- efficient_quality_profile(
+  fnRs,
+  max_files = min(3, length(fnRs)),
+  max_reads = 10000  # Sample 10,000 reads per file for faster processing
+)
 
 # Display the quality plots
 print(forward_qual)
