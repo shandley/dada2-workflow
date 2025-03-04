@@ -15,7 +15,7 @@ output:
     toc_depth: 3
     latex_engine: xelatex
 params:
-  generate_report: FALSE
+  generate_report: TRUE
   output_format: "html"
   output_dir: "reports"
   output_file: "dada2_workflow_report"
@@ -1234,48 +1234,6 @@ print(reverse_qual)
 
 # Automatic Parameter Optimization
 
-Based on the quality profiles, we'll optimize key parameters like truncation lengths and error thresholds to maximize both data quality and sequence retention. This optimization process is a key feature of this workflow that automatically determines the best parameters for your specific dataset.
-
-## Understanding the Parameter Optimization Plots
-
-### Truncation Length Optimization
-
-The truncation length optimization generates **paired plots for forward and reverse reads**:
-
-![](https://i.imgur.com/vAEjPQU.png)
-
-These plots show:
-- **Blue line**: The mean quality score at each position (cycle) in the read
-- **Red horizontal line**: The quality threshold (Q25) below which bases are considered unreliable
-- **Blue vertical line**: The automatically determined optimal truncation point
-
-The algorithm finds the optimal truncation by:
-1. Identifying where quality drops below the threshold
-2. Balancing quality concerns with the need to maintain sufficient sequence overlap
-3. Ensuring the combined read length can cover the expected amplicon size
-4. Adjusting for platform-specific characteristics
-
-The optimal truncation positions are chosen to discard low-quality bases while retaining enough high-quality sequence for reliable merging. The text output provides additional information, including expected overlap after truncation.
-
-### Expected Error Threshold Optimization
-
-The maxEE parameter optimization generates a **bar chart showing read retention percentages**:
-
-![](https://i.imgur.com/UxOaXWQ.png)
-
-This plot shows:
-- **X-axis**: Different combinations of maxEE values for forward and reverse reads (F-R)
-- **Y-axis**: Percentage of reads retained after filtering
-- **Bar labels**: Exact percentage of reads retained for each parameter combination
-
-The algorithm tests various combinations and selects the optimal maxEE values by:
-1. Starting with stringent maxEE values (lower is more stringent)
-2. Targeting at least 70% read retention (dropping to 50% if necessary)
-3. Choosing the most stringent combination that meets the retention target
-4. Accommodating the typically lower quality of reverse reads by allowing higher maxEE values
-
-The goal is to remove as many low-quality reads as possible while still retaining a sufficient percentage of the data for robust downstream analysis.
-
 ```{r parameter-optimization}
 # Function to determine optimal truncation lengths based on quality profiles
 optimize_truncation_lengths <- function(forward_files, reverse_files, quality_threshold = 30,
@@ -2452,7 +2410,7 @@ if (length(derepFs) > 20 || is_multi_run) {
       }
       
       # Optimized garbage collection
-      adaptive_gc(i == length(batch_groups) || i % 3 == 0)
+      adaptive_gc(i == length(batch_groups) || i %% 3 == 0)
     }
   }
 } else {
@@ -2566,7 +2524,7 @@ if (length(derepRs) > 20 || is_multi_run) {
       }
       
       # Optimized garbage collection
-      adaptive_gc(i == length(batch_groups) || i % 3 == 0)
+      adaptive_gc(i == length(batch_groups) || i %% 3 == 0)
     }
   }
 } else {
@@ -4123,6 +4081,8 @@ if (taxonomy_methods$RDP_DADA2) {
 }
 ```
 
+# Taxonomy comparison
+
 ```{r taxonomy-comparison}
 # Compare taxonomy assignments from different methods
 if (length(taxa_results) > 1) {
@@ -4404,12 +4364,6 @@ save_checkpoint("after_taxonomy",
                c("seqtab.nochim", "taxa", "taxa_results", "sample.names", "track_df"),
                overwrite = TRUE)
 cat("Checkpoint saved after taxonomy assignment step\n")
-```
-
-# Create Phyloseq Object
-
-```{r phyloseq1, eval=FALSE}
-# This chunk has been removed and consolidated with the phyloseq2 chunk below
 ```
 
 # Create Phyloseq Object
@@ -4992,8 +4946,6 @@ if (can_build_trees) {
   asv_tree <- NULL
 }
 ```
-
-# Save Results
 
 # Rarefaction Analysis
 
@@ -5647,240 +5599,5 @@ write.csv(data.frame(
 cat("Saved enhanced workflow summary to results/workflow_summary.rds\n")
 ```
 
-# Generate Automated Report
 
-```{r generate-report, eval=params$generate_report}
-# Only execute this block if report generation is requested via parameters
 
-# Create a simplified copy of this Rmd file for report generation
-tryCatch({
-  # Create reports directory if needed
-  reports_dir <- "reports"
-  if (!dir.exists(reports_dir)) {
-    dir.create(reports_dir, recursive = TRUE)
-  }
-  
-  # Current date for report filename
-  report_date <- format(Sys.Date(), "%Y%m%d")
-  report_file <- file.path(reports_dir, paste0("dada2_report_", report_date, ".html"))
-  
-  # Generate a self-contained HTML report of the results
-  cat("Generating HTML report of results...\n")
-  
-  # Create folder for report files if it doesn't exist
-  report_files_dir <- file.path(reports_dir, "report_files")
-  if (!dir.exists(report_files_dir)) {
-    dir.create(report_files_dir, recursive = TRUE)
-  }
-  
-  # Save phyloseq object for the report
-  saveRDS(ps, file.path(report_files_dir, "phyloseq_for_report.rds"))
-  
-  # Write a simplified report generation Rmd
-  report_rmd <- file.path(reports_dir, "report_template.Rmd")
-  
-  # Create a basic report template
-  report_template <- paste0('---
-title: "DADA2 Analysis Report"
-date: "', Sys.Date(), '"
-output: 
-  html_document:
-    toc: true
-    toc_float: true
-    theme: united
----
-
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE)
-library(phyloseq)
-library(ggplot2)
-library(dplyr)
-library(tidyr)
-```
-
-# DADA2 Analysis Results
-
-This report summarizes the results of the DADA2 analysis pipeline.
-
-## Dataset Overview
-
-```{r}
-ps <- readRDS("report_files/phyloseq_for_report.rds")
-cat("Analysis includes", nsamples(ps), "samples and", ntaxa(ps), "ASVs\\n")
-```
-
-## Sample Read Counts
-
-```{r}
-sample_counts <- data.frame(
-  Sample = sample_names(ps),
-  Reads = sample_sums(ps)
-)
-
-# Sort by read count
-sample_counts <- sample_counts[order(sample_counts$Reads, decreasing = TRUE),]
-
-# Plot sample read counts
-ggplot(sample_counts, aes(x = reorder(Sample, -Reads), y = Reads)) +
-  geom_bar(stat = "identity") +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
-  labs(title = "Sample Read Counts", x = "Sample", y = "Number of Reads")
-```
-
-## Taxonomic Composition
-
-```{r}
-# Get taxonomy table
-tax_table <- as.data.frame(tax_table(ps))
-
-# Summarize at phylum level
-phylum_counts <- tax_table %>%
-  group_by(Phylum) %>%
-  summarize(Count = n()) %>%
-  arrange(desc(Count))
-
-# Plot phylum distribution
-ggplot(phylum_counts[1:10,], aes(x = reorder(Phylum, Count), y = Count)) +
-  geom_bar(stat = "identity") +
-  coord_flip() +
-  theme_minimal() +
-  labs(title = "Top 10 Phyla", x = "Phylum", y = "Number of ASVs")
-```
-
-## Alpha Diversity
-
-```{r}
-# Calculate alpha diversity
-alpha_div <- estimate_richness(ps, measures = c("Observed", "Shannon", "Simpson"))
-alpha_div$Sample <- rownames(alpha_div)
-
-# Add metadata if available
-if(ncol(sample_data(ps)) > 0) {
-  sample_df <- as.data.frame(sample_data(ps))
-  sample_df$Sample <- rownames(sample_df)
-  
-  # Use first categorical column as grouping variable if available
-  cat_cols <- sapply(sample_df, function(col) {
-    is.character(col) || is.factor(col) || length(unique(col)) < 10
-  })
-  
-  if(any(cat_cols)) {
-    group_var <- names(cat_cols)[which(cat_cols)[1]]
-    alpha_div <- merge(alpha_div, sample_df[, c("Sample", group_var)], by = "Sample")
-    
-    # Plot alpha diversity by group
-    ggplot(alpha_div, aes_string(x = group_var, y = "Shannon", fill = group_var)) +
-      geom_boxplot() +
-      theme_minimal() +
-      labs(title = "Shannon Diversity by Group", x = "", y = "Shannon Index") +
-      theme(legend.position = "none")
-  }
-}
-
-# Basic richness plot
-ggplot(alpha_div, aes(x = Observed)) +
-  geom_histogram(bins = 15, fill = "steelblue") +
-  theme_minimal() +
-  labs(title = "Distribution of ASV Richness", x = "Observed ASVs", y = "Number of Samples")
-```
-
-# Conclusion
-
-This report provides a summary of the key results from the DADA2 analysis. Full details and raw data are available in the results directory.')
-  
-  # Write the template to file
-  writeLines(report_template, report_rmd)
-  
-  # Render the report template
-  tryCatch({
-    # Use full paths for everything to avoid working directory issues
-    rmarkdown::render(
-      input = report_rmd,
-      output_file = basename(report_file),
-      output_dir = reports_dir,
-      knit_root_dir = reports_dir  # Set the root directory for knitting
-    )
-    
-    # Clean up template file after successful rendering
-    unlink(report_rmd)
-    
-    cat("Report successfully generated:", report_file, "\n")
-  }, error = function(e) {
-    cat("Error rendering report: ", conditionMessage(e), "\n")
-    cat("The template file has been kept at", report_rmd, "for debugging.\n")
-  })
-}, error = function(e) {
-  cat("Error generating report:", e$message, "\n")
-})
-```
-
-# Conclusion
-
-This document outlines an optimized DADA2 workflow for processing 16S rRNA gene amplicon data. The workflow includes automatic parameter optimization based on your sequencing data, quality filtering, denoising, merging paired reads, chimera removal, and taxonomic assignment to generate a table of amplicon sequence variants (ASVs).
-
-Key enhancements in this optimized workflow:
-
-1. **Automatic platform detection** and parameter optimization based on read length and quality
-2. **Adaptive quality filtering** with optimized truncation lengths and expected error thresholds
-3. **Primer detection** for expected amplicon size estimation
-4. **Read merging optimization** to ensure sufficient overlap
-5. **Phylogenetic tree construction** with multiple alignment and maximum likelihood optimization
-6. **Enhanced quality visualization** with percentile distributions and quality interpretation zones
-7. **Extensive quality control** throughout the pipeline
-8. **Detailed visualization** of results at each step
-9. **Comprehensive results export** for downstream analysis
-10. **Automated HTML/PDF report generation**
-
-## Checkpointing System
-
-This workflow includes a robust checkpointing system that saves intermediate results after each computationally intensive step. Checkpoints provide several benefits:
-
-1. **Workflow Resilience**: If a long-running analysis is interrupted, you can restart from the last successful checkpoint instead of beginning again
-2. **Parameter Experimentation**: Run parts of the workflow with different parameters without rerunning earlier steps
-3. **Saving Time**: Skip time-consuming steps when you're just making changes to later parts of the analysis
-4. **Memory Management**: Break a large analysis into manageable chunks that fit within available memory
-
-Checkpoints are saved in the `checkpoints/` directory and can be loaded at the start of a workflow run. To work with checkpoints:
-
-- At the beginning of a workflow, you will be prompted to load an existing checkpoint if any are available
-- To manually load a checkpoint, use `load_checkpoint("checkpoint_name")`
-- To list all available checkpoints, use `list_checkpoints()`
-
-This optimized workflow creates checkpoints after each major processing step:
-- After filtering and trimming
-- After error learning
-- After dereplication
-- After sample inference
-- After read merging
-- After ASV table construction
-- After chimera removal
-- After taxonomy assignment
-- After phyloseq object creation
-- After phylogenetic tree construction
-
-## Automated Reporting
-
-This workflow supports automated report generation in both HTML and PDF formats. To generate a report, use the following command-line options with the `run_dashboard.R` script:
-
-```bash
-# Generate HTML report (default)
-Rscript run_dashboard.R --generate-report
-
-# Generate PDF report
-Rscript run_dashboard.R --generate-report --format pdf_document
-
-# Customize output location and filename
-Rscript run_dashboard.R --generate-report --output-dir custom/path --output-file custom_name
-```
-
-The report will include all the plots, tables, and analysis results with the code optionally hidden (toggled via the code_folding parameter). Reports are automatically timestamped and saved in the specified output directory.
-
-To visualize and explore your results interactively, you can use the companion dashboard:
-
-```r
-# Run the dashboard
-source("run_dashboard.R")
-```
-
-The output files in the `results/` directory can be used for further microbiome analyses in R (using phyloseq, microbiome, vegan, etc.) or exported to other platforms.
