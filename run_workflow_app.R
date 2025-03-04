@@ -3,8 +3,89 @@
 # DADA2 Workflow Launcher App
 # A Shiny application to configure and launch the optimized DADA2 workflow
 
-# Set CRAN mirror first to avoid "no mirror selected" error
-options(repos = c(CRAN = "https://cloud.r-project.org"))
+# Function to set CRAN mirror automatically with smart detection
+auto_set_cran_mirror <- function() {
+  # Check if a CRAN mirror is already set
+  repos <- getOption("repos")
+  
+  # If CRAN is already set to a working URL, use it
+  if ("CRAN" %in% names(repos) && repos["CRAN"] != "@CRAN@" && repos["CRAN"] != "") {
+    cat("Using existing CRAN mirror:", repos["CRAN"], "\n")
+    return(repos["CRAN"])
+  }
+  
+  # Primary mirrors to try (in order of preference)
+  primary_mirrors <- c(
+    "https://cloud.r-project.org",           # Global CDN
+    "https://cran.rstudio.com"               # RStudio mirror
+  )
+  
+  # Regional mirrors based on timezones
+  timezone <- Sys.timezone()
+  regional_mirrors <- list(
+    US = c(
+      "https://mirrors.nics.utk.edu/cran",    # USA (Tennessee)
+      "https://cran.case.edu"                 # USA (Cleveland)
+    ),
+    Europe = c(
+      "https://cran.wu.ac.at",                # Austria
+      "https://cran.stat.unipd.it"            # Italy
+    ),
+    Asia = c(
+      "https://mirror.las.iastate.edu/CRAN",  # China
+      "https://cran.asia"                     # Singapore
+    ),
+    Australia = c(
+      "https://cran.ms.unimelb.edu.au"        # Australia
+    )
+  )
+  
+  # Add regional mirrors based on timezone
+  if (grepl("America|US", timezone)) {
+    mirrors_to_try <- c(primary_mirrors, regional_mirrors$US)
+  } else if (grepl("Europe|GB|DE|FR|IT|ES", timezone)) {
+    mirrors_to_try <- c(primary_mirrors, regional_mirrors$Europe)
+  } else if (grepl("Asia|Japan|China|Hong|Singapore|Korea", timezone)) {
+    mirrors_to_try <- c(primary_mirrors, regional_mirrors$Asia) 
+  } else if (grepl("Australia", timezone)) {
+    mirrors_to_try <- c(primary_mirrors, regional_mirrors$Australia)
+  } else {
+    # Default to primary mirrors if region can't be determined
+    mirrors_to_try <- primary_mirrors
+  }
+  
+  # Try each mirror until one works
+  for (mirror in mirrors_to_try) {
+    tryCatch({
+      # Try to download a small file from the mirror to test connectivity
+      test_url <- paste0(mirror, "/PACKAGES")
+      
+      # Set a reasonable timeout
+      timeout_option <- options(timeout = 5)
+      on.exit(options(timeout_option), add = TRUE)
+      
+      # Try to connect to the mirror
+      con <- url(test_url, "rb")
+      close(con)
+      
+      # If we get here, the mirror is working
+      cat("Setting CRAN mirror to", mirror, "\n")
+      options(repos = c(CRAN = mirror))
+      return(mirror)
+    }, error = function(e) {
+      # This mirror failed, try the next one
+      cat("Mirror", mirror, "not available:", conditionMessage(e), "\n")
+    })
+  }
+  
+  # If all else fails, use the cloud.r-project.org mirror
+  cat("No working mirrors found. Defaulting to cloud.r-project.org...\n")
+  options(repos = c(CRAN = "https://cloud.r-project.org"))
+  return("https://cloud.r-project.org")
+}
+
+# Call the function to automatically set a CRAN mirror
+auto_set_cran_mirror()
 
 # Check for required packages and install if missing
 required_packages <- c("shiny", "shinydashboard", "shinyFiles", "shinyjs", 
@@ -17,7 +98,15 @@ bioc_packages <- c("dada2")
 for (pkg in required_packages) {
   if (!requireNamespace(pkg, quietly = TRUE)) {
     cat("Installing package:", pkg, "\n")
-    install.packages(pkg)
+    tryCatch({
+      install.packages(pkg)
+    }, error = function(e) {
+      cat("Error installing package", pkg, ":", conditionMessage(e), "\n")
+      cat("Trying to find alternative mirror...\n")
+      # Re-attempt mirror selection and try again
+      mirror <- auto_set_cran_mirror()
+      install.packages(pkg, repos = mirror)
+    })
   }
   library(pkg, character.only = TRUE)
 }
@@ -26,7 +115,15 @@ for (pkg in required_packages) {
 if (any(!sapply(bioc_packages, requireNamespace, quietly = TRUE))) {
   if (!requireNamespace("BiocManager", quietly = TRUE)) {
     cat("Installing BiocManager...\n")
-    install.packages("BiocManager")
+    tryCatch({
+      install.packages("BiocManager")
+    }, error = function(e) {
+      cat("Error installing BiocManager:", conditionMessage(e), "\n")
+      cat("Trying to find alternative mirror...\n")
+      # Re-attempt mirror selection and try again
+      mirror <- auto_set_cran_mirror()
+      install.packages("BiocManager", repos = mirror)
+    })
   }
   
   # Only check for dada2 - don't try to install automatically as it's large
