@@ -31,11 +31,16 @@ This document implements an optimized workflow for processing 16S rRNA gene ampl
 # Setup
 
 ```{r setup, include=FALSE}
+# Basic setup for R Markdown
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
-# Checkpointing functions
+# Define checkpoint directory
 checkpoint_dir <- "checkpoints"
+```
 
+# Package Management
+
+```{r package-management}
 # Enhanced package checking and loading function
 check_and_load_packages <- function() {
   # Set CRAN mirror to avoid "no mirror selected" errors
@@ -136,6 +141,31 @@ check_and_load_packages <- function() {
   ))
 }
 
+# Load all packages and display status
+package_status <- check_and_load_packages()
+
+# Display information about available packages
+cat("Required packages loaded:", length(package_status$required), "\n")
+if (length(package_status$optional) > 0) {
+  cat("Optional packages loaded:", paste(package_status$optional, collapse = ", "), "\n")
+}
+if (length(package_status$missing) > 0) {
+  cat("Optional packages not available:", paste(package_status$missing, collapse = ", "), "\n")
+  cat("Some advanced features may be disabled.\n")
+}
+
+# Check if phylogenetic tree building is available
+can_build_trees <- all(c("phangorn", "DECIPHER") %in% package_status$optional)
+if (can_build_trees) {
+  cat("✓ Phylogenetic tree construction is available\n")
+} else {
+  cat("✗ Phylogenetic tree construction is disabled (install phangorn and DECIPHER to enable)\n")
+}
+```
+
+# Checkpointing Functions
+
+```{r checkpointing-functions}
 # Create a checkpoint
 save_checkpoint <- function(checkpoint_name, object_list, overwrite = FALSE) {
   # Validate inputs
@@ -421,31 +451,6 @@ list_checkpoints <- function() {
     warning("Error listing checkpoints: ", conditionMessage(e))
     return(NULL)
   })
-}
-```
-
-# Package management
-
-```{r load-packages}
-# Check and load all required and optional packages
-package_status <- check_and_load_packages()
-
-# Display information about available packages
-cat("Required packages loaded:", length(package_status$required), "\n")
-if (length(package_status$optional) > 0) {
-  cat("Optional packages loaded:", paste(package_status$optional, collapse = ", "), "\n")
-}
-if (length(package_status$missing) > 0) {
-  cat("Optional packages not available:", paste(package_status$missing, collapse = ", "), "\n")
-  cat("Some advanced features may be disabled.\n")
-}
-
-# Check if phylogenetic tree building is available
-can_build_trees <- all(c("phangorn", "DECIPHER") %in% package_status$optional)
-if (can_build_trees) {
-  cat("✓ Phylogenetic tree construction is available\n")
-} else {
-  cat("✗ Phylogenetic tree construction is disabled (install phangorn and DECIPHER to enable)\n")
 }
 ```
 
