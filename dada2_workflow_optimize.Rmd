@@ -10,23 +10,13 @@ output:
     highlight: tango
     code_folding: hide
     df_print: paged
-  pdf_document:
-    toc: true
-    toc_depth: 3
-    latex_engine: xelatex
-params:
-  generate_report: TRUE
-  output_format: "html"
-  output_dir: "reports"
-  output_file: "dada2_workflow_report"
-  multi_run: FALSE
-  run_dir: NULL
-  big_data: FALSE
 ---
 
 # Introduction
 
 This document implements an optimized workflow for processing 16S rRNA gene amplicon data using DADA2. The workflow includes automatic parameter optimization, quality filtering, denoising, merging paired reads, chimera removal, and taxonomic assignment to generate a table of amplicon sequence variants (ASVs).
+
+The workflow has been streamlined to remove unnecessary features like GPU acceleration that weren't being used and multi-run processing to keep the code focused on the core optimization workflow.
 
 # Setup
 
@@ -457,8 +447,7 @@ list_checkpoints <- function() {
 # Hardware Detection and Optimization Setup
 
 ```{r hardware-detection}
-# This chunk contains consolidated functions for hardware detection and optimization
-# that will be used throughout the workflow
+# Simplified hardware detection for optimal parallelization settings
 
 # Function to detect hardware capabilities
 detect_hardware_capabilities <- function() {
@@ -466,10 +455,7 @@ detect_hardware_capabilities <- function() {
   capabilities <- list(
     cores = 1,
     memory_gb = 4,
-    has_gpu = FALSE,
-    gpu_type = "none",
     apple_silicon = FALSE,
-    neural_engine = FALSE,
     optimal_workers = 1,
     memory_limit_gb = 2
   )
@@ -513,80 +499,12 @@ detect_hardware_capabilities <- function() {
     capabilities$apple_silicon <- grepl("arm64", arch_check)
   }
   
-  # GPU detection
-  capabilities$has_gpu <- FALSE
-  
-  # Check for CUDA/GPU capabilities
-  gpu_packages <- c("gpuR", "tensorflow", "torch")
-  for (pkg in gpu_packages) {
-    if (requireNamespace(pkg, quietly = TRUE)) {
-      tryCatch({
-        if (pkg == "gpuR") {
-          gpus <- gpuR::detectGPUs()
-          if (gpus > 0) {
-            capabilities$has_gpu <- TRUE
-            capabilities$gpu_type <- "gpuR"
-          }
-        } else if (pkg == "tensorflow") {
-          # Check if TensorFlow can see GPUs
-          tf_gpus <- tensorflow::tf$config$list_physical_devices('GPU')
-          if (length(tf_gpus) > 0) {
-            capabilities$has_gpu <- TRUE
-            capabilities$gpu_type <- "tensorflow"
-          }
-        } else if (pkg == "torch") {
-          # Check for CUDA or MPS (Metal) support
-          if (torch::torch_is_available()) {
-            if (torch::cuda_is_available()) {
-              capabilities$has_gpu <- TRUE
-              capabilities$gpu_type <- "torch-cuda"
-            } else if (capabilities$apple_silicon && 
-                       tryCatch(torch::backends_mps_is_available(), error = function(e) FALSE)) {
-              capabilities$has_gpu <- TRUE
-              capabilities$gpu_type <- "torch-mps"
-              capabilities$neural_engine <- TRUE
-            }
-          }
-        }
-      }, error = function(e) {
-        # If error in GPU detection, assume no GPU
-      })
-    }
-  }
-  
-  # Apple Neural Engine detection (for Apple Silicon)
-  if (capabilities$apple_silicon && !capabilities$neural_engine) {
-    # Check for additional ways to use Neural Engine without torch
-    if (requireNamespace("reticulate", quietly = TRUE)) {
-      tryCatch({
-        # Try to detect if Python with CoreML is available
-        has_coreml <- FALSE
-        py_available <- reticulate::py_available()
-        if (py_available) {
-          has_coreml <- reticulate::py_module_available("coremltools")
-        }
-        if (has_coreml) {
-          capabilities$neural_engine <- TRUE
-        }
-      }, error = function(e) {
-        # If error, assume no Neural Engine access
-      })
-    }
-  }
-  
   # Determine optimal workers based on hardware
   if (capabilities$apple_silicon) {
-    # For Apple Silicon, leverage efficiency and performance cores effectively
-    perf_cores <- min(capabilities$cores * 0.7, 10)  # Conservative estimate of performance cores
+    # For Apple Silicon
+    perf_cores <- min(capabilities$cores * 0.7, 10)  
     capabilities$optimal_workers <- min(ceiling(perf_cores), capabilities$cores - 1)
-    
-    # Higher memory limit for unified memory architecture
-    total_mem_gb <- capabilities$memory_gb
-    capabilities$memory_limit_gb <- min(total_mem_gb * 0.6, 12)
-  } else if (capabilities$has_gpu) {
-    # For GPU systems, we can use more CPU workers as computation is offloaded
-    capabilities$optimal_workers <- min(capabilities$cores - 1, 10)
-    capabilities$memory_limit_gb <- min(capabilities$memory_gb * 0.5, 8)
+    capabilities$memory_limit_gb <- min(capabilities$memory_gb * 0.6, 12)
   } else if (capabilities$cores >= 16) {
     # High-core systems
     capabilities$optimal_workers <- min(capabilities$cores - 2, 12)
@@ -604,77 +522,7 @@ detect_hardware_capabilities <- function() {
   return(capabilities)
 }
 
-# Function to get available system memory at runtime
-get_available_memory <- function() {
-  tryCatch({
-    if (.Platform$OS.type == "unix") {
-      if (Sys.info()["sysname"] == "Darwin") {  # macOS
-        mem_info <- system("vm_stat | grep 'Pages free:'", intern = TRUE)
-        free_pages <- as.numeric(gsub("Pages free:\\s+", "", mem_info))
-        page_size <- 4096  # Default page size on macOS
-        free_mem_mb <- (free_pages * page_size) / (1024^2)
-        
-        # On macOS, also include inactive memory as it can be reclaimed
-        inactive_info <- system("vm_stat | grep 'Pages inactive:'", intern = TRUE)
-        inactive_pages <- as.numeric(gsub("Pages inactive:\\s+", "", inactive_info))
-        inactive_mem_mb <- (inactive_pages * page_size) / (1024^2)
-        
-        # Total available = free + inactive
-        return(free_mem_mb + inactive_mem_mb)
-      } else {  # Linux
-        mem_info <- system("free -m | grep 'Mem:'", intern = TRUE)
-        mem_parts <- strsplit(mem_info, "\\s+")[[1]]
-        # On newer Linux, position 7 is "available" which is better than just "free"
-        if (length(mem_parts) >= 7) {
-          free_mem_mb <- as.numeric(mem_parts[7])
-        } else {
-          free_mem_mb <- as.numeric(mem_parts[4])
-        }
-        return(free_mem_mb)
-      }
-    } else {  # Windows or unknown
-      return(8000)  # Default to 8GB for unknown systems
-    }
-  }, error = function(e) {
-    # If memory detection fails, use a conservative default
-    cat("Could not detect available memory, using default value\n")
-    return(4000)  # Default to 4GB if detection fails
-  })
-}
-
-# Function for smart adaptive batch sizing based on memory and data characteristics
-calculate_adaptive_batch_size <- function(items_count, estimated_item_size_mb, 
-                                         min_batch = 3, max_batch = 50,
-                                         memory_reserve_percent = 30) {
-  # Get available memory
-  available_memory_mb <- get_available_memory()
-  
-  # Reserve some memory for system and other R operations
-  reserved_memory_mb <- available_memory_mb * (memory_reserve_percent/100)
-  usable_memory_mb <- available_memory_mb - reserved_memory_mb
-  
-  # Calculate theoretical batch size based on memory
-  theoretical_batch_size <- floor(usable_memory_mb / estimated_item_size_mb)
-  
-  # Apply reasonable limits
-  optimal_batch_size <- min(max(theoretical_batch_size, min_batch), max_batch)
-  
-  # Special handling for hardware types
-  if (exists("hw_caps") && hw_caps$apple_silicon) {
-    # Apple Silicon can handle larger batches due to unified memory
-    optimal_batch_size <- min(optimal_batch_size * 1.3, max_batch)
-  } else if (exists("hw_caps") && hw_caps$has_gpu) {
-    # GPU systems may benefit from larger batches to utilize GPU fully
-    optimal_batch_size <- min(optimal_batch_size * 1.2, max_batch)
-  }
-  
-  # Never process more items than we have
-  optimal_batch_size <- min(optimal_batch_size, items_count)
-  
-  return(optimal_batch_size)
-}
-
-# Smart garbage collection based on hardware type
+# Smart garbage collection
 adaptive_gc <- function(force_full = FALSE) {
   if (exists("hw_caps") && hw_caps$apple_silicon) {
     # Less aggressive GC for Apple Silicon to avoid memory fragmentation
@@ -689,9 +537,6 @@ adaptive_gc <- function(force_full = FALSE) {
   }
 }
 
-# Note: This function has been removed as it's not currently used in the workflow
-# If needed in the future, it can be implemented for hardware-accelerated matrix operations
-
 # Detect hardware and set up environment
 hw_caps <- detect_hardware_capabilities()
 
@@ -702,13 +547,6 @@ cat(sprintf("Estimated %.1f GB total memory\n", hw_caps$memory_gb))
 
 if (hw_caps$apple_silicon) {
   cat("Detected Apple Silicon (M-series) processor\n")
-  if (hw_caps$neural_engine) {
-    cat("Apple Neural Engine acceleration available\n")
-  }
-}
-
-if (hw_caps$has_gpu) {
-  cat(sprintf("GPU acceleration available (%s)\n", hw_caps$gpu_type))
 }
 
 cat(sprintf("Using %d worker threads for parallel processing\n", hw_caps$optimal_workers))
@@ -718,55 +556,18 @@ cat(sprintf("Setting memory limit to %.1f GB\n", hw_caps$memory_limit_gb))
 # Parallelization
 
 ```{r parallelization}
-# Set up parallelization for faster processing using detected hardware capabilities
-# Set the future plan based on hardware
+# Set up parallelization for faster processing
 future::plan(future::multisession, workers = hw_caps$optimal_workers)
 
 # Set memory limits based on hardware capabilities
 options(future.globals.maxSize = hw_caps$memory_limit_gb * 1024^3)
 
-# Apply hardware-specific optimizations
+# Apply Apple Silicon optimizations if detected
 if (hw_caps$apple_silicon) {
   # For Apple Silicon, set environment variables for optimal performance
   Sys.setenv(VECLIB_MAXIMUM_THREADS = as.character(hw_caps$optimal_workers))
-  
-  # Enable Accelerate framework optimizations if available
-  if (requireNamespace("RcppArmadillo", quietly = TRUE)) {
-    cat("RcppArmadillo detected: leveraging Accelerate framework for matrix operations\n")
-  }
-  
-  # macOS-specific optimizations
   Sys.setenv(OMP_THREAD_LIMIT = as.character(hw_caps$optimal_workers))
-  
-  # Additional M-series optimizations
   cat("Applied Apple Silicon-specific optimizations\n")
-}
-
-# GPU-specific setup if available
-if (hw_caps$has_gpu) {
-  if (hw_caps$gpu_type == "tensorflow") {
-    # Configure TensorFlow to use GPU memory growth
-    tryCatch({
-      tensorflow::tf$config$experimental$set_memory_growth(
-        tensorflow::tf$config$list_physical_devices('GPU')[[1]], 
-        TRUE
-      )
-      cat("Configured TensorFlow for GPU memory growth\n")
-    }, error = function(e) {
-      cat("TensorFlow GPU configuration failed:", conditionMessage(e), "\n")
-    })
-  } else if (hw_caps$gpu_type == "torch-cuda" || hw_caps$gpu_type == "torch-mps") {
-    # Configure torch for optimal performance
-    tryCatch({
-      # Set default tensor type to float for better performance
-      torch::torch_set_default_dtype(torch::torch_float())
-      cat("Configured torch for optimal GPU performance\n")
-    }, error = function(e) {
-      cat("Torch GPU configuration failed:", conditionMessage(e), "\n")
-    })
-  }
-  
-  cat("Applied GPU-specific optimizations\n")
 }
 
 # Set the random seed for reproducibility
@@ -826,60 +627,14 @@ tryCatch({
 })
 ```
 
-# Set Working Directory and Configure for Single or Multi-Run Processing
+# Set Working Directory and Configure for Processing
 
 ```{r run-configuration}
-# Check for multi-run mode specified in parameters
-is_multi_run <- params$multi_run
-is_big_data <- params$big_data
+# Set data directory
+path <- "data"
+cat("Using data directory for processing\n")
 
-if(is_multi_run) {
-  cat("Multi-run processing mode enabled\n")
-  
-  # Check if run directory is specified
-  if(!is.null(params$run_dir) && nchar(params$run_dir) > 0) {
-    root_path <- params$run_dir
-    cat("Using specified run directory:", root_path, "\n")
-  } else {
-    # Default to data directory with subdirectories for runs
-    root_path <- "data"
-    cat("Using default data directory for multi-run processing\n")
-  }
-  
-  # Check if the run directory exists
-  if(!dir.exists(root_path)) {
-    stop("Run directory does not exist: ", root_path)
-  }
-  
-  # Look for run subdirectories
-  run_dirs <- list.dirs(root_path, full.names = TRUE, recursive = FALSE)
-  
-  # Filter to only include directories that have fastq files
-  run_dirs <- run_dirs[sapply(run_dirs, function(dir) {
-    length(list.files(dir, pattern = "\\.(fastq|fq)(\\.gz)?$", recursive = TRUE)) > 0
-  })]
-  
-  if(length(run_dirs) == 0) {
-    cat("No run directories with fastq files found in", root_path, "\n")
-    cat("Falling back to single-run mode with data directory\n")
-    is_multi_run <- FALSE
-    path <- "data"
-  } else {
-    cat("Found", length(run_dirs), "run directories with fastq files:\n")
-    cat(paste(" -", basename(run_dirs)), sep = "\n")
-  }
-} else {
-  # Single run mode
-  cat("Single-run processing mode enabled\n")
-  path <- "data"
-}
-
-# For big data mode, we'll use more aggressive memory management
-if(is_big_data) {
-  cat("Big data mode enabled - optimizing for memory efficiency\n")
-}
-
-# Create a function to handle file finding for both single and multi-run modes
+# Function to find paired FASTQ files
 find_fastq_files <- function(search_path, recursive = FALSE) {
   # Common function to handle various file naming patterns
   
@@ -937,8 +692,8 @@ find_fastq_files <- function(search_path, recursive = FALSE) {
 ```
 
 ```{r locate-files}
-# Function to extract sample names from filenames that works with multiple naming conventions
-extract_sample_names <- function(file_paths, pattern, run_names = NULL) {
+# Function to extract sample names from filenames
+extract_sample_names <- function(file_paths, pattern) {
   sample_names <- basename(file_paths)
   
   # First handle the standard Illumina pattern
@@ -950,7 +705,7 @@ extract_sample_names <- function(file_paths, pattern, run_names = NULL) {
     sample_names <- gsub("_R\\d\\.fastq\\.gz$", "", sample_names)
   }
   # General case: remove file extension and the "R1"/"R2"/"forward"/"reverse" pattern
-    else {
+  else {
     # Remove fastq/fq file extension
     sample_names <- gsub("\\.(fastq|fq)(\\.gz)?$", "", sample_names)
     # Remove R1/R2 or forward/reverse pattern
@@ -959,28 +714,6 @@ extract_sample_names <- function(file_paths, pattern, run_names = NULL) {
   
   # Remove trailing underscores if present
   sample_names <- gsub("_+$", "", sample_names)
-  
-  # If we have run names and are in multi-run mode, prefix with run name
-  if(!is.null(run_names)) {
-    # Extract the run name for each file by matching its path against the run directories
-    file_runs <- sapply(file_paths, function(fp) {
-      # Find which run directory this file belongs to
-      run_idx <- which(sapply(names(run_names), function(r) grepl(r, fp, fixed = TRUE)))
-      if(length(run_idx) > 0) {
-        return(run_names[run_idx[1]])  # Return the run name
-      } else {
-        return("unknown")  # Fallback
-      }
-    })
-    
-    # Prefix sample names with run names (if in multi-run mode)
-    if(is_multi_run) {
-      sample_names <- paste(file_runs, sample_names, sep = "_")
-    }
-    
-    # Store the run information (useful for multi-run handling)
-    attr(sample_names, "runs") <- file_runs
-  }
   
   return(sample_names)
 }
@@ -1056,79 +789,22 @@ get_expected_amplicon_size <- function(primer) {
   }
 }
 
-# Process files differently based on single or multi-run mode
-if(is_multi_run) {
-  # Initialize lists to store file information for each run
-  all_fnFs <- list()
-  all_fnRs <- list()
-  all_sample_names <- list()
-  run_names <- character()
-  
-  # Process each run directory
-  for(i in seq_along(run_dirs)) {
-    run_dir <- run_dirs[i]
-    run_name <- basename(run_dir)
-    cat("\nProcessing run directory:", run_name, "\n")
-    
-    # Find fastq files for this run
-    files <- find_fastq_files(run_dir)
-    
-    if(is.null(files)) {
-      cat("No valid fastq files found in", run_dir, "- skipping\n")
-      next
-    }
-    
-    # Store the files for this run
-    all_fnFs[[run_name]] <- files$fnFs
-    all_fnRs[[run_name]] <- files$fnRs
-    
-    # Extract sample names for this run
-    run_sample_names <- extract_sample_names(files$fnFs, files$pattern)
-    all_sample_names[[run_name]] <- run_sample_names
-    
-    # Store the run name
-    run_names[run_name] <- run_name
-    
-    cat("Found", length(files$fnFs), "samples in run", run_name, "\n")
-  }
-  
-  # Check if we found any valid runs
-  if(length(all_fnFs) == 0) {
-    stop("No valid fastq files found in any run directories")
-  }
-  
-  # Combine all runs into single vectors
-  fnFs <- unlist(all_fnFs, use.names = FALSE)
-  fnRs <- unlist(all_fnRs, use.names = FALSE)
-  
-  # Get run for each file for later use in naming
-  file_to_run <- rep(names(all_fnFs), sapply(all_fnFs, length))
-  names(file_to_run) <- NULL  # Clean names to avoid confusion
-  
-  # Extract sample names with run prefixes
-  sample.names <- extract_sample_names(fnFs, "combined", run_names = file_to_run)
-  
-  cat("\nCombined all runs:", length(fnFs), "total samples from", length(all_fnFs), "runs\n")
-} else {
-  # Single run mode
-  cat("\nProcessing in single-run mode\n")
-  
-  # Find fastq files
-  files <- find_fastq_files(path)
-  
-  if(is.null(files)) {
-    stop("No valid fastq files found in data directory. Please check your file paths and naming conventions.")
-  }
-  
-  fnFs <- files$fnFs
-  fnRs <- files$fnRs
-  file_pattern <- files$pattern
-  
-  # Extract sample names
-  sample.names <- extract_sample_names(fnFs, file_pattern)
-  
-  cat("Found", length(fnFs), "samples\n")
+# Find fastq files
+cat("\nSearching for FASTQ files\n")
+files <- find_fastq_files(path)
+
+if(is.null(files)) {
+  stop("No valid fastq files found in data directory. Please check your file paths and naming conventions.")
 }
+
+fnFs <- files$fnFs
+fnRs <- files$fnRs
+file_pattern <- files$pattern
+
+# Extract sample names
+sample.names <- extract_sample_names(fnFs, file_pattern)
+
+cat("Found", length(fnFs), "samples\n")
 
 # Verify sample names were extracted properly
 sample.df <- data.frame(
@@ -1143,20 +819,10 @@ if (length(fnFs) != length(fnRs)) {
   stop("Number of forward and reverse files don't match. Check your files.")
 }
 
-# Get primer information based on combined files if in multi-run mode
+# Get primer information from filenames
 primer_info <- detect_primers(c(fnFs, fnRs))
 expected_amplicon_size <- get_expected_amplicon_size(primer_info)
 cat("Expected amplicon size:", expected_amplicon_size, "bp\n")
-
-# Create run information table if in multi-run mode
-if(is_multi_run && exists("file_to_run")) {
-  run_table <- table(file_to_run)
-  run_df <- data.frame(
-    Run = names(run_table),
-    Samples = as.numeric(run_table)
-  )
-  kable(run_df, caption = "Sample Counts by Run")
-}
 ```
 
 # Initial Quality Assessment
@@ -1884,49 +1550,12 @@ if (length(filtFs) > 0) {
 
 In this step, DADA2 learns the error rates from the filtered sequence data. This is a critical step that models the relationship between sequence quality scores and the observed error rates, allowing the algorithm to better distinguish between sequencing errors and true biological variation.
 
-The workflow uses parallelization and memory optimization techniques to efficiently process the data:
-- For large datasets, a representative subset of samples is randomly selected
-- Error models are learned separately for forward and reverse reads
-- The resulting error rates are visualized to show the quality of the model fit
-- These error models will be used in the subsequent denoising step to infer the true biological sequences
-
 ```{r learn-errors}
-# Learn error rates with optimized parallelization and hardware acceleration
-cat("Learning error rates with hardware-optimized parallelization...\n")
+# Learn error rates with optimized parallelization
+cat("Learning error rates with optimized parallelization...\n")
 
-# Function to optimize error learning with GPU acceleration if available
-# This function can use GPU for matrix operations in the error model
-optimized_learn_errors <- function(fastq_files, nbases = 1e8, use_gpu = TRUE) {
-  # Check if GPU acceleration is available for matrix operations
-  if (use_gpu && exists("hw_caps") && hw_caps$has_gpu) {
-    cat("Attempting to use GPU acceleration for error model computation...\n")
-    
-    tryCatch({
-      # Call learnErrors with GPU-optimized parameters
-      if (hw_caps$gpu_type == "torch-mps" || hw_caps$gpu_type == "torch-cuda") {
-        # Torch-based approach would be implemented here in a real-world scenario
-        # For now, we're using the standard function with GPU-optimized parameters
-        result <- learnErrors(fastq_files, multithread = TRUE, randomize = TRUE, 
-                             verbose = TRUE, nbases = nbases)
-      } else if (hw_caps$gpu_type == "tensorflow") {
-        # TensorFlow-based approach would be implemented here
-        # For now, using standard function with optimized parameters
-        result <- learnErrors(fastq_files, multithread = TRUE, randomize = TRUE, 
-                             verbose = TRUE, nbases = nbases)
-      } else {
-        # Generic GPU approach
-        result <- learnErrors(fastq_files, multithread = TRUE, randomize = TRUE, 
-                             verbose = TRUE, nbases = nbases)
-      }
-      cat("GPU-accelerated error learning complete\n")
-      return(result)
-    }, error = function(e) {
-      cat("GPU-accelerated error learning failed, falling back to CPU:", conditionMessage(e), "\n")
-      # Fall back to CPU implementation if GPU fails
-      return(NULL)
-    })
-  }
-  
+# Optimize error learning with hardware-specific optimizations
+optimized_learn_errors <- function(fastq_files, nbases = 1e8) {
   # CPU implementation with hardware-specific optimizations
   if (exists("hw_caps") && hw_caps$apple_silicon) {
     # Optimize for Apple Silicon
@@ -1960,51 +1589,21 @@ determine_error_learning_samples <- function(total_samples) {
     if (hw_caps$apple_silicon) {
       # Apple Silicon can handle more samples efficiently
       max_samples <- 60
-    } else if (hw_caps$has_gpu) {
-      # Systems with GPU can process more samples
-      max_samples <- 70
     } else if (hw_caps$cores >= 16) {
       # High-core systems
       max_samples <- 50
     }
   }
   
-  # Determine memory-based sample limit
-  # Each sample needs approximately 20-40MB for error learning
-  if (exists("hw_caps") && hw_caps$memory_gb > 0) {
-    mem_based_limit <- as.integer(hw_caps$memory_gb * 1024 / 30)  # 30MB per sample estimate
-    max_samples <- min(max_samples, mem_based_limit)
-  }
-  
   # Never use more samples than we have
   return(min(max_samples, total_samples))
-}
-
-# Determine batch size for large datasets
-batch_size_for_error_learning <- function(total_samples) {
-  if (exists("hw_caps")) {
-    # Calculate from hardware parameters
-    samples_per_batch <- if (hw_caps$apple_silicon) {
-      30  # Larger batches for unified memory architecture
-    } else if (hw_caps$has_gpu) {
-      25  # GPU can handle larger batches
-    } else {
-      20  # Conservative for standard systems
-    }
-    
-    # Ensure reasonable bounds
-    return(min(samples_per_batch, total_samples))
-  } else {
-    # Conservative default
-    return(min(20, total_samples))
-  }
 }
 
 # Determine samples to use for error learning
 total_samples <- length(filtFs)
 MAX_ERROR_LEARN_SAMPLES <- determine_error_learning_samples(total_samples)
 
-cat(sprintf("Hardware-optimized error learning will use up to %d samples\n", MAX_ERROR_LEARN_SAMPLES))
+cat(sprintf("Optimized error learning will use up to %d samples\n", MAX_ERROR_LEARN_SAMPLES))
 
 # Sample selection for error learning
 if(total_samples > MAX_ERROR_LEARN_SAMPLES) {
@@ -2014,96 +1613,33 @@ if(total_samples > MAX_ERROR_LEARN_SAMPLES) {
   set.seed(100)  # For reproducibility
   error_learn_samples <- sample(seq_along(filtFs), MAX_ERROR_LEARN_SAMPLES)
   
-  # Determine if we need batching for large sample sets
-  if (MAX_ERROR_LEARN_SAMPLES > 30) {
-    # Use batched approach for larger sample sets
-    batch_size <- batch_size_for_error_learning(MAX_ERROR_LEARN_SAMPLES)
-    cat(sprintf("Using batched error learning with %d samples per batch\n", batch_size))
-    
-    # Create batches
-    batch_indices <- split(error_learn_samples, ceiling(seq_along(error_learn_samples)/batch_size))
-    
-    # Process forward reads in batches
-    cat("Learning error rates for forward reads...\n")
-    errF_batches <- list()
-    
-    for (i in seq_along(batch_indices)) {
-      cat(sprintf("Processing forward batch %d of %d...\n", i, length(batch_indices)))
-      batch_samples <- batch_indices[[i]]
-      
-      # Process this batch with optimization
-      batch_errF <- optimized_learn_errors(filtFs[batch_samples], 
-                                         nbases = if (exists("hw_caps") && hw_caps$apple_silicon) 1e9 else 1e8,
-                                         use_gpu = exists("hw_caps") && hw_caps$has_gpu)
-      
-      # Store batch results
-      errF_batches[[i]] <- batch_errF
-      
-      # Optimized garbage collection
-      adaptive_gc(i == length(batch_indices))  # Full GC only on last batch
-    }
-    
-    # Combine batch results for forward reads
-    # In a proper implementation, we would aggregate the error models
-    # For now, we'll use the first batch as a simplification
-    errF <- errF_batches[[1]]
-    
-    # Process reverse reads in batches
-    cat("Learning error rates for reverse reads...\n")
-    errR_batches <- list()
-    
-    for (i in seq_along(batch_indices)) {
-      cat(sprintf("Processing reverse batch %d of %d...\n", i, length(batch_indices)))
-      batch_samples <- batch_indices[[i]]
-      
-      # Process this batch with optimization
-      batch_errR <- optimized_learn_errors(filtRs[batch_samples], 
-                                         nbases = if (exists("hw_caps") && hw_caps$apple_silicon) 1e9 else 1e8,
-                                         use_gpu = exists("hw_caps") && hw_caps$has_gpu)
-      
-      # Store batch results
-      errR_batches[[i]] <- batch_errR
-      
-      # Optimized garbage collection
-      adaptive_gc(i == length(batch_indices))  # Full GC only on last batch
-    }
-    
-    # Combine batch results for reverse reads
-    # In a proper implementation, we would aggregate the error models
-    # For now, we'll use the first batch as a simplification
-    errR <- errR_batches[[1]]
-  } else {
-    # Standard non-batched approach for smaller sample sets
-    cat("Learning error rates for forward reads...\n")
-    errF <- optimized_learn_errors(filtFs[error_learn_samples], 
-                                 nbases = if (exists("hw_caps") && hw_caps$apple_silicon) 1e9 else 1e8,
-                                 use_gpu = exists("hw_caps") && hw_caps$has_gpu)
-    
-    # Apply optimized garbage collection
-    adaptive_gc(FALSE)
-    
-    cat("Learning error rates for reverse reads...\n")
-    errR <- optimized_learn_errors(filtRs[error_learn_samples], 
-                                 nbases = if (exists("hw_caps") && hw_caps$apple_silicon) 1e9 else 1e8,
-                                 use_gpu = exists("hw_caps") && hw_caps$has_gpu)
-  }
+  # Process forward reads
+  cat("Learning error rates for forward reads...\n")
+  errF <- optimized_learn_errors(filtFs[error_learn_samples], 
+                               nbases = if (exists("hw_caps") && hw_caps$apple_silicon) 1e9 else 1e8)
+  
+  # Apply optimized garbage collection
+  adaptive_gc(FALSE)
+  
+  # Process reverse reads
+  cat("Learning error rates for reverse reads...\n")
+  errR <- optimized_learn_errors(filtRs[error_learn_samples], 
+                               nbases = if (exists("hw_caps") && hw_caps$apple_silicon) 1e9 else 1e8)
 } else {
   # For smaller datasets, use all samples
   cat("Learning error rates for forward reads using all samples...\n")
   errF <- optimized_learn_errors(filtFs, 
-                               nbases = if (exists("hw_caps") && hw_caps$apple_silicon) 1e9 else 1e8,
-                               use_gpu = exists("hw_caps") && hw_caps$has_gpu)
+                               nbases = if (exists("hw_caps") && hw_caps$apple_silicon) 1e9 else 1e8)
   
   # Apply optimized garbage collection
   adaptive_gc(FALSE)
   
   cat("Learning error rates for reverse reads using all samples...\n")
   errR <- optimized_learn_errors(filtRs, 
-                               nbases = if (exists("hw_caps") && hw_caps$apple_silicon) 1e9 else 1e8,
-                               use_gpu = exists("hw_caps") && hw_caps$has_gpu)
+                               nbases = if (exists("hw_caps") && hw_caps$apple_silicon) 1e9 else 1e8)
 }
 
-# Final garbage collection after both error models are learned
+# Final garbage collection
 adaptive_gc(TRUE)
 
 # Plot error rates for forward reads
@@ -2114,27 +1650,14 @@ print(errF_plot + ggtitle("Error Rates - Forward Reads"))
 errR_plot <- plotErrors(errR, nominalQ = TRUE)
 print(errR_plot + ggtitle("Error Rates - Reverse Reads"))
 
-# Create error rate plots with more informative titles
-errF_plot <- plotErrors(errF, nominalQ = TRUE) + 
-  ggtitle("Error Rates - Forward Reads") + 
-  labs(subtitle = "Points: observed error rates; Lines: fitted error model")
-
-errR_plot <- plotErrors(errR, nominalQ = TRUE) + 
-  ggtitle("Error Rates - Reverse Reads") + 
-  labs(subtitle = "Points: observed error rates; Lines: fitted error model")
-
 # Create a side-by-side plot
-grid.arrange(errF_plot, errR_plot, ncol = 2)
+grid.arrange(
+  errF_plot + ggtitle("Error Rates - Forward Reads"), 
+  errR_plot + ggtitle("Error Rates - Reverse Reads"), 
+  ncol = 2
+)
 
-# Create checkpoint after learning error rates with performance metrics
-save_checkpoint("after_error_learning", 
-               c("filtFs", "filtRs", "errF", "errR", "sample.names",
-                 "truncLen_forward", "truncLen_reverse", "maxEE_forward", "maxEE_reverse",
-                 "is_multi_run"),  # Added multi-run tracking
-               overwrite = TRUE)
-cat("Checkpoint saved after error learning step\n")
-
-# Create a separate file with error model parameters for reproducibility
+# Save error models for reproducibility
 if (!dir.exists("results")) dir.create("results")
 error_models <- list(
   forward = errF,
@@ -2197,40 +1720,11 @@ cat("Dereplication summary saved to results/derep_summary.csv\n")
 DADA2 will now denoise the data and infer the true biological sequences.
 
 ```{r dada2}
-# Apply the DADA2 algorithm with hardware-optimized acceleration
-cat("Denoising reads with hardware-optimized acceleration...\n")
+# Apply the DADA2 algorithm with optimized processing
+cat("Denoising reads with optimized parallelization...\n")
 
-# Function to optimize DADA2 sample inference with GPU acceleration if available
-optimized_dada <- function(derep, err, pool = FALSE, use_gpu = TRUE) {
-  # Check if GPU acceleration is available for matrix operations
-  if (use_gpu && exists("hw_caps") && hw_caps$has_gpu) {
-    cat("Attempting to use GPU acceleration for sample inference...\n")
-    
-    tryCatch({
-      # Call dada with GPU-optimized parameters
-      if (hw_caps$gpu_type == "torch-mps" || hw_caps$gpu_type == "torch-cuda") {
-        # Torch-based acceleration for matrix operations
-        # In a real implementation, we would use torch to accelerate specific operations
-        # For now, using standard function with GPU-optimized parameters
-        result <- dada(derep, err = err, multithread = TRUE, pool = pool)
-      } else if (hw_caps$gpu_type == "tensorflow") {
-        # TensorFlow-based acceleration
-        # In a real implementation, we would use tensorflow to accelerate specific operations
-        # For now, using standard function with GPU-optimized parameters
-        result <- dada(derep, err = err, multithread = TRUE, pool = pool)
-      } else {
-        # Generic GPU approach
-        result <- dada(derep, err = err, multithread = TRUE, pool = pool)
-      }
-      cat("GPU-accelerated sample inference complete\n")
-      return(result)
-    }, error = function(e) {
-      cat("GPU-accelerated sample inference failed, falling back to CPU:", conditionMessage(e), "\n")
-      # Fall back to CPU implementation if GPU fails
-      return(NULL)
-    })
-  }
-  
+# Function to optimize DADA2 sample inference with hardware-specific settings
+optimized_dada <- function(derep, err, pool = FALSE) {
   # CPU implementation with hardware-specific optimizations
   if (exists("hw_caps") && hw_caps$apple_silicon) {
     # Optimize for Apple Silicon
@@ -2249,259 +1743,88 @@ optimized_dada <- function(derep, err, pool = FALSE, use_gpu = TRUE) {
   }
 }
 
-# Determine optimal batch size for sample inference based on hardware and data
-optimize_sample_inference_batch_size <- function(item_count) {
-  # Calculate memory requirements - each sample takes roughly 200-400MB
-  estimated_mem_per_sample <- 300  # MB per sample (rough estimate)
-  
-  # Call general memory-based batch size calculation
-  batch_size <- calculate_adaptive_batch_size(
-    items_count = item_count,
-    estimated_item_size_mb = estimated_mem_per_sample,
-    min_batch = 5,
-    max_batch = 30
-  )
-  
-  return(batch_size)
-}
+# Use pseudo-pooling to improve detection of rare variants
+pooling_option <- "pseudo"
+cat("Using pseudo-pooling across all samples\n")
 
-# Determine pooling option based on multi-run status
-# For multi-run data, we can use "pseudo" pooling within each run
-# For a single run, use "pseudo" pooling overall
-pooling_option <- ifelse(is_multi_run && exists("file_to_run"), FALSE, "pseudo")
-
-if(is_multi_run && exists("file_to_run")) {
-  cat("Multi-run mode: Each run will be processed separately with pseudo-pooling within each run\n")
-} else {
-  cat("Using pseudo-pooling across all samples\n")
-}
-
-# Optimize forward reads processing
+# Process forward reads
 cat("Denoising forward reads with optimized parallelization...\n")
 
-# Use parallel batch processing for large datasets
-if (length(derepFs) > 20 || is_multi_run) {
-  # Calculate optimal batch size for this dataset and hardware
-  batch_size <- optimize_sample_inference_batch_size(length(derepFs))
-  cat(sprintf("Using adaptive batch size of %d for forward reads based on hardware capabilities\n", batch_size))
-  
-  if(is_multi_run && exists("file_to_run")) {
-    # In multi-run mode, use runs for batching
-    run_names <- unique(file_to_run)
-    cat("Processing each sequencing run independently\n")
-    
-    # Process each run separately with GPU acceleration if available
-    dadaFs_list <- list()
-    for(run in run_names) {
-      cat(sprintf("Processing run '%s' forward reads...\n", run))
-      # Get samples for this run
-      run_samples <- names(derepFs)[file_to_run == run]
-      
-      if(length(run_samples) > batch_size) {
-        # Further divide into batches if the run has many samples
-        run_batches <- split(run_samples, ceiling(seq_along(run_samples)/batch_size))
-        
-        # Process each batch with pooling within the run
-        run_dadaFs <- list()
-        for(j in seq_along(run_batches)) {
-          cat(sprintf("  Processing batch %d of %d within run '%s'...\n", 
-                    j, length(run_batches), run))
-          batch_samples <- run_batches[[j]]
-          
-          # Use hardware-optimized sample inference
-          batch_dadaFs <- optimized_dada(derepFs[batch_samples], 
-                                       err = errF, 
-                                       pool = "pseudo",
-                                       use_gpu = exists("hw_caps") && hw_caps$has_gpu)
-          
-          run_dadaFs <- c(run_dadaFs, batch_dadaFs)
-          
-          # Optimized garbage collection
-          adaptive_gc(j == length(run_batches))  # Full GC only on last batch
-        }
-      } else {
-        # Process all samples in this run at once with pooling
-        run_dadaFs <- optimized_dada(derepFs[run_samples], 
-                                    err = errF, 
-                                    pool = "pseudo",
-                                    use_gpu = exists("hw_caps") && hw_caps$has_gpu)
-      }
-      
-      # Add to the full list
-      dadaFs_list <- c(dadaFs_list, run_dadaFs)
-      
-      # Optimized garbage collection after each run
-      adaptive_gc(run == run_names[length(run_names)])
-    }
-    dadaFs <- dadaFs_list
-  } else {
-    # Standard batch processing (not separated by run)
-    sample_names <- names(derepFs)
-    batch_groups <- split(sample_names, ceiling(seq_along(sample_names)/batch_size))
-    
-    # Pre-allocate results list to avoid memory fragmentation
-    dadaFs <- vector("list", length(sample_names))
-    names(dadaFs) <- sample_names
-    
-    # Process each batch and combine results
-    for (i in seq_along(batch_groups)) {
-      cat(sprintf("Processing forward batch %d of %d...\n", i, length(batch_groups)))
-      batch_samples <- batch_groups[[i]]
-      
-      # Process with hardware optimization
-      batch_results <- optimized_dada(derepFs[batch_samples], 
-                                     err = errF, 
-                                     pool = pooling_option,
-                                     use_gpu = exists("hw_caps") && hw_caps$has_gpu)
-      
-      # Assign directly to pre-allocated list to reduce memory fragmentation
-      for (sample_name in names(batch_results)) {
-        dadaFs[[sample_name]] <- batch_results[[sample_name]]
-      }
-      
-      # Monitor memory usage and adjust batch size dynamically if needed
-      if (i < length(batch_groups)) {
-        current_memory <- get_available_memory()
-        memory_threshold <- 0.3 * get_available_memory()  # 30% of total as threshold
-        
-        if (current_memory < memory_threshold) {
-          # Memory is getting low, reduce batch size for next iteration
-          cat("Memory pressure detected, reducing batch size for next batches\n")
-          new_batch_size <- max(floor(batch_size * 0.7), 3)
-          
-          # Recalculate batches for remaining samples
-          remaining_samples <- unlist(batch_groups[(i+1):length(batch_groups)])
-          batch_groups <- c(
-            batch_groups[1:i],
-            split(remaining_samples, ceiling(seq_along(remaining_samples)/new_batch_size))
-          )
-        }
-      }
-      
-      # Optimized garbage collection
-      adaptive_gc(i == length(batch_groups) || i %% 3 == 0)
-    }
-  }
+# For smaller datasets, process all at once with hardware optimization
+if (length(derepFs) <= 20) {
+  dadaFs <- optimized_dada(derepFs, err = errF, pool = pooling_option)
 } else {
-  # For smaller datasets, process all at once with hardware optimization
-  dadaFs <- optimized_dada(derepFs, 
-                          err = errF, 
-                          pool = pooling_option,
-                          use_gpu = exists("hw_caps") && hw_caps$has_gpu)
+  # Use batch processing for larger datasets
+  batch_size <- 20  # Default batch size
+  
+  # Adjust batch size for Apple Silicon
+  if (exists("hw_caps") && hw_caps$apple_silicon) {
+    batch_size <- 30
+  }
+  
+  sample_names <- names(derepFs)
+  batch_groups <- split(sample_names, ceiling(seq_along(sample_names)/batch_size))
+  
+  # Pre-allocate results list to avoid memory fragmentation
+  dadaFs <- vector("list", length(sample_names))
+  names(dadaFs) <- sample_names
+  
+  # Process each batch and combine results
+  for (i in seq_along(batch_groups)) {
+    cat(sprintf("Processing forward batch %d of %d...\n", i, length(batch_groups)))
+    batch_samples <- batch_groups[[i]]
+    
+    # Process with hardware optimization
+    batch_results <- optimized_dada(derepFs[batch_samples], err = errF, pool = pooling_option)
+    
+    # Assign directly to pre-allocated list
+    for (sample_name in names(batch_results)) {
+      dadaFs[[sample_name]] <- batch_results[[sample_name]]
+    }
+    
+    # Optimized garbage collection
+    adaptive_gc(i == length(batch_groups) || i %% 3 == 0)
+  }
 }
 
-# Apply optimized denoising to reverse reads
+# Process reverse reads 
 cat("Denoising reverse reads with optimized parallelization...\n")
 
-# Use parallel batch processing for large datasets
-if (length(derepRs) > 20 || is_multi_run) {
-  # Calculate optimal batch size for this dataset and hardware
-  batch_size <- optimize_sample_inference_batch_size(length(derepRs))
-  cat(sprintf("Using adaptive batch size of %d for reverse reads based on hardware capabilities\n", batch_size))
-  
-  if(is_multi_run && exists("file_to_run")) {
-    # In multi-run mode, use runs for batching
-    run_names <- unique(file_to_run)
-    cat("Processing each sequencing run independently\n")
-    
-    # Process each run separately with GPU acceleration if available
-    dadaRs_list <- list()
-    for(run in run_names) {
-      cat(sprintf("Processing run '%s' reverse reads...\n", run))
-      # Get samples for this run
-      run_samples <- names(derepRs)[file_to_run == run]
-      
-      if(length(run_samples) > batch_size) {
-        # Further divide into batches if the run has many samples
-        run_batches <- split(run_samples, ceiling(seq_along(run_samples)/batch_size))
-        
-        # Process each batch with pooling within the run
-        run_dadaRs <- list()
-        for(j in seq_along(run_batches)) {
-          cat(sprintf("  Processing batch %d of %d within run '%s'...\n", 
-                    j, length(run_batches), run))
-          batch_samples <- run_batches[[j]]
-          
-          # Use hardware-optimized sample inference
-          batch_dadaRs <- optimized_dada(derepRs[batch_samples], 
-                                       err = errR, 
-                                       pool = "pseudo",
-                                       use_gpu = exists("hw_caps") && hw_caps$has_gpu)
-          
-          run_dadaRs <- c(run_dadaRs, batch_dadaRs)
-          
-          # Optimized garbage collection
-          adaptive_gc(j == length(run_batches))  # Full GC only on last batch
-        }
-      } else {
-        # Process all samples in this run at once with pooling
-        run_dadaRs <- optimized_dada(derepRs[run_samples], 
-                                    err = errR, 
-                                    pool = "pseudo",
-                                    use_gpu = exists("hw_caps") && hw_caps$has_gpu)
-      }
-      
-      # Add to the full list
-      dadaRs_list <- c(dadaRs_list, run_dadaRs)
-      
-      # Optimized garbage collection after each run
-      adaptive_gc(run == run_names[length(run_names)])
-    }
-    dadaRs <- dadaRs_list
-  } else {
-    # Standard batch processing (not separated by run)
-    sample_names <- names(derepRs)
-    batch_groups <- split(sample_names, ceiling(seq_along(sample_names)/batch_size))
-    
-    # Pre-allocate results list to avoid memory fragmentation
-    dadaRs <- vector("list", length(sample_names))
-    names(dadaRs) <- sample_names
-    
-    # Process each batch and combine results
-    for (i in seq_along(batch_groups)) {
-      cat(sprintf("Processing reverse batch %d of %d...\n", i, length(batch_groups)))
-      batch_samples <- batch_groups[[i]]
-      
-      # Process with hardware optimization
-      batch_results <- optimized_dada(derepRs[batch_samples], 
-                                     err = errR, 
-                                     pool = pooling_option,
-                                     use_gpu = exists("hw_caps") && hw_caps$has_gpu)
-      
-      # Assign directly to pre-allocated list to reduce memory fragmentation
-      for (sample_name in names(batch_results)) {
-        dadaRs[[sample_name]] <- batch_results[[sample_name]]
-      }
-      
-      # Monitor memory usage and adjust batch size dynamically if needed
-      if (i < length(batch_groups)) {
-        current_memory <- get_available_memory()
-        memory_threshold <- 0.3 * get_available_memory()  # 30% of total as threshold
-        
-        if (current_memory < memory_threshold) {
-          # Memory is getting low, reduce batch size for next iteration
-          cat("Memory pressure detected, reducing batch size for next batches\n")
-          new_batch_size <- max(floor(batch_size * 0.7), 3)
-          
-          # Recalculate batches for remaining samples
-          remaining_samples <- unlist(batch_groups[(i+1):length(batch_groups)])
-          batch_groups <- c(
-            batch_groups[1:i],
-            split(remaining_samples, ceiling(seq_along(remaining_samples)/new_batch_size))
-          )
-        }
-      }
-      
-      # Optimized garbage collection
-      adaptive_gc(i == length(batch_groups) || i %% 3 == 0)
-    }
-  }
+# For smaller datasets, process all at once with hardware optimization
+if (length(derepRs) <= 20) {
+  dadaRs <- optimized_dada(derepRs, err = errR, pool = pooling_option)
 } else {
-  # For smaller datasets, process all at once with hardware optimization
-  dadaRs <- optimized_dada(derepRs, 
-                          err = errR, 
-                          pool = pooling_option,
-                          use_gpu = exists("hw_caps") && hw_caps$has_gpu)
+  # Use batch processing for larger datasets
+  batch_size <- 20  # Default batch size
+  
+  # Adjust batch size for Apple Silicon
+  if (exists("hw_caps") && hw_caps$apple_silicon) {
+    batch_size <- 30
+  }
+  
+  sample_names <- names(derepRs)
+  batch_groups <- split(sample_names, ceiling(seq_along(sample_names)/batch_size))
+  
+  # Pre-allocate results list to avoid memory fragmentation
+  dadaRs <- vector("list", length(sample_names))
+  names(dadaRs) <- sample_names
+  
+  # Process each batch and combine results
+  for (i in seq_along(batch_groups)) {
+    cat(sprintf("Processing reverse batch %d of %d...\n", i, length(batch_groups)))
+    batch_samples <- batch_groups[[i]]
+    
+    # Process with hardware optimization
+    batch_results <- optimized_dada(derepRs[batch_samples], err = errR, pool = pooling_option)
+    
+    # Assign directly to pre-allocated list
+    for (sample_name in names(batch_results)) {
+      dadaRs[[sample_name]] <- batch_results[[sample_name]]
+    }
+    
+    # Optimized garbage collection
+    adaptive_gc(i == length(batch_groups) || i %% 3 == 0)
+  }
 }
 
 # Final garbage collection
@@ -2520,11 +1843,6 @@ denoise_summary <- data.frame(
   PercentRetained = sapply(dadaFs, function(x) round(sum(getUniques(x$denoised)) / sum(getUniques(x)) * 100, 1))
 )
 
-# Add run information if in multi-run mode
-if(is_multi_run && exists("file_to_run")) {
-  denoise_summary$Run <- file_to_run[match(denoise_summary$Sample, names(derepFs))]
-}
-
 kable(head(denoise_summary, 10), caption = "Denoising Summary (First 10 Samples)")
 
 # Average denoising stats
@@ -2533,29 +1851,11 @@ total_asvs_forward <- sum(sapply(dadaFs, function(x) length(x$denoised)))
 cat("Average percentage of reads retained after denoising:", round(avg_denoised_pct, 1), "%\n")
 cat("Total ASVs identified in forward reads:", total_asvs_forward, "\n")
 
-# Create checkpoint after sample inference step with better tracking
-save_checkpoint("after_sample_inference", 
-               c("derepFs", "derepRs", "errF", "errR", "dadaFs", "dadaRs", "sample.names",
-                 "is_multi_run", "file_to_run", "denoise_summary", "pooling_option",
-                 "truncLen_forward", "truncLen_reverse", "maxEE_forward", "maxEE_reverse"),
-               overwrite = TRUE)
-cat("Checkpoint saved after sample inference step\n")
-
-# Save denoising summary for easier access and dashboard visualization
+# Save denoising summary 
 if (!dir.exists("results")) dir.create("results")
 saveRDS(denoise_summary, "results/denoise_summary.rds")
 write.csv(denoise_summary, "results/denoise_summary.csv", row.names = FALSE)
 cat("Denoising summary saved to results/denoise_summary.csv\n")
-
-# Record the pooling strategy used
-pooling_info <- list(
-  strategy = pooling_option,
-  multi_run = is_multi_run,
-  timestamp = Sys.time(),
-  forward_asvs = total_asvs_forward
-)
-saveRDS(pooling_info, "results/pooling_strategy.rds")
-cat("Pooling strategy information saved to results/pooling_strategy.rds\n")
 ```
 
 # Merge Paired Reads
@@ -2900,40 +2200,11 @@ cat("Filtered ASV sequences saved to results/filtered_asv_sequences.rds\n")
 # Remove Chimeras
 
 ```{r chimeras}
-# Remove chimeric sequences with hardware-optimized acceleration
-cat("Removing chimeric sequences with hardware-optimized acceleration...\n")
+# Remove chimeric sequences
+cat("Removing chimeric sequences...\n")
 
-# Function to optimize chimera removal with GPU acceleration if available
-optimized_remove_chimeras <- function(seqtab, method = "consensus", use_gpu = TRUE) {
-  # Check if GPU acceleration is available for matrix operations
-  if (use_gpu && exists("hw_caps") && hw_caps$has_gpu) {
-    cat("Attempting to use GPU acceleration for chimera detection...\n")
-    
-    tryCatch({
-      # Call removeBimeraDenovo with GPU-optimized parameters
-      if (hw_caps$gpu_type == "torch-mps" || hw_caps$gpu_type == "torch-cuda") {
-        # Torch-based approach for pairwise alignments and sequence comparisons
-        # This would be implemented as a custom GPU-accelerated version in a real scenario
-        # For now, we're using the standard function with GPU-optimized parameters
-        result <- removeBimeraDenovo(seqtab, method = method, multithread = TRUE, verbose = TRUE)
-      } else if (hw_caps$gpu_type == "tensorflow") {
-        # TensorFlow-based approach for sequence comparisons
-        # This would be implemented as a custom GPU-accelerated version in a real scenario
-        # For now, using standard function with optimized parameters
-        result <- removeBimeraDenovo(seqtab, method = method, multithread = TRUE, verbose = TRUE)
-      } else {
-        # Generic GPU approach
-        result <- removeBimeraDenovo(seqtab, method = method, multithread = TRUE, verbose = TRUE)
-      }
-      cat("GPU-accelerated chimera removal complete\n")
-      return(result)
-    }, error = function(e) {
-      cat("GPU-accelerated chimera removal failed, falling back to CPU:", conditionMessage(e), "\n")
-      # Fall back to CPU implementation if GPU fails
-      return(NULL)
-    })
-  }
-  
+# Optimize chimera removal for hardware
+optimized_remove_chimeras <- function(seqtab, method = "consensus") {
   # CPU implementation with hardware-specific optimizations
   if (exists("hw_caps") && hw_caps$apple_silicon) {
     # Optimize for Apple Silicon
@@ -2952,124 +2223,8 @@ optimized_remove_chimeras <- function(seqtab, method = "consensus", use_gpu = TR
   }
 }
 
-# Determine optimal batch size for chimera removal based on hardware and data
-optimize_chimera_batch_size <- function(asv_count) {
-  # Base batch size - chimera removal is less memory intensive than sample inference
-  base_size <- 2000
-  
-  # Adjust based on hardware - chimera detection compares sequences pairwise
-  if (exists("hw_caps")) {
-    if (hw_caps$has_gpu) {
-      # GPU systems can handle larger batches for sequence comparisons
-      base_size <- 3000
-    } else if (hw_caps$apple_silicon) {
-      # Apple Silicon can handle larger batches due to unified memory
-      base_size <- 2500
-    } else if (hw_caps$cores >= 16) {
-      # High-core systems
-      base_size <- 2200
-    }
-    
-    # Memory-based adjustment
-    if (hw_caps$memory_gb > 16) {
-      # Scale with available memory
-      memory_factor <- min(hw_caps$memory_gb / 16, 2.0)  # Cap at 2x
-      base_size <- base_size * memory_factor
-    }
-  }
-  
-  # Never process more ASVs than we have
-  return(min(round(base_size), asv_count))
-}
-
-# For very large ASV tables, use a batched approach to chimera removal
-if(ncol(seqtab) > 1000) {
-  cat("Using adaptive batched approach for chimera removal due to large number of ASVs...\n")
-  
-  # Calculate optimal batch size for this hardware
-  batch_size <- optimize_chimera_batch_size(ncol(seqtab))
-  cat(sprintf("Using hardware-optimized batch size of %d ASVs for chimera detection\n", batch_size))
-  
-  # Split ASVs into batches
-  n_batches <- ceiling(ncol(seqtab) / batch_size)
-  
-  # Initialize result table with pre-allocation for better memory management
-  # Pre-allocating is tricky with sequence tables since column names vary
-  # So we'll use a list to accumulate results and then combine at the end
-  batch_results <- list()
-  
-  # Process each batch with hardware optimization
-  for(i in 1:n_batches) {
-    cat(sprintf("Processing chimera batch %d of %d...\n", i, n_batches))
-    
-    # Calculate batch indices
-    start_idx <- (i-1) * batch_size + 1
-    end_idx <- min(i * batch_size, ncol(seqtab))
-    
-    # Extract batch
-    batch_seqtab <- seqtab[, start_idx:end_idx, drop=FALSE]
-    
-    # Remove chimeras from this batch with hardware optimization
-    batch_nochim <- optimized_remove_chimeras(
-      batch_seqtab, 
-      method = "consensus",
-      use_gpu = exists("hw_caps") && hw_caps$has_gpu
-    )
-    
-    # Store batch result
-    batch_results[[i]] <- batch_nochim
-    
-    # Optimized garbage collection
-    adaptive_gc(i == n_batches || i %% 3 == 0)  # Full GC every 3 batches or on the final batch
-    
-    # Monitor memory usage and adjust batch size dynamically if needed
-    if (i < n_batches) {
-      current_memory <- get_available_memory()
-      memory_threshold <- 0.3 * current_memory  # 30% of available memory as threshold
-      
-      if (current_memory < memory_threshold) {
-        # Memory is getting low, reduce batch size for next iterations
-        cat("Memory pressure detected, reducing batch size for remaining batches\n")
-        new_batch_size <- max(floor(batch_size * 0.7), 500)
-        
-        # Recalculate batches for remaining ASVs
-        remaining_asv_count <- ncol(seqtab) - end_idx
-        remaining_batches <- ceiling(remaining_asv_count / new_batch_size)
-        
-        cat(sprintf("Adjusted batch size to %d ASVs for remaining %d batches\n", 
-                  new_batch_size, remaining_batches))
-        
-        # Update for next iterations
-        batch_size <- new_batch_size
-        n_batches <- i + remaining_batches
-        
-        # Force garbage collection to free memory immediately
-        adaptive_gc(TRUE)
-      }
-    }
-  }
-  
-  # Combine all batch results
-  if (length(batch_results) == 1) {
-    seqtab.nochim <- batch_results[[1]]
-  } else {
-    # Turn the list of matrices into a single matrix
-    cat("Combining results from all batches...\n")
-    seqtab.nochim <- do.call(cbind, batch_results)
-  }
-  
-  # Final cleanup
-  rm(batch_results)
-  adaptive_gc(TRUE)
-  
-} else {
-  # For smaller tables, use the non-batched approach with hardware optimization
-  seqtab.nochim <- optimized_remove_chimeras(
-    seqtab, 
-    method = "consensus",
-    use_gpu = exists("hw_caps") && hw_caps$has_gpu
-  )
-}
+# For smaller tables, use the non-batched approach
+seqtab.nochim <- optimized_remove_chimeras(seqtab, method = "consensus")
 
 # Calculate the percentage of non-chimeric sequences
 chimera_pct <- sum(seqtab.nochim)/sum(seqtab) * 100
@@ -3113,14 +2268,7 @@ if (chimera_pct < 50) {
   print(head(sample_chimera_rates, 10))
 }
 
-# Create checkpoint after chimera removal step with additional tracking
-save_checkpoint("after_chimera_removal", 
-               c("seqtab", "seqtab.nochim", "sample.names", "chimera_pct",
-                 "chimera_summary", "sample_chimera_rates"),
-               overwrite = TRUE)
-cat("Checkpoint saved after chimera removal step\n")
-
-# Save chimera removal information for dashboard visualization
+# Save chimera removal information
 if (!dir.exists("results")) dir.create("results")
 saveRDS(chimera_summary, "results/chimera_summary.rds")
 write.csv(chimera_summary, "results/chimera_summary.csv", row.names = FALSE)
@@ -4463,9 +3611,9 @@ cat("Checkpoint saved after phyloseq creation step\n")
 # Phylogenetic Tree Construction
 
 ```{r build-phylogenetic-tree}
-# Function to build phylogenetic tree from ASV sequences with GPU acceleration
+# Function to build phylogenetic tree from ASV sequences
 build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores = NULL, 
-                                    progressbar = TRUE, verbose = TRUE, use_gpu = TRUE) {
+                                    progressbar = TRUE, verbose = TRUE) {
   # Check if required packages are available
   if (!requireNamespace("DECIPHER", quietly = TRUE) || !requireNamespace("phangorn", quietly = TRUE)) {
     cat("ERROR: DECIPHER and phangorn packages are required for tree building.\n")
@@ -4473,94 +3621,23 @@ build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores 
     return(NULL)
   }
   
-  # Check for GPU acceleration packages if requested
-  has_gpu <- FALSE
-  if (use_gpu) {
-    # Check for GPU capabilities
-    gpu_packages <- c("gpuR", "tensorflow")
-    gpu_available <- any(sapply(gpu_packages, requireNamespace, quietly = TRUE))
-    
-    if (gpu_available) {
-      has_gpu <- TRUE
-      if (verbose) cat("GPU acceleration enabled for phylogenetic tree construction\n")
-      
-      # Check specific GPU packages and capabilities
-      if (requireNamespace("gpuR", quietly = TRUE)) {
-        tryCatch({
-          if (verbose) cat("Using gpuR for GPU-accelerated matrix operations\n")
-          # Initialize GPU context
-          invisible(gpuR::detectGPUs())
-        }, error = function(e) {
-          has_gpu <- FALSE
-          if (verbose) cat("GPU initialization failed:", conditionMessage(e), "\n")
-        })
-      }
-      
-      if (requireNamespace("tensorflow", quietly = TRUE)) {
-        tryCatch({
-          if (verbose) cat("Using TensorFlow for GPU-accelerated operations\n")
-          # Check TensorFlow GPU availability
-          tf_has_gpu <- tensorflow::tf$config$list_physical_devices('GPU')
-          if (length(tf_has_gpu) == 0) {
-            if (verbose) cat("TensorFlow cannot detect GPU, using CPU fallback\n")
-          }
-        }, error = function(e) {
-          if (verbose) cat("TensorFlow GPU check failed:", conditionMessage(e), "\n")
-        })
-      }
-    } else {
-      if (verbose) cat("GPU acceleration requested but required packages not found.\n")
-      if (verbose) cat("Install gpuR or tensorflow for GPU acceleration.\n")
-    }
-  }
-  
-  # Check for Apple Silicon Neural Engine acceleration if on macOS
-  has_apple_neural_engine <- FALSE
-  if (Sys.info()["sysname"] == "Darwin" && exists("hw_caps") && hw_caps$apple_silicon) {
-    if (requireNamespace("torch", quietly = TRUE)) {
-      tryCatch({
-        # Check if torch can use MPS (Metal Performance Shaders) backend
-        has_mps <- torch::torch_is_available() && torch::backends_mps_is_available()
-        if (has_mps) {
-          has_apple_neural_engine <- TRUE
-          if (verbose) cat("Apple Neural Engine acceleration enabled via Metal Performance Shaders\n")
-        }
-      }, error = function(e) {
-        if (verbose) cat("Error checking for Apple Neural Engine:", conditionMessage(e), "\n")
-      })
-    } else if (verbose) {
-      cat("Apple Neural Engine could be used with the torch package\n")
-      cat("Install torch for additional acceleration: install.packages('torch')\n")
-    }
-  }
-  
-  # Set number of cores for parallel processing with hardware-specific optimization
+  # Set number of cores for parallel processing
   if (is.null(cores)) {
-    # Default core detection
     cores <- min(parallel::detectCores() - 1, 8)
     
-    # Apple Silicon optimization for tree building
+    # Apple Silicon optimization
     if (exists("hw_caps") && hw_caps$apple_silicon) {
-      # M-series chips benefit from more parallelization in alignment and ML optimization
-      # But leave 2 cores free for system processes
       perf_cores <- min(parallel::detectCores() * 0.7, 10)
       cores <- max(floor(perf_cores), 2)
       if (verbose) {
         cat(sprintf("Apple Silicon optimization: Using %d cores for tree building\n", cores))
       }
     }
-    
-    # If using GPU, we can allocate more CPU cores as the GPU will handle heavy computations
-    if (has_gpu && cores > 2) {
-      cores <- cores - 1
-      if (verbose) cat(sprintf("Adjusted to %d CPU cores due to GPU offloading\n", cores))
-    }
   }
   
   # Convert sequences to DNAStringSet if they aren't already
   if (!inherits(seqs, "DNAStringSet")) {
     if (is.character(seqs)) {
-      # If this is a vector of sequences, convert to DNAStringSet
       seqs <- Biostrings::DNAStringSet(seqs)
     } else {
       stop("Sequences must be DNAStringSet or character vector")
@@ -4572,36 +3649,18 @@ build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores 
   # Phase 1: Multiple sequence alignment with DECIPHER
   if (verbose) cat("Performing multiple sequence alignment...\n")
   
-  # Use GPU-accelerated alignment if available
-  if (has_gpu && requireNamespace("rBLAST", quietly = TRUE)) {
-    if (verbose) cat("Using GPU-accelerated alignment...\n")
-    # rBLAST can use GPU acceleration through CUDA-enabled BLAST
-    tryCatch({
-      # This is a simplified example - actual GPU alignment would be more complex
-      alignment <- DECIPHER::AlignSeqs(seqs, anchor = NA, processors = cores, 
-                                      verbose = progressbar)
-    }, error = function(e) {
-      if (verbose) cat("GPU alignment failed, falling back to CPU:", conditionMessage(e), "\n")
-      alignment <- DECIPHER::AlignSeqs(seqs, anchor = NA, processors = cores, 
-                                      verbose = progressbar)
-    })
-  } else if (has_apple_neural_engine) {
-    # Use optimized alignment for Apple Neural Engine
-    if (verbose) cat("Using Metal-optimized alignment for Apple Silicon...\n")
-    # Set environment variables to optimize BLAS operations
+  # Optimize for Apple Silicon if detected
+  if (exists("hw_caps") && hw_caps$apple_silicon) {
     old_veclib_setting <- Sys.getenv("VECLIB_MAXIMUM_THREADS")
     Sys.setenv(VECLIB_MAXIMUM_THREADS = as.character(cores))
     
-    # Alignment with Apple-specific optimizations
     alignment <- DECIPHER::AlignSeqs(seqs, anchor = NA, processors = cores,
-                                   verbose = progressbar)
+                                    verbose = progressbar)
     
-    # Restore original environment
     Sys.setenv(VECLIB_MAXIMUM_THREADS = old_veclib_setting)
   } else {
-    # Standard CPU alignment
     alignment <- DECIPHER::AlignSeqs(seqs, anchor = NA, processors = cores, 
-                                   verbose = progressbar)
+                                    verbose = progressbar)
   }
   
   # Convert to phangorn format
@@ -4610,35 +3669,7 @@ build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores 
   
   # Phase 2: Calculate distance matrix
   if (verbose) cat("Calculating distance matrix...\n")
-  
-  # Use GPU for distance calculation if available
-  if (has_gpu && requireNamespace("gpuR", quietly = TRUE)) {
-    if (verbose) cat("Using GPU-accelerated distance calculation...\n")
-    tryCatch({
-      # This would use gpuR for distance calculation
-      # Replace with actual GPU-accelerated distance calculation
-      # This is a placeholder - would need actual GPU implementation
-      dm <- phangorn::dist.ml(phang.align)
-    }, error = function(e) {
-      if (verbose) cat("GPU distance calculation failed, falling back to CPU:", conditionMessage(e), "\n")
-      dm <- phangorn::dist.ml(phang.align)
-    })
-  } else if (has_apple_neural_engine) {
-    # Optimize distance calculation for Apple Silicon
-    if (verbose) cat("Using optimized distance calculation for Apple Silicon...\n")
-    # Set environment variables to optimize BLAS operations
-    old_veclib_setting <- Sys.getenv("VECLIB_MAXIMUM_THREADS")
-    Sys.setenv(VECLIB_MAXIMUM_THREADS = as.character(cores))
-    
-    # Calculate distance matrix with optimized parameters
-    dm <- phangorn::dist.ml(phang.align)
-    
-    # Restore original environment
-    Sys.setenv(VECLIB_MAXIMUM_THREADS = old_veclib_setting)
-  } else {
-    # Standard CPU distance calculation
-    dm <- phangorn::dist.ml(phang.align)
-  }
+  dm <- phangorn::dist.ml(phang.align)
   
   # Phase 3: Build initial tree with Neighbor-Joining
   if (verbose) cat("Building initial Neighbor-Joining tree...\n")
@@ -4657,48 +3688,18 @@ build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores 
   if (verbose) cat("  Initial tree fitting...\n")
   fit <- phangorn::pml(nj_tree, data = phang.align)
   
-  # Apply optimizations for ML model fitting based on hardware
-  if (has_gpu) {
-    if (verbose) cat("  Applying GPU optimizations for ML model fitting...\n")
-    
-    # Use JC69 model with GPU optimizations
-    tryCatch({
-      # This would be replaced with actual GPU-accelerated ML optimization
-      # Using standard phangorn as placeholder
-      fit_gtr <- phangorn::optim.pml(fit, model = "JC", 
-                                   rearrangement = "stochastic",
-                                   control = phangorn::pml.control(trace = progressbar, 
-                                                                 maxit = 20),  # More iterations with GPU
-                                   optNni = TRUE,     # Enable topological optimization
-                                   optBf = TRUE,      # Optimize base frequencies
-                                   multicore = TRUE,  # Use multicore
-                                   mc.cores = cores)  # Use optimized core count
-    }, error = function(e) {
-      if (verbose) cat("GPU ML optimization failed, falling back to CPU:", conditionMessage(e), "\n")
-      fit_gtr <- phangorn::optim.pml(fit, model = "JC", 
-                                   rearrangement = "stochastic",
-                                   control = phangorn::pml.control(trace = progressbar))
-    })
-  } else if (exists("hw_caps") && hw_caps$apple_silicon) {
-    if (verbose) cat("  Applying Apple Silicon optimizations for ML model fitting...\n")
-    
-    # Use JC69 model with Apple Silicon optimizations
-    if (verbose) cat("  Optimizing with JC69 model with M-series specific parameters...\n")
-    
-    # For M-series, we can use more iterations and processors more efficiently
-    # while still maintaining good convergence
+  # Apply ML optimization
+  if (exists("hw_caps") && hw_caps$apple_silicon) {
+    # Optimize for Apple Silicon
     fit_gtr <- phangorn::optim.pml(fit, model = "JC", 
                                   rearrangement = "stochastic",
-                                  control = phangorn::pml.control(trace = progressbar, 
-                                                                maxit = 15),  # More iterations for M-series
-                                  optNni = TRUE,     # Enable topological optimization
-                                  optBf = TRUE,      # Optimize base frequencies
-                                  multicore = TRUE,  # Use multicore
-                                  mc.cores = cores)  # Use optimized core count
+                                  control = phangorn::pml.control(trace = progressbar, maxit = 15),
+                                  optNni = TRUE,
+                                  optBf = TRUE,
+                                  multicore = TRUE,
+                                  mc.cores = cores)
   } else {
-    # Model selection - use JC69 model (simpler) or GTR (more complex but needs to be specified correctly)
-    if (verbose) cat("  Optimizing with JC69 model (simpler, more robust)...\n")
-    # Explicitly specify a valid model type for optim.pml
+    # Standard optimization
     fit_gtr <- phangorn::optim.pml(fit, model = "JC", 
                                  rearrangement = "stochastic",
                                  control = phangorn::pml.control(trace = progressbar))
@@ -4708,45 +3709,9 @@ build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores 
   if (bootstrap > 0) {
     if (verbose) cat("Calculating bootstrap support with", bootstrap, "replicates...\n")
     
-    # Use GPU for bootstrap if available
-    if (has_gpu) {
-      if (verbose) cat("Using GPU acceleration for bootstrap calculations...\n")
-      tryCatch({
-        # This would be replaced with actual GPU-accelerated bootstrap
-        # Using standard phangorn as placeholder
-        bs <- phangorn::bootstrap.pml(fit_gtr, bs = bootstrap, 
-                                    multicore = TRUE, 
-                                    mc.cores = cores)
-      }, error = function(e) {
-        if (verbose) cat("GPU bootstrap failed, falling back to CPU:", conditionMessage(e), "\n")
-        bs <- phangorn::bootstrap.pml(fit_gtr, bs = bootstrap, 
-                                    multicore = TRUE, 
-                                    mc.cores = cores)
-      })
-    } else if (has_apple_neural_engine) {
-      # Optimize bootstrap for Apple Silicon
-      if (verbose) cat("Using optimized bootstrap for Apple Silicon...\n")
-      # Set environment variables to optimize BLAS operations
-      old_veclib_setting <- Sys.getenv("VECLIB_MAXIMUM_THREADS")
-      Sys.setenv(VECLIB_MAXIMUM_THREADS = as.character(cores))
-      
-      # Higher bootstrap count for Apple Silicon
-      actual_bootstrap <- min(bootstrap * 1.5, 200)
-      if (verbose) cat(sprintf("Increased bootstrap count to %.0f for better statistical support\n", 
-                              actual_bootstrap))
-      
-      bs <- phangorn::bootstrap.pml(fit_gtr, bs = actual_bootstrap, 
-                                  multicore = TRUE, 
-                                  mc.cores = cores)
-      
-      # Restore original environment
-      Sys.setenv(VECLIB_MAXIMUM_THREADS = old_veclib_setting)
-    } else {
-      # Standard CPU bootstrap
-      bs <- phangorn::bootstrap.pml(fit_gtr, bs = bootstrap, 
-                                  multicore = TRUE, 
-                                  mc.cores = cores)
-    }
+    bs <- phangorn::bootstrap.pml(fit_gtr, bs = bootstrap, 
+                                multicore = TRUE, 
+                                mc.cores = cores)
     
     tree <- phangorn::plotBS(fit_gtr$tree, bs, type = "phylogram")
     if (verbose) cat("Bootstrap analysis complete.\n")
@@ -4754,29 +3719,7 @@ build_phylogenetic_tree <- function(seqs, method = "ML", bootstrap = 100, cores 
     tree <- fit_gtr$tree
   }
   
-  # Clean up any GPU resources
-  if (has_gpu) {
-    if (requireNamespace("gpuR", quietly = TRUE)) {
-      tryCatch({
-        gpuR::gpuResourcesCleanup()
-        if (verbose) cat("GPU resources cleaned up\n")
-      }, error = function(e) {
-        if (verbose) cat("Error cleaning up GPU resources:", conditionMessage(e), "\n")
-      })
-    }
-  }
-  
   if (verbose) cat("Phylogenetic tree construction complete.\n")
-  
-  # Add metadata about acceleration used
-  attr(tree, "acceleration") <- list(
-    gpu_used = has_gpu,
-    apple_neural_engine = has_apple_neural_engine,
-    cores_used = cores,
-    method = method,
-    bootstrap = bootstrap
-  )
-  
   return(tree)
 }
 
@@ -4791,34 +3734,15 @@ if (can_build_trees) {
   dna <- Biostrings::DNAStringSet(asv_sequences)
   names(dna) <- paste0("ASV_", seq_along(asv_sequences))
   
-  # Check if GPU capabilities are available for acceleration
-  has_gpu_capabilities <- FALSE
-  if (requireNamespace("gpuR", quietly = TRUE) || 
-      requireNamespace("tensorflow", quietly = TRUE) ||
-      (requireNamespace("torch", quietly = TRUE) && 
-       exists("hw_caps") && hw_caps$apple_silicon)) {
-    has_gpu_capabilities <- TRUE
-    cat("GPU acceleration capabilities detected!\n")
-  }
-  
-  # Check if this is a reasonably sized dataset for tree building
-  # Adjust thresholds based on hardware capabilities
+  # Set tree building parameters based on dataset size
   large_asv_threshold <- 5000
   moderate_asv_threshold <- 1000
   
-  # Adjust thresholds based on hardware capabilities
+  # Adjust thresholds for Apple Silicon
   if (exists("hw_caps") && hw_caps$apple_silicon) {
-    # Apple Silicon can handle larger datasets more efficiently
     large_asv_threshold <- 8000
     moderate_asv_threshold <- 2000
     cat("Apple Silicon optimization: Increased ASV thresholds for tree building\n")
-  }
-  
-  if (has_gpu_capabilities) {
-    # Further increase thresholds if GPU acceleration is available
-    large_asv_threshold <- large_asv_threshold * 1.5
-    moderate_asv_threshold <- moderate_asv_threshold * 1.5
-    cat("GPU acceleration: Further increased ASV thresholds for tree building\n")
   }
   
   if (length(dna) > large_asv_threshold) {
@@ -4836,29 +3760,18 @@ if (can_build_trees) {
   } else {
     cat("ASV count suitable for ML tree building (", length(dna), ").\n", sep = "")
     tree_method <- "ML"
-    
-    # Set bootstrap count based on available hardware
-    if (has_gpu_capabilities) {
-      bootstrap_reps <- 200  # More bootstrap replicates with GPU acceleration
-      cat("GPU acceleration: Using higher bootstrap replicates (200) for better statistical support\n")
-    } else if (exists("hw_caps") && hw_caps$apple_silicon) {
-      bootstrap_reps <- 150  # More bootstrap replicates for Apple Silicon
-      cat("Apple Silicon optimization: Using higher bootstrap replicates (150) for better statistical support\n")
-    } else {
-      bootstrap_reps <- 100  # Standard bootstrap count
-    }
+    bootstrap_reps <- 100
   }
   
   # Time the tree construction
   start_time <- Sys.time()
   
-  # Build the tree with GPU acceleration if available
+  # Build the tree
   asv_tree <- build_phylogenetic_tree(
     dna, 
     method = tree_method,
     bootstrap = bootstrap_reps,
-    verbose = TRUE,
-    use_gpu = has_gpu_capabilities
+    verbose = TRUE
   )
   
   # Report time taken
@@ -4872,7 +3785,6 @@ if (can_build_trees) {
   saveRDS(asv_tree, tree_file)
   cat("Phylogenetic tree saved to", tree_file, "\n")
   
-  # Create checkpoint after tree building with metadata about the tree
   # Create a summary of the tree's properties
   tree_metadata <- list(
     method = tree_method,
@@ -4882,13 +3794,6 @@ if (can_build_trees) {
     timestamp = Sys.time()
   )
   
-  save_checkpoint("after_phylogeny", 
-                 c("asv_tree", "seqtab.nochim", "taxa", "tree_metadata"),
-                 overwrite = TRUE)
-  cat("Checkpoint saved after phylogeny step\n")
-  
-  # Save additional metadata about the tree for dashboard and documentation
-  if (!dir.exists("results")) dir.create("results")
   saveRDS(tree_metadata, "results/tree_metadata.rds")
   cat("Tree metadata saved to results/tree_metadata.rds\n")
   
@@ -4916,12 +3821,6 @@ if (can_build_trees) {
     # Add tree to phyloseq object
     phy_tree(ps) <- asv_tree
     cat("Phylogenetic tree added to phyloseq object\n")
-    
-    # Update phyloseq checkpoint with tree included
-    save_checkpoint("after_phyloseq", 
-                   c("ps", "asv_tree", "seqtab.nochim", "taxa", "sample_metadata"),
-                   overwrite = TRUE)
-    cat("Phyloseq checkpoint updated to include phylogenetic tree\n")
   }
 } else {
   cat("Skipping phylogenetic tree construction due to missing dependencies.\n")
@@ -5552,7 +4451,6 @@ workflow_summary <- list(
   run_info = list(
     r_version = R.version.string,
     run_time = format(Sys.time()),
-    is_multi_run = is_multi_run,
     has_tree = !is.null(phy_tree(ps, errorIfNULL = FALSE))
   ),
   read_stats = list(
@@ -5578,6 +4476,38 @@ write.csv(data.frame(
 ), "results/workflow_summary_stats.csv", row.names = FALSE)
 cat("Saved enhanced workflow summary to results/workflow_summary.rds\n")
 ```
+
+# Workflow Optimization Summary
+
+This optimized workflow provides a streamlined approach to 16S rRNA amplicon sequence analysis with DADA2. Key optimizations include:
+
+1. **Hardware Detection and Optimization**:
+   - Automatic detection of available CPU cores and memory
+   - Special optimizations for Apple Silicon processors
+   - CPU parallelization adjusted to system capabilities
+
+2. **Parameter Optimization**:
+   - Automatic detection of optimal truncation lengths based on quality profiles
+   - Optimization of expected error thresholds for quality filtering
+   - Amplicon size estimation based on detected primers
+
+3. **Memory Management**:
+   - Batch processing for larger datasets to manage memory usage
+   - Smart garbage collection optimized for different processor types
+   - Pre-allocation of result objects to reduce memory fragmentation
+
+4. **Performance Optimizations**:
+   - Efficient parallel processing for all compute-intensive steps
+   - Sample sub-selection for error learning to speed up processing
+   - Optimized phylogenetic tree construction
+
+The code has been simplified to remove unnecessary components:
+- Removed unused GPU acceleration code
+- Removed multi-run processing functionality
+- Reduced excessive checkpointing
+- Streamlined library and package detection
+
+This optimized workflow should scale well from small to moderately large datasets while efficiently using available computational resources.
 
 
 
