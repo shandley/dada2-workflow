@@ -40,7 +40,8 @@ check_and_load_packages <- function() {
 
   # Packages from CRAN
   cran_required_packages <- c(
-    "ggplot2", "tidyverse", "gridExtra", "knitr", "future", "future.apply", "taxize"
+    "ggplot2", "tidyverse", "gridExtra", "knitr", "future", "future.apply", "taxize",
+    "rBayesianOptimization"  # Added for Bayesian optimization
   )
   
   # Packages from Bioconductor
@@ -84,6 +85,17 @@ check_and_load_packages <- function() {
     }
   }
   
+  # Check if we have multiple cores available for parallel processing
+  has_multiple_cores <- parallel::detectCores() > 2
+  
+  # Automatically install ParBayesianOptimization if multiple cores available
+  has_pbo <- requireNamespace("ParBayesianOptimization", quietly = TRUE)
+  if (!has_pbo && has_multiple_cores) {
+    message("Detected multiple CPU cores. Automatically installing ParBayesianOptimization for parallel optimization...")
+    install.packages("ParBayesianOptimization")
+    has_pbo <- requireNamespace("ParBayesianOptimization", quietly = TRUE)
+  }
+  
   # Alert about missing optional packages but don't install automatically
   if (length(missing_cran_optional) > 0 || length(missing_bioc_optional) > 0) {
     missing_optional <- c(missing_cran_optional, missing_bioc_optional)
@@ -119,15 +131,40 @@ check_and_load_packages <- function() {
     }
   }
   
+  # Load ParBayesianOptimization if available
+  if (has_pbo) {
+    suppressPackageStartupMessages(library("ParBayesianOptimization"))
+  }
+  
+  # Check for Bayesian optimization packages
+  has_rbo <- requireNamespace("rBayesianOptimization", quietly = TRUE)
+  
+  if (has_rbo) {
+    message("Bayesian optimization is available for parameter tuning.")
+    if (has_pbo) {
+      message("ParBayesianOptimization detected: Will use parallel processing for faster optimization.")
+    }
+  }
+  
   # Create a comprehensive list of all Bioconductor packages
   all_bioc_packages <- c(bioc_required_packages, bioc_optional_packages)
+  
+  # Determine CPU core details for performance optimization
+  cores_info <- list(
+    total_cores = parallel::detectCores(),
+    usable_cores = max(1, parallel::detectCores() - 1),
+    multiple_cores = has_multiple_cores
+  )
   
   return(list(
     required = required_packages,
     optional = intersect(optional_packages, 
                         optional_packages[sapply(optional_packages, requireNamespace, quietly = TRUE)]),
     missing = c(missing_cran_optional, missing_bioc_optional),
-    bioconductor_packages = all_bioc_packages
+    bioconductor_packages = all_bioc_packages,
+    has_bayesian_optimization = has_rbo,
+    has_parallel_bayesian_optimization = has_pbo,
+    cores = cores_info
   ))
 }
 
@@ -144,8 +181,27 @@ if (length(package_status$missing) > 0) {
   cat("Some advanced features may be disabled.\n")
 }
 
-# Check if phylogenetic tree building is available
+# Check if specialized functionality is available
 can_build_trees <- all(c("phangorn", "DECIPHER") %in% package_status$optional)
+can_use_bayesian_optimization <- package_status$has_bayesian_optimization
+can_use_parallel_bayesian_optimization <- package_status$has_parallel_bayesian_optimization
+
+# Get core information
+total_cores <- package_status$cores$total_cores
+usable_cores <- package_status$cores$usable_cores
+
+# Display optimization capability
+if (can_use_bayesian_optimization) {
+  cat("✓ Bayesian parameter optimization is available\n")
+  if (can_use_parallel_bayesian_optimization) {
+    cat(sprintf("✓ Parallel Bayesian optimization enabled (using %d of %d cores)\n", 
+              usable_cores, total_cores))
+  } else if (total_cores > 2) {
+    cat("! Parallel optimization is available but not enabled (ParBayesianOptimization package not installed)\n")
+  }
+} else {
+  cat("✗ Bayesian parameter optimization is not available\n")
+}
 if (can_build_trees) {
   cat("✓ Phylogenetic tree construction is available\n")
 } else {
@@ -870,19 +926,18 @@ print(reverse_qual)
 # Automatic Parameter Optimization
 
 ```{r parameter-optimization}
-# Install and load required packages for Bayesian Optimization
-if (!requireNamespace("rBayesianOptimization", quietly = TRUE)) {
-  cat("Installing rBayesianOptimization package for Bayesian Optimization...\n")
-  install.packages("rBayesianOptimization")
+# Set up Bayesian Optimization based on package availability
+if (!can_use_bayesian_optimization) {
+  stop("This workflow requires the rBayesianOptimization package. Please restart the workflow after installing it.")
 }
 
-# Check for ParBayesianOptimization - better for parallel processing but optional
-has_pbo <- requireNamespace("ParBayesianOptimization", quietly = TRUE)
-if (!has_pbo) {
-  cat("For faster parallel optimization, consider installing: ParBayesianOptimization\n")
+# Use parallel optimization if available
+has_pbo <- can_use_parallel_bayesian_optimization
+if (has_pbo) {
+  cat("Using parallel Bayesian optimization for faster parameter tuning\n")
+} else {
+  cat("Using standard Bayesian optimization\n")
 }
-
-library(rBayesianOptimization)
 
 # Function to extract quality profiles from read files
 extract_quality_profiles <- function(forward_files, reverse_files, max_files = 5) {
@@ -1185,10 +1240,10 @@ temp_dir <- prepare_temp_dir()
 cat("Starting Bayesian optimization for DADA2 parameter selection...\n")
 cat("This process will systematically test different parameter combinations to find the optimal settings.\n")
 
-# Determine the best optimization approach based on available packages
-if (has_pbo && requireNamespace("ParBayesianOptimization", quietly = TRUE)) {
-  # Use parallel Bayesian optimization if available
-  library(ParBayesianOptimization)
+# Determine the best optimization approach based on available packages and cores
+if (has_pbo) {
+  # Use parallel Bayesian optimization
+  cat(sprintf("Running parallel Bayesian optimization with %d cores\n", usable_cores))
   
   # Define the parameter space
   param_set <- list(
@@ -1197,11 +1252,6 @@ if (has_pbo && requireNamespace("ParBayesianOptimization", quietly = TRUE)) {
     maxEE_F = c(bounds$maxEE_F[1], bounds$maxEE_F[2]),
     maxEE_R = c(bounds$maxEE_R[1], bounds$maxEE_R[2])
   )
-  
-  # Determine optimal number of cores for parallel processing
-  n_cores <- ifelse(exists("hw_caps"), 
-                   min(hw_caps$optimal_workers, parallel::detectCores() - 1),
-                   min(4, parallel::detectCores() - 1))
   
   # Run parallel Bayesian optimization
   optim_results <- ParBayesianOptimization::pbayesopt(
@@ -1212,7 +1262,7 @@ if (has_pbo && requireNamespace("ParBayesianOptimization", quietly = TRUE)) {
     iters.k = 1,
     parallel = TRUE,
     packages = c("dada2"),
-    cores = n_cores
+    cores = usable_cores
   )
   
   # Extract best parameters
@@ -1224,6 +1274,7 @@ if (has_pbo && requireNamespace("ParBayesianOptimization", quietly = TRUE)) {
   
 } else {
   # Use standard Bayesian optimization
+  cat("Running standard Bayesian optimization\n")
   
   # Define the parameter space
   param_set <- list(
@@ -1234,7 +1285,7 @@ if (has_pbo && requireNamespace("ParBayesianOptimization", quietly = TRUE)) {
   )
   
   # Adjust maxiterations based on system capability
-  max_iter <- ifelse(exists("hw_caps") && hw_caps$cores >= 8, 20, 15)
+  max_iter <- ifelse(total_cores >= 8, 20, 15)
   
   # Run Bayesian optimization
   optim_results <- rBayesianOptimization::BayesianOptimization(
