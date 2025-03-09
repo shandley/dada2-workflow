@@ -870,11 +870,24 @@ print(reverse_qual)
 # Automatic Parameter Optimization
 
 ```{r parameter-optimization}
-# Function to determine optimal truncation lengths based on quality profiles
-optimize_truncation_lengths <- function(forward_files, reverse_files, quality_threshold = 30,
-                                        min_overlap = 20, target_amplicon_size = NULL) {
-  # Sample a subset of files for efficiency (max 5)
-  n_sample <- min(5, length(forward_files))
+# Install and load required packages for Bayesian Optimization
+if (!requireNamespace("rBayesianOptimization", quietly = TRUE)) {
+  cat("Installing rBayesianOptimization package for Bayesian Optimization...\n")
+  install.packages("rBayesianOptimization")
+}
+
+# Check for ParBayesianOptimization - better for parallel processing but optional
+has_pbo <- requireNamespace("ParBayesianOptimization", quietly = TRUE)
+if (!has_pbo) {
+  cat("For faster parallel optimization, consider installing: ParBayesianOptimization\n")
+}
+
+library(rBayesianOptimization)
+
+# Function to extract quality profiles from read files
+extract_quality_profiles <- function(forward_files, reverse_files, max_files = 5) {
+  # Sample a subset of files for efficiency
+  n_sample <- min(max_files, length(forward_files))
   sample_idx <- sample(1:length(forward_files), n_sample)
   
   sample_forwards <- forward_files[sample_idx]
@@ -888,11 +901,9 @@ optimize_truncation_lengths <- function(forward_files, reverse_files, quality_th
   forward_data <- forward_qual$data
   reverse_data <- reverse_qual$data
   
-  # Detect maximum read length from data
+  # Calculate read lengths
   max_forward_cycle <- max(forward_data$Cycle)
   max_reverse_cycle <- max(reverse_data$Cycle)
-  
-  cat("Detected read lengths: Forward =", max_forward_cycle, "bp, Reverse =", max_reverse_cycle, "bp\n")
   
   # Determine platform type based on read length
   platform <- "Unknown"
@@ -903,126 +914,125 @@ optimize_truncation_lengths <- function(forward_files, reverse_files, quality_th
   } else if (max_forward_cycle >= 100 && max_reverse_cycle >= 100) {
     platform <- "NovaSeq/NextSeq (2x100)"
   }
+  
+  cat("Detected read lengths: Forward =", max_forward_cycle, "bp, Reverse =", max_reverse_cycle, "bp\n")
   cat("Likely sequencing platform:", platform, "\n")
   
   # Calculate mean quality by position
   forward_mean_qual <- aggregate(Score ~ Cycle, data = forward_data, FUN = mean)
   reverse_mean_qual <- aggregate(Score ~ Cycle, data = reverse_data, FUN = mean)
   
-  # Find position where quality drops below threshold
-  quality_drop_f <- which(forward_mean_qual$Score < quality_threshold)
-  quality_drop_r <- which(reverse_mean_qual$Score < quality_threshold)
-  
-  # Determine initial truncation points
-  if (length(quality_drop_f) > 0) {
-    forward_trunc <- max(quality_drop_f[1] - 10, floor(max_forward_cycle * 0.5))
-  } else {
-    forward_trunc <- max_forward_cycle  # Use full length if quality remains high
-  }
-  
-  if (length(quality_drop_r) > 0) {
-    reverse_trunc <- max(quality_drop_r[1] - 10, floor(max_reverse_cycle * 0.5))
-  } else {
-    reverse_trunc <- max_reverse_cycle  # Use full length if quality remains high
-  }
-  
-  # Safety checks to ensure quality is maintained
-  # Find the last position where quality is good (Q25+)
-  good_quality_f <- max(which(forward_mean_qual$Score >= 25))
-  good_quality_r <- max(which(reverse_mean_qual$Score >= 25))
-  
-  # Limit truncation to positions with good quality
-  forward_trunc <- min(forward_trunc, good_quality_f)
-  reverse_trunc <- min(reverse_trunc, good_quality_r)
-  
-  # Account for expected amplicon size if provided
-  if (!is.null(target_amplicon_size)) {
-    # Adjust truncation to ensure enough overlap for merging
-    min_read_sum <- target_amplicon_size + min_overlap
-    
-    if (forward_trunc + reverse_trunc < min_read_sum) {
-      # Need to adjust truncation to ensure sufficient bp for assembly
-      cat("Warning: Detected quality-based truncation might not preserve enough sequence for assembly\n")
-      cat("Target amplicon size:", target_amplicon_size, "bp, Minimum required read sum:", min_read_sum, "bp\n")
-      
-      # Prefer keeping higher quality read at full length
-      if (mean(forward_mean_qual$Score) > mean(reverse_mean_qual$Score)) {
-        # Keep forward at max quality-based truncation, extend reverse as needed
-        forward_trunc <- min(forward_trunc, max_forward_cycle)
-        reverse_trunc <- max(min_read_sum - forward_trunc, 0.7 * max_reverse_cycle)
-      } else {
-        # Keep reverse at max quality-based truncation, extend forward as needed
-        reverse_trunc <- min(reverse_trunc, max_reverse_cycle)
-        forward_trunc <- max(min_read_sum - reverse_trunc, 0.7 * max_forward_cycle)
-      }
-    }
-  }
-  
-  # Ensure truncation doesn't exceed read length
-  forward_trunc <- min(forward_trunc, max_forward_cycle)
-  reverse_trunc <- min(reverse_trunc, max_reverse_cycle)
-  
-  # Round to integers
-  forward_trunc <- as.integer(forward_trunc)
-  reverse_trunc <- as.integer(reverse_trunc)
-  
-  # Create plots with platform-specific recommendations
-  forward_plot <- ggplot(forward_mean_qual, aes(x = Cycle, y = Score)) +
-    geom_line(size = 1) +
-    geom_hline(yintercept = quality_threshold, linetype = "dashed", color = "red") +
-    geom_vline(xintercept = forward_trunc, linetype = "dashed", color = "blue") +
-    scale_y_continuous(limits = c(0, 40)) +
-    labs(title = paste("Forward Read Quality -", platform), 
-         subtitle = paste("Suggested truncation at position", forward_trunc),
-         x = "Cycle", y = "Quality Score") +
-    theme_minimal()
-  
-  reverse_plot <- ggplot(reverse_mean_qual, aes(x = Cycle, y = Score)) +
-    geom_line(size = 1) +
-    geom_hline(yintercept = quality_threshold, linetype = "dashed", color = "red") +
-    geom_vline(xintercept = reverse_trunc, linetype = "dashed", color = "blue") +
-    scale_y_continuous(limits = c(0, 40)) +
-    labs(title = paste("Reverse Read Quality -", platform), 
-         subtitle = paste("Suggested truncation at position", reverse_trunc),
-         x = "Cycle", y = "Quality Score") +
-    theme_minimal()
-  
-  # Display plots together
-  grid.arrange(forward_plot, reverse_plot, ncol = 2)
-  
-  # Estimate expected overlap after trimming
-  expected_overlap <- forward_trunc + reverse_trunc - target_amplicon_size
-  cat("Expected overlap after trimming:", expected_overlap, "bp\n")
-  if (expected_overlap < min_overlap) {
-    cat("WARNING: Expected overlap is less than recommended minimum (", min_overlap, "bp)\n")
-    cat("Consider adjusting truncation lengths or using a more relaxed merging criteria\n")
-  } else {
-    cat("Overlap is sufficient for reliable read merging\n")
-  }
-  
-  # Return recommendations with platform info
   return(list(
-    forward = forward_trunc, 
-    reverse = reverse_trunc,
-    platform = platform,
-    max_forward_len = max_forward_cycle,
-    max_reverse_len = max_reverse_cycle,
-    expected_overlap = expected_overlap
+    forward_mean_qual = forward_mean_qual,
+    reverse_mean_qual = reverse_mean_qual,
+    max_forward_cycle = max_forward_cycle,
+    max_reverse_cycle = max_reverse_cycle,
+    platform = platform
   ))
 }
 
-# Function to optimize expected error thresholds
-optimize_maxEE <- function(trunc_forward, trunc_reverse, forward_files, reverse_files, 
-                          sample_names, ee_range = c(1, 2, 3, 4)) {
-  # Make a temporary directory for testing
+# Function to determine parameter bounds based on quality profiles
+determine_parameter_bounds <- function(quality_profiles, target_amplicon_size = NULL, 
+                                     min_overlap = 20, quality_threshold = 25) {
+  forward_mean_qual <- quality_profiles$forward_mean_qual
+  reverse_mean_qual <- quality_profiles$reverse_mean_qual
+  max_forward_cycle <- quality_profiles$max_forward_cycle
+  max_reverse_cycle <- quality_profiles$max_reverse_cycle
+  
+  # Find positions where quality drops below threshold
+  quality_drop_f <- which(forward_mean_qual$Score < quality_threshold)
+  quality_drop_r <- which(reverse_mean_qual$Score < quality_threshold)
+  
+  # Find the earliest position where quality drops
+  if (length(quality_drop_f) > 0) {
+    earliest_drop_f <- quality_drop_f[1]
+  } else {
+    earliest_drop_f <- max_forward_cycle
+  }
+  
+  if (length(quality_drop_r) > 0) {
+    earliest_drop_r <- quality_drop_r[1]
+  } else {
+    earliest_drop_r <- max_reverse_cycle
+  }
+  
+  # Find the lowest safe truncation points (where quality is still good)
+  min_trunc_f <- max(100, floor(max_forward_cycle * 0.4)) # Minimum 100bp or 40% of read
+  min_trunc_r <- max(100, floor(max_reverse_cycle * 0.4)) # Minimum 100bp or 40% of read
+  
+  # Determine maximum truncation values (should be before quality drops too much)
+  max_trunc_f <- max_forward_cycle
+  max_trunc_r <- max_reverse_cycle
+  
+  # If we have amplicon size information, ensure we'll have sufficient overlap
+  if (!is.null(target_amplicon_size)) {
+    min_combined_length <- target_amplicon_size + min_overlap
+    
+    # Ensure minimum truncation points will allow sufficient overlap
+    if (min_trunc_f + min_trunc_r < min_combined_length) {
+      # Adjust min truncation values to ensure overlap is possible
+      adjustment <- ceiling((min_combined_length - (min_trunc_f + min_trunc_r)) / 2)
+      min_trunc_f <- min(min_trunc_f + adjustment, max_forward_cycle - 10)
+      min_trunc_r <- min(min_trunc_r + adjustment, max_reverse_cycle - 10)
+    }
+  }
+  
+  # Set maxEE bounds based on common values
+  min_maxEE_f <- 1
+  max_maxEE_f <- 5
+  min_maxEE_r <- 1
+  max_maxEE_r <- 8  # Allow higher errors for reverse reads which typically have lower quality
+  
+  # Round to integers for truncation lengths
+  min_trunc_f <- as.integer(min_trunc_f)
+  max_trunc_f <- as.integer(max_trunc_f)
+  min_trunc_r <- as.integer(min_trunc_r)
+  max_trunc_r <- as.integer(max_trunc_r)
+  
+  # Calculate expected overlap range
+  if (!is.null(target_amplicon_size)) {
+    min_overlap_possible <- min_trunc_f + min_trunc_r - target_amplicon_size
+    max_overlap_possible <- max_trunc_f + max_trunc_r - target_amplicon_size
+    cat("Possible overlap range: ", min_overlap_possible, " - ", max_overlap_possible, " bp\n", sep="")
+    
+    if (min_overlap_possible < min_overlap) {
+      cat("WARNING: Minimum possible overlap may be less than recommended (", min_overlap, " bp)\n", sep="")
+    }
+  }
+  
+  # Return bounds for optimization
+  return(list(
+    truncF_bounds = c(min_trunc_f, max_trunc_f),
+    truncR_bounds = c(min_trunc_r, max_trunc_r),
+    maxEE_f_bounds = c(min_maxEE_f, max_maxEE_f),
+    maxEE_r_bounds = c(min_maxEE_r, max_maxEE_r),
+    target_amplicon_size = target_amplicon_size
+  ))
+}
+
+# Create a temporary directory for parameter testing
+prepare_temp_dir <- function() {
+  temp_dir <- file.path(path, "temp_filter")
+  if (!dir.exists(temp_dir)) dir.create(temp_dir)
+  return(temp_dir)
+}
+
+# Function to evaluate a set of DADA2 parameters and return a score
+# This is the objective function for Bayesian optimization
+evaluate_parameters <- function(truncF, truncR, maxEE_F, maxEE_R) {
+  # Ensure parameters are integers where needed
+  truncF <- as.integer(truncF)
+  truncR <- as.integer(truncR)
+  
+  # Create a temporary directory for testing
   temp_dir <- file.path(path, "temp_filter")
   if(!dir.exists(temp_dir)) dir.create(temp_dir)
   
-  # Use a small subset of files to test parameters efficiently
-  n_test <- min(3, length(forward_files))
-  test_fnFs <- forward_files[1:n_test]
-  test_fnRs <- reverse_files[1:n_test]
-  test_names <- sample_names[1:n_test]
+  # Use a small subset of files for efficiency
+  n_test <- min(3, length(fnFs))
+  test_fnFs <- fnFs[1:n_test]
+  test_fnRs <- fnRs[1:n_test]
+  test_names <- sample.names[1:n_test]
   
   # Generate test file paths
   test_filtFs <- file.path(temp_dir, paste0(test_names, "_F_filt.fastq.gz"))
@@ -1030,154 +1040,366 @@ optimize_maxEE <- function(trunc_forward, trunc_reverse, forward_files, reverse_
   names(test_filtFs) <- test_names
   names(test_filtRs) <- test_names
   
-  # Track results for each maxEE value
-  results <- data.frame(maxEE_F = numeric(), 
-                        maxEE_R = numeric(),
-                        reads_in = numeric(),
-                        reads_kept = numeric(),
-                        percent_kept = numeric())
-  
-  # Generate combinations of expected error thresholds to test
-  ee_combinations <- expand.grid(maxEE_F = ee_range, maxEE_R = ee_range)
-  
-  # Filter out combinations where reverse EE is lower than forward
-  # (since reverse reads typically have lower quality)
-  ee_combinations <- ee_combinations[ee_combinations$maxEE_R >= ee_combinations$maxEE_F, ]
-  
-  # Test different expected error thresholds
-  for (i in 1:nrow(ee_combinations)) {
-    f_ee <- ee_combinations$maxEE_F[i]
-    r_ee <- ee_combinations$maxEE_R[i]
-    
-    # Filter and track results
-    test_out <- suppressWarnings(
+  # Filter with current parameters
+  test_out <- tryCatch({
+    suppressWarnings(
       filterAndTrim(test_fnFs, test_filtFs, test_fnRs, test_filtRs,
-                   truncLen = c(trunc_forward, trunc_reverse),
-                   maxN = 0, maxEE = c(f_ee, r_ee), truncQ = 2,
+                   truncLen = c(truncF, truncR),
+                   maxN = 0, maxEE = c(maxEE_F, maxEE_R), truncQ = 2,
                    rm.phix = TRUE, compress = TRUE, multithread = TRUE)
     )
-    
-    # Calculate statistics
-    reads_in <- sum(test_out[, 1])
-    reads_kept <- sum(test_out[, 2])
-    percent_kept <- round(reads_kept / reads_in * 100, 1)
-    
-    # Store results
-    results <- rbind(results, data.frame(
-      maxEE_F = f_ee,
-      maxEE_R = r_ee,
-      reads_in = reads_in,
-      reads_kept = reads_kept,
-      percent_kept = percent_kept
-    ))
+  }, error = function(e) {
+    # Return NA if filtering fails
+    return(NULL)
+  })
+  
+  # Clean up filtered files immediately to save space
+  unlink(list.files(temp_dir, full.names = TRUE))
+  
+  # If filtering failed, return a very low score
+  if (is.null(test_out)) {
+    cat("Filtering failed with parameters: truncF=", truncF, " truncR=", truncR, 
+        " maxEE_F=", maxEE_F, " maxEE_R=", maxEE_R, "\n")
+    return(-100)  # Penalty score for failed filtering
   }
   
-  # Clean up temporary files
-  unlink(temp_dir, recursive = TRUE)
+  # Calculate retention rate
+  reads_in <- sum(test_out[, 1])
+  reads_kept <- sum(test_out[, 2])
+  retention_rate <- reads_kept / reads_in
   
-  # Find optimal parameters (target ~80% retention while being stringent)
-  # Sort by percent kept descending
-  results <- results[order(results$percent_kept, decreasing = TRUE), ]
+  # Process the merged data to evaluate overlap quality
+  merge_score <- 0
+  tryCatch({
+    # Dereplicate filtered reads
+    derepFs <- derepFastq(test_filtFs)
+    derepRs <- derepFastq(test_filtRs)
+    names(derepFs) <- test_names
+    names(derepRs) <- test_names
+    
+    # Learn error rates (minimal process, just for testing)
+    errF <- learnErrors(test_filtFs, multithread = TRUE, nbases = 1e8, randomize = TRUE)
+    errR <- learnErrors(test_filtRs, multithread = TRUE, nbases = 1e8, randomize = TRUE)
+    
+    # Sample inference (minimal process, just for testing)
+    dadaFs <- dada(derepFs, err = errF, multithread = TRUE, pool = FALSE)
+    dadaRs <- dada(derepRs, err = errR, multithread = TRUE, pool = FALSE)
+    
+    # Merge paired reads - the critical step for evaluating parameter quality
+    mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose = FALSE)
+    
+    # Calculate merging success rate
+    merge_input <- sum(sapply(dadaFs, function(x) sum(getUniques(x$denoised))))
+    merge_output <- sum(sapply(mergers, function(x) sum(getUniques(x))))
+    merge_rate <- merge_output / merge_input
+    
+    # Calculate merge score - weight this heavily as it's critical for success
+    merge_score <- merge_rate * 50  # Scale to make it a significant part of the score
+    
+  }, error = function(e) {
+    # If merging fails or has issues, set a low merge score
+    merge_score <- 0
+    cat("Merging process failed with parameters: truncF=", truncF, " truncR=", truncR, 
+        " maxEE_F=", maxEE_F, " maxEE_R=", maxEE_R, "\n")
+  })
   
-  # Create a label column for the plot
-  results$label <- paste0(results$maxEE_F, "-", results$maxEE_R)
-  
-  # Make the plot
-  ee_plot <- ggplot(results, aes(x = reorder(label, percent_kept), y = percent_kept)) +
-    geom_bar(stat = "identity", fill = "steelblue") +
-    geom_text(aes(label = paste0(percent_kept, "%")), vjust = -0.3, size = 3) +
-    labs(title = "Read Retention by Expected Error Parameters",
-         x = "maxEE (Forward-Reverse)",
-         y = "Percent Reads Kept") +
-    theme_minimal() +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
-  
-  print(ee_plot)
-  
-  # Determine optimal values
-  # Look for >70% retention while using lowest possible maxEE values
-  optimal <- results[results$percent_kept > 70, ]
-  if (nrow(optimal) > 0) {
-    # Sort by forward then reverse EE to get most stringent option
-    optimal <- optimal[order(optimal$maxEE_F, optimal$maxEE_R), ]
-    optimal_maxEE <- c(optimal$maxEE_F[1], optimal$maxEE_R[1])
-    optimal_pct <- optimal$percent_kept[1]
-  } else {
-    # If retention is too low with 70% threshold, drop to 50%
-    optimal <- results[results$percent_kept > 50, ]
-    if (nrow(optimal) > 0) {
-      optimal <- optimal[order(optimal$maxEE_F, optimal$maxEE_R), ]
-      optimal_maxEE <- c(optimal$maxEE_F[1], optimal$maxEE_R[1])
-      optimal_pct <- optimal$percent_kept[1]
-      cat("Warning: Using relaxed retention threshold (50%)\n")
+  # Calculate amplicon length compliance score
+  amplicon_score <- 0
+  if (!is.null(param_bounds$target_amplicon_size)) {
+    target_size <- param_bounds$target_amplicon_size
+    expected_overlap <- truncF + truncR - target_size
+    
+    # Penalty if overlap is too small (< 20bp is problematic)
+    if (expected_overlap < 20) {
+      amplicon_score <- -50  # Severe penalty
+    } else if (expected_overlap >= 20 && expected_overlap < 30) {
+      amplicon_score <- expected_overlap - 20  # Small positive score for minimal acceptable overlap
+    } else if (expected_overlap >= 30 && expected_overlap < 50) {
+      amplicon_score <- 10 + (expected_overlap - 30) * 0.5  # Good score for moderate overlap
     } else {
-      # If all else fails, use the combination with highest retention
-      optimal_maxEE <- c(results$maxEE_F[1], results$maxEE_R[1])
-      optimal_pct <- results$percent_kept[1]
-      cat("Warning: All tested parameters had low retention (<50%)\n")
+      amplicon_score <- 20  # Maximum score for abundant overlap
     }
   }
   
-  cat("Optimal maxEE parameters:", optimal_maxEE[1], "(forward),", 
-      optimal_maxEE[2], "(reverse) with", optimal_pct, "% read retention\n")
+  # Calculate stringency score (we prefer more stringent filtering when possible)
+  # Lower maxEE values are more stringent, but we want a higher score for more stringency
+  maxEE_total <- maxEE_F + maxEE_R
+  stringency_score <- 15 - maxEE_total  # Higher score for lower total maxEE
   
-  return(list(
-    maxEE = optimal_maxEE,
-    percent_kept = optimal_pct,
-    all_results = results
-  ))
+  # Calculate read length score (we prefer to keep more of the read when quality allows)
+  # Higher truncation values keep more of the read
+  length_proportion_f <- truncF / quality_profiles$max_forward_cycle
+  length_proportion_r <- truncR / quality_profiles$max_reverse_cycle
+  length_score <- (length_proportion_f + length_proportion_r) * 15  # Scale to contribute meaningfully
+  
+  # Calculate final combined score with appropriate weighting
+  # Retention rate is important but shouldn't dominate
+  retention_score <- retention_rate * 40  # Scale to make it significant
+  
+  # Combine all scores
+  final_score <- retention_score + merge_score + amplicon_score + stringency_score + length_score
+  
+  # Report parameter evaluation
+  cat(sprintf("Parameters (truncF=%d, truncR=%d, maxEE_F=%.1f, maxEE_R=%.1f): Retention=%.1f%%, Merge Score=%.1f, Total Score=%.1f\n",
+              truncF, truncR, maxEE_F, maxEE_R, 
+              retention_rate*100, merge_score, final_score))
+  
+  # Clean up all temporary files
+  unlink(test_filtFs)
+  unlink(test_filtRs)
+  
+  return(final_score)
 }
 
-# Run truncation length optimization
-cat("Optimizing truncation lengths...\n")
-truncation_lengths <- optimize_truncation_lengths(
-  fnFs, fnRs, 
-  quality_threshold = 25, 
-  min_overlap = 20, 
-  target_amplicon_size = expected_amplicon_size
+# Create our optimization wrapper function in the format required by rBayesianOptimization
+dada2_optimization_function <- function(truncF, truncR, maxEE_F, maxEE_R) {
+  score <- evaluate_parameters(truncF, truncR, maxEE_F, maxEE_R)
+  return(list(Score = score))
+}
+
+# Extract quality profiles and determine parameter bounds
+cat("Analyzing read quality profiles to determine parameter bounds...\n")
+quality_profiles <- extract_quality_profiles(fnFs, fnRs, max_files = 5)
+
+# Determine parameter bounds
+cat("Determining optimal parameter ranges for Bayesian optimization...\n")
+param_bounds <- determine_parameter_bounds(
+  quality_profiles,
+  target_amplicon_size = expected_amplicon_size,
+  min_overlap = 20,
+  quality_threshold = 25
 )
 
-# Run expected error threshold optimization
-cat("Optimizing expected error thresholds...\n")
-maxEE_params <- optimize_maxEE(
-  truncation_lengths$forward, 
-  truncation_lengths$reverse, 
-  fnFs, fnRs, 
-  sample.names
+# Prepare parameter bounds for Bayesian optimization
+bounds <- list(
+  truncF = param_bounds$truncF_bounds,
+  truncR = param_bounds$truncR_bounds,
+  maxEE_F = param_bounds$maxEE_f_bounds,
+  maxEE_R = param_bounds$maxEE_r_bounds
 )
 
-# Create a parameter summary table
+# Create a temporary directory for testing
+temp_dir <- prepare_temp_dir()
+
+# Set up Bayesian optimization
+cat("Starting Bayesian optimization for DADA2 parameter selection...\n")
+cat("This process will systematically test different parameter combinations to find the optimal settings.\n")
+
+# Determine the best optimization approach based on available packages
+if (has_pbo && requireNamespace("ParBayesianOptimization", quietly = TRUE)) {
+  # Use parallel Bayesian optimization if available
+  library(ParBayesianOptimization)
+  
+  # Define the parameter space
+  param_set <- list(
+    truncF = c(bounds$truncF[1], bounds$truncF[2]),
+    truncR = c(bounds$truncR[1], bounds$truncR[2]),
+    maxEE_F = c(bounds$maxEE_F[1], bounds$maxEE_F[2]),
+    maxEE_R = c(bounds$maxEE_R[1], bounds$maxEE_R[2])
+  )
+  
+  # Determine optimal number of cores for parallel processing
+  n_cores <- ifelse(exists("hw_caps"), 
+                   min(hw_caps$optimal_workers, parallel::detectCores() - 1),
+                   min(4, parallel::detectCores() - 1))
+  
+  # Run parallel Bayesian optimization
+  optim_results <- ParBayesianOptimization::pbayesopt(
+    FUN = dada2_optimization_function,
+    bounds = param_set,
+    initPoints = 5,
+    iters.n = 15,
+    iters.k = 1,
+    parallel = TRUE,
+    packages = c("dada2"),
+    cores = n_cores
+  )
+  
+  # Extract best parameters
+  best_params <- optim_results$Best_Par
+  truncLen_forward <- as.integer(best_params$truncF)
+  truncLen_reverse <- as.integer(best_params$truncR)
+  maxEE_forward <- best_params$maxEE_F
+  maxEE_reverse <- best_params$maxEE_R
+  
+} else {
+  # Use standard Bayesian optimization
+  
+  # Define the parameter space
+  param_set <- list(
+    truncF = c(bounds$truncF[1], bounds$truncF[2]),
+    truncR = c(bounds$truncR[1], bounds$truncR[2]),
+    maxEE_F = c(bounds$maxEE_F[1], bounds$maxEE_F[2]),
+    maxEE_R = c(bounds$maxEE_R[1], bounds$maxEE_R[2])
+  )
+  
+  # Adjust maxiterations based on system capability
+  max_iter <- ifelse(exists("hw_caps") && hw_caps$cores >= 8, 20, 15)
+  
+  # Run Bayesian optimization
+  optim_results <- rBayesianOptimization::BayesianOptimization(
+    FUN = dada2_optimization_function,
+    bounds = param_set,
+    init_points = 5,
+    n_iter = max_iter,
+    acq = "ucb",
+    verbose = TRUE
+  )
+  
+  # Extract best parameters
+  best_params <- optim_results$Best_Par
+  truncLen_forward <- as.integer(best_params[["truncF"]])
+  truncLen_reverse <- as.integer(best_params[["truncR"]])
+  maxEE_forward <- best_params[["maxEE_F"]]
+  maxEE_reverse <- best_params[["maxEE_R"]]
+}
+
+# Calculate expected overlap with optimized parameters
+expected_overlap <- truncLen_forward + truncLen_reverse
+if (!is.null(param_bounds$target_amplicon_size)) {
+  expected_overlap <- expected_overlap - param_bounds$target_amplicon_size
+}
+
+# Visualize the quality profiles with optimized truncation points
+forward_plot <- ggplot(quality_profiles$forward_mean_qual, aes(x = Cycle, y = Score)) +
+  geom_line(size = 1) +
+  geom_hline(yintercept = 25, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = truncLen_forward, linetype = "dashed", color = "blue") +
+  scale_y_continuous(limits = c(0, 40)) +
+  labs(title = paste("Forward Read Quality -", quality_profiles$platform), 
+       subtitle = paste("Bayesian optimized truncation at position", truncLen_forward),
+       x = "Cycle", y = "Quality Score") +
+  theme_minimal()
+
+reverse_plot <- ggplot(quality_profiles$reverse_mean_qual, aes(x = Cycle, y = Score)) +
+  geom_line(size = 1) +
+  geom_hline(yintercept = 25, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = truncLen_reverse, linetype = "dashed", color = "blue") +
+  scale_y_continuous(limits = c(0, 40)) +
+  labs(title = paste("Reverse Read Quality -", quality_profiles$platform), 
+       subtitle = paste("Bayesian optimized truncation at position", truncLen_reverse),
+       x = "Cycle", y = "Quality Score") +
+  theme_minimal()
+
+# Display plots together
+grid.arrange(forward_plot, reverse_plot, ncol = 2)
+
+# Create a function to test the optimized parameters on a larger dataset
+# This validates our optimized parameters
+validate_optimized_parameters <- function(truncF, truncR, maxEE_F, maxEE_R, 
+                                        validate_size = 5) {
+  # Use a larger subset for validation
+  n_validate <- min(validate_size, length(fnFs))
+  validate_fnFs <- fnFs[1:n_validate]
+  validate_fnRs <- fnRs[1:n_validate]
+  validate_names <- sample.names[1:n_validate]
+  
+  # Create filtered file paths
+  validate_filtFs <- file.path(temp_dir, paste0(validate_names, "_F_filt.fastq.gz"))
+  validate_filtRs <- file.path(temp_dir, paste0(validate_names, "_R_filt.fastq.gz"))
+  names(validate_filtFs) <- validate_names
+  names(validate_filtRs) <- validate_names
+  
+  # Filter with optimized parameters
+  validate_out <- suppressWarnings(
+    filterAndTrim(validate_fnFs, validate_filtFs, validate_fnRs, validate_filtRs,
+                 truncLen = c(truncF, truncR),
+                 maxN = 0, maxEE = c(maxEE_F, maxEE_R), truncQ = 2,
+                 rm.phix = TRUE, compress = TRUE, multithread = TRUE)
+  )
+  
+  # Calculate overall retention rate
+  reads_in <- sum(validate_out[, 1])
+  reads_kept <- sum(validate_out[, 2])
+  retention_rate <- round(reads_kept / reads_in * 100, 1)
+  
+  # Calculate per-sample retention rates
+  sample_retention <- round(validate_out[, 2] / validate_out[, 1] * 100, 1)
+  
+  # Create a validation summary
+  validation <- list(
+    retention_rate = retention_rate,
+    sample_retention = sample_retention,
+    reads_in = reads_in,
+    reads_kept = reads_kept
+  )
+  
+  # Clean up validation files
+  unlink(validate_filtFs)
+  unlink(validate_filtRs)
+  
+  return(validation)
+}
+
+# Validate the optimized parameters
+cat("\nValidating optimized parameters on a larger dataset...\n")
+validation <- validate_optimized_parameters(
+  truncLen_forward, truncLen_reverse,
+  maxEE_forward, maxEE_reverse,
+  validate_size = 5
+)
+
+# Create a more comprehensive parameter summary table
 param_summary <- data.frame(
   Parameter = c("Platform", "Forward Read Length", "Reverse Read Length", 
                 "Forward Truncation Length", "Reverse Truncation Length", 
                 "Forward maxEE", "Reverse maxEE",
-                "Expected Amplicon Size", "Expected Overlap"),
-  Value = c(truncation_lengths$platform, 
-            truncation_lengths$max_forward_len,
-            truncation_lengths$max_reverse_len,
-            truncation_lengths$forward, 
-            truncation_lengths$reverse, 
-            maxEE_params$maxEE[1], 
-            maxEE_params$maxEE[2],
+                "Expected Amplicon Size", "Expected Overlap",
+                "Overall Read Retention", "Min Sample Retention", "Max Sample Retention"),
+  Value = c(quality_profiles$platform, 
+            quality_profiles$max_forward_cycle,
+            quality_profiles$max_reverse_cycle,
+            truncLen_forward, 
+            truncLen_reverse, 
+            round(maxEE_forward, 1), 
+            round(maxEE_reverse, 1),
             expected_amplicon_size,
-            truncation_lengths$expected_overlap),
+            expected_overlap,
+            paste0(validation$retention_rate, "%"),
+            paste0(min(validation$sample_retention), "%"),
+            paste0(max(validation$sample_retention), "%")),
   Notes = c("Detected sequencing platform",
             "Maximum cycle number in forward reads",
             "Maximum cycle number in reverse reads",
-            "Position where quality drops below threshold",
-            "Position where quality drops below threshold",
-            "Maximum expected errors allowed in forward reads",
-            "Maximum expected errors allowed in reverse reads",
+            "Bayesian optimized truncation position",
+            "Bayesian optimized truncation position",
+            "Bayesian optimized maximum expected errors",
+            "Bayesian optimized maximum expected errors",
             "Expected amplicon size based on primer",
-            "Expected overlap after truncation")
+            "Expected overlap after truncation",
+            "Percentage of reads retained after filtering",
+            "Lowest retention rate among samples",
+            "Highest retention rate among samples")
 )
-kable(param_summary, caption = "Optimized Filtering Parameters")
+kable(param_summary, caption = "Bayesian Optimized DADA2 Parameters")
 
-# Set the optimized parameters for use in the workflow
-truncLen_forward <- truncation_lengths$forward  
-truncLen_reverse <- truncation_lengths$reverse
-maxEE_forward <- maxEE_params$maxEE[1]
-maxEE_reverse <- maxEE_params$maxEE[2]
+# Plot the optimization history if using rBayesianOptimization
+if (!has_pbo) {
+  # Extract optimization history
+  history <- optim_results$History
+  history$Round <- 1:nrow(history)
+  
+  # Plot optimization progress
+  opt_plot <- ggplot(history, aes(x = Round, y = Value)) +
+    geom_line() +
+    geom_point() +
+    geom_hline(yintercept = optim_results$Best_Value, linetype = "dashed", color = "red") +
+    labs(title = "DADA2 Parameter Optimization Progress",
+         subtitle = paste("Best score:", round(optim_results$Best_Value, 2)),
+         x = "Optimization Round", 
+         y = "Parameter Score") +
+    theme_minimal()
+  
+  print(opt_plot)
+}
+
+# Clean up temporary directory
+unlink(temp_dir, recursive = TRUE)
+
+# Final parameters for the rest of the workflow
+cat("\nFinal Bayesian optimized parameters for filtering:\n")
+cat("truncLen =", c(truncLen_forward, truncLen_reverse), "\n")
+cat("maxEE =", c(round(maxEE_forward, 1), round(maxEE_reverse, 1)), "\n")
 
 # Allow parameter override (uncomment to override)
 # truncLen_forward <- 240  # Uncomment to override
@@ -1185,9 +1407,22 @@ maxEE_reverse <- maxEE_params$maxEE[2]
 # maxEE_forward <- 2       # Uncomment to override
 # maxEE_reverse <- 2       # Uncomment to override
 
-cat("Final parameters for filtering:\n")
-cat("truncLen =", c(truncLen_forward, truncLen_reverse), "\n")
-cat("maxEE =", c(maxEE_forward, maxEE_reverse), "\n")
+# Store optimization results for reporting
+bayesian_optimization_results <- list(
+  method = "Bayesian Optimization",
+  platform = quality_profiles$platform,
+  parameters = list(
+    truncLen = c(forward = truncLen_forward, reverse = truncLen_reverse),
+    maxEE = c(forward = round(maxEE_forward, 1), reverse = round(maxEE_reverse, 1))
+  ),
+  validation = validation,
+  expected_overlap = expected_overlap,
+  target_amplicon_size = expected_amplicon_size
+)
+
+# Save optimization results for reporting/dashboards
+if (!dir.exists("results")) dir.create("results")
+saveRDS(bayesian_optimization_results, "results/bayesian_optimization_results.rds")
 ```
 
 # Filter and Trim
