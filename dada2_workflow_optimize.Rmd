@@ -923,6 +923,328 @@ print(forward_qual)
 print(reverse_qual)
 ```
 
+# K-mer Signature Analysis for Adapter Detection
+
+Before optimizing parameters, let's perform a k-mer analysis to detect potential adapter contamination or other systematic artifacts at read ends.
+
+```{r kmer-signature-analysis}
+# Function to extract and analyze k-mers at read ends
+analyze_read_end_kmers <- function(fastq_files, k = 8, n_reads = 10000, end_position = 5) {
+  # Load required libraries
+  library(ShortRead)
+  library(Biostrings)
+  library(ggplot2)
+  
+  cat("Analyzing read-end k-mer signatures for potential adapter contamination...\n")
+  cat("Using k =", k, "for k-mer analysis\n")
+  
+  # Sample a subset of files for efficiency
+  n_files <- min(3, length(fastq_files))
+  sampled_files <- fastq_files[sample(length(fastq_files), n_files)]
+  
+  # Initialize results
+  kmer_counts_5prime <- list()
+  kmer_counts_3prime <- list()
+  
+  # Process each file
+  for (file_path in sampled_files) {
+    cat("Processing", basename(file_path), "...\n")
+    
+    # Read FASTQ file and sample reads
+    reads <- ShortRead::readFastq(file_path)
+    if (length(reads) > n_reads) {
+      set.seed(42)  # For reproducibility
+      reads <- reads[sample(length(reads), n_reads)]
+    }
+    
+    # Extract sequences
+    sequences <- ShortRead::sread(reads)
+    
+    # Extract k-mers from the 5' end (beginning of read)
+    start_pos <- 1
+    end_pos <- min(start_pos + k - 1, width(sequences)[1])
+    
+    kmers_5prime <- substring(sequences, start_pos, end_pos)
+    kmer_table_5prime <- table(kmers_5prime)
+    kmer_counts_5prime[[basename(file_path)]] <- kmer_table_5prime
+    
+    # Extract k-mers from the 3' end (end of read)
+    # Handle variable width reads
+    widths <- width(sequences)
+    
+    # Function to get k-mer from end position
+    get_3prime_kmer <- function(seq, w, k) {
+      if (w <= k) return(as.character(seq))
+      start_pos <- w - k + 1
+      end_pos <- w
+      return(substring(seq, start_pos, end_pos))
+    }
+    
+    # Apply to each read
+    kmers_3prime <- mapply(
+      get_3prime_kmer,
+      as.character(sequences),
+      widths,
+      MoreArgs = list(k = k)
+    )
+    
+    kmer_table_3prime <- table(kmers_3prime)
+    kmer_counts_3prime[[basename(file_path)]] <- kmer_table_3prime
+  }
+  
+  # Combine results across files
+  combine_kmer_counts <- function(count_list) {
+    all_kmers <- unique(unlist(lapply(count_list, names)))
+    combined_counts <- rep(0, length(all_kmers))
+    names(combined_counts) <- all_kmers
+    
+    for (counts in count_list) {
+      combined_counts[names(counts)] <- combined_counts[names(counts)] + counts
+    }
+    
+    # Sort by frequency
+    return(sort(combined_counts, decreasing = TRUE))
+  }
+  
+  combined_5prime <- combine_kmer_counts(kmer_counts_5prime)
+  combined_3prime <- combine_kmer_counts(kmer_counts_3prime)
+  
+  # Calculate total counts
+  total_5prime <- sum(combined_5prime)
+  total_3prime <- sum(combined_3prime)
+  
+  # Convert to percentages and prepare for plotting
+  prepare_for_plot <- function(counts, total, max_kmers = 20) {
+    pct <- (counts / total) * 100
+    top_kmers <- head(pct, max_kmers)
+    df <- data.frame(
+      kmer = names(top_kmers),
+      percentage = as.numeric(top_kmers)
+    )
+    return(df)
+  }
+  
+  plot_data_5prime <- prepare_for_plot(combined_5prime, total_5prime)
+  plot_data_3prime <- prepare_for_plot(combined_3prime, total_3prime)
+  
+  # Check for common adapter sequences
+  common_adapters <- list(
+    TruSeq = c(
+      "AGATCGGAAGAGC",  # TruSeq Universal Adapter
+      "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA",  # TruSeq Adapter, Index 1
+      "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT"   # TruSeq Adapter, Index 2
+    ),
+    Nextera = c(
+      "CTGTCTCTTATACACATCT",  # Nextera Transposase Sequence
+      "TCGTCGGCAGCGTCAGATGTGTATAAGAGACAG",  # Nextera Read 1
+      "GTCTCGTGGGCTCGGAGATGTGTATAAGAGACAG"  # Nextera Read 2
+    ),
+    "Illumina Small RNA" = c(
+      "TGGAATTCTCGGGTGCCAAGG"  # Illumina Small RNA Adapter
+    )
+  )
+  
+  # Function to check for adapter contamination
+  check_adapter_contamination <- function(kmer_counts, adapter_list, k) {
+    results <- list()
+    
+    for (adapter_name in names(adapter_list)) {
+      adapter_seqs <- adapter_list[[adapter_name]]
+      
+      for (adapter in adapter_seqs) {
+        # Skip if adapter is shorter than k
+        if (nchar(adapter) < k) next
+        
+        # Generate k-mers from adapter
+        adapter_kmers <- character(nchar(adapter) - k + 1)
+        for (i in 1:(nchar(adapter) - k + 1)) {
+          adapter_kmers[i] <- substring(adapter, i, i + k - 1)
+        }
+        
+        # Check if k-mers are present in our data
+        matching_kmers <- adapter_kmers[adapter_kmers %in% names(kmer_counts)]
+        
+        if (length(matching_kmers) > 0) {
+          # Calculate prevalence
+          prevalence <- sum(kmer_counts[matching_kmers]) / sum(kmer_counts) * 100
+          
+          if (prevalence > 0.1) {  # Only report if prevalent enough
+            results[[paste0(adapter_name, " (", adapter, ")")]] <- list(
+              kmers = matching_kmers,
+              prevalence = prevalence
+            )
+          }
+        }
+      }
+    }
+    
+    return(results)
+  }
+  
+  adapter_check_5prime <- check_adapter_contamination(combined_5prime, common_adapters, k)
+  adapter_check_3prime <- check_adapter_contamination(combined_3prime, common_adapters, k)
+  
+  # Create plots
+  plot_5prime <- ggplot(plot_data_5prime, aes(x = reorder(kmer, -percentage), y = percentage)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    labs(title = paste0("Top ", k, "-mers at 5' end (read start)"),
+         subtitle = "Potential adapter or systematic bias detection",
+         x = paste0(k, "-mer"),
+         y = "Frequency (%)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  plot_3prime <- ggplot(plot_data_3prime, aes(x = reorder(kmer, -percentage), y = percentage)) +
+    geom_bar(stat = "identity", fill = "darkred") +
+    labs(title = paste0("Top ", k, "-mers at 3' end (read end)"),
+         subtitle = "Potential adapter or systematic bias detection",
+         x = paste0(k, "-mer"),
+         y = "Frequency (%)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  # Calculate homogeneity score (higher scores mean more homogeneous k-mer distribution)
+  calc_homogeneity <- function(kmer_counts) {
+    # Convert counts to probabilities
+    probs <- kmer_counts / sum(kmer_counts)
+    
+    # Calculate entropy (lower entropy = less randomness = more homogeneity)
+    entropy <- -sum(probs * log2(probs), na.rm = TRUE)
+    
+    # Maximum possible entropy (completely random distribution)
+    max_entropy <- log2(length(kmer_counts))
+    
+    # Normalize and convert to homogeneity score (0-100)
+    if (max_entropy > 0) {
+      homogeneity <- (1 - (entropy / max_entropy)) * 100
+    } else {
+      homogeneity <- 0
+    }
+    
+    return(homogeneity)
+  }
+  
+  homogeneity_5prime <- calc_homogeneity(combined_5prime)
+  homogeneity_3prime <- calc_homogeneity(combined_3prime)
+  
+  # Return results
+  return(list(
+    plots = list(five_prime = plot_5prime, three_prime = plot_3prime),
+    top_kmers = list(five_prime = head(combined_5prime, 30), three_prime = head(combined_3prime, 30)),
+    adapter_check = list(five_prime = adapter_check_5prime, three_prime = adapter_check_3prime),
+    homogeneity = list(five_prime = homogeneity_5prime, three_prime = homogeneity_3prime)
+  ))
+}
+
+# Run k-mer analysis on forward reads
+cat("Running k-mer analysis on forward reads to detect potential adapter contamination...\n")
+forward_kmer_analysis <- analyze_read_end_kmers(fnFs, k = 8, n_reads = 10000)
+
+# Display 5' end k-mer plot for forward reads
+print(forward_kmer_analysis$plots$five_prime)
+
+# Display 3' end k-mer plot for forward reads
+print(forward_kmer_analysis$plots$three_prime)
+
+# Run k-mer analysis on reverse reads
+cat("Running k-mer analysis on reverse reads to detect potential adapter contamination...\n")
+reverse_kmer_analysis <- analyze_read_end_kmers(fnRs, k = 8, n_reads = 10000)
+
+# Display 5' end k-mer plot for reverse reads
+print(reverse_kmer_analysis$plots$five_prime)
+
+# Display 3' end k-mer plot for reverse reads
+print(reverse_kmer_analysis$plots$three_prime)
+
+# Report adapter findings
+cat("\nAdapter contamination analysis:\n")
+
+report_adapters <- function(adapter_check, end_type, read_type) {
+  if (length(adapter_check) > 0) {
+    cat("\nPotential", end_type, "adapter contamination in", read_type, "reads:\n")
+    for (adapter_name in names(adapter_check)) {
+      cat("- ", adapter_name, ": ", round(adapter_check[[adapter_name]]$prevalence, 2), "% prevalence\n", sep = "")
+    }
+  } else {
+    cat("No", end_type, "adapter contamination detected in", read_type, "reads\n")
+  }
+}
+
+report_adapters(forward_kmer_analysis$adapter_check$five_prime, "5' end", "forward")
+report_adapters(forward_kmer_analysis$adapter_check$three_prime, "3' end", "forward")
+report_adapters(reverse_kmer_analysis$adapter_check$five_prime, "5' end", "reverse")
+report_adapters(reverse_kmer_analysis$adapter_check$three_prime, "3' end", "reverse")
+
+# Report homogeneity scores
+cat("\nK-mer pattern homogeneity scores (higher values indicate more homogeneous patterns):\n")
+cat("Forward reads - 5' end:", round(forward_kmer_analysis$homogeneity$five_prime, 1), "%\n")
+cat("Forward reads - 3' end:", round(forward_kmer_analysis$homogeneity$three_prime, 1), "%\n")
+cat("Reverse reads - 5' end:", round(reverse_kmer_analysis$homogeneity$five_prime, 1), "%\n")
+cat("Reverse reads - 3' end:", round(reverse_kmer_analysis$homogeneity$three_prime, 1), "%\n")
+
+# Provide recommendations based on analysis
+provide_recommendations <- function(fwd_analysis, rev_analysis) {
+  cat("\nAdapter contamination recommendations:\n")
+  
+  # Check if any adapter contamination was detected
+  has_adapters <- length(fwd_analysis$adapter_check$five_prime) > 0 ||
+    length(fwd_analysis$adapter_check$three_prime) > 0 ||
+    length(rev_analysis$adapter_check$five_prime) > 0 ||
+    length(rev_analysis$adapter_check$three_prime) > 0
+  
+  high_homogeneity <- fwd_analysis$homogeneity$five_prime > 30 ||
+    fwd_analysis$homogeneity$three_prime > 30 ||
+    rev_analysis$homogeneity$five_prime > 30 ||
+    rev_analysis$homogeneity$three_prime > 30
+  
+  if (has_adapters || high_homogeneity) {
+    cat("- Adapter contamination or systematic biases detected\n")
+    
+    # Check 5' end adapters
+    if (length(fwd_analysis$adapter_check$five_prime) > 0 ||
+        length(rev_analysis$adapter_check$five_prime) > 0) {
+      cat("- Consider adjusting trimLeft parameter in filterAndTrim\n")
+    }
+    
+    # Check 3' end adapters
+    if (length(fwd_analysis$adapter_check$three_prime) > 0 ||
+        length(rev_analysis$adapter_check$three_prime) > 0) {
+      cat("- Your truncation parameters will remove 3' adapters, but you may need more aggressive truncation\n")
+    }
+    
+    # Recommend truncation points
+    if (high_homogeneity) {
+      if (fwd_analysis$homogeneity$five_prime > 30) {
+        # Recommend trimming the first few bases of forward reads
+        cat("- Consider using trimLeft=5 or higher for forward reads\n")
+      }
+      
+      if (rev_analysis$homogeneity$five_prime > 30) {
+        # Recommend trimming the first few bases of reverse reads
+        cat("- Consider using trimLeft=5 or higher for reverse reads\n")
+      }
+    }
+  } else {
+    cat("- No significant adapter contamination or systematic biases detected\n")
+    cat("- Standard filtering parameters should be sufficient\n")
+  }
+}
+
+provide_recommendations(forward_kmer_analysis, reverse_kmer_analysis)
+
+# Save results for reporting
+if (!dir.exists("results")) dir.create("results")
+
+kmer_analysis_results <- list(
+  forward = forward_kmer_analysis,
+  reverse = reverse_kmer_analysis,
+  timestamp = Sys.time()
+)
+
+saveRDS(kmer_analysis_results, "results/kmer_analysis.rds")
+cat("K-mer analysis results saved to results/kmer_analysis.rds\n")
+```
+
 # Read Length Distribution Analysis
 
 Before optimizing parameters, let's analyze the read length distribution to better understand our sequencing data.
@@ -1062,6 +1384,25 @@ read_length_info <- list(
   expected_overlap = if(exists("expected_overlap")) expected_overlap else NULL,
   expected_amplicon_size = if(exists("expected_amplicon_size")) expected_amplicon_size else NULL
 )
+
+# Store modal read lengths for use in parameter optimization
+modal_forward_length <- modal_lengths$ReadLength[modal_lengths$Direction == "Forward"]
+modal_reverse_length <- modal_lengths$ReadLength[modal_lengths$Direction == "Reverse"]
+
+# Calculate suggested truncation points based on observed read lengths
+# Use a conservative approach - truncate a small amount (5%) from the modal length
+# or use quality profile information if available
+suggested_truncF <- floor(modal_forward_length * 0.95)
+suggested_truncR <- floor(modal_reverse_length * 0.95)
+
+cat("\nSuggested truncation points based on read length analysis:\n")
+cat("Forward reads:", suggested_truncF, "bp (95% of modal length)\n")
+cat("Reverse reads:", suggested_truncR, "bp (95% of modal length)\n")
+
+# Store the read overlap if calculated
+if(exists("expected_overlap")) {
+  cat("\nThis information will be used to optimize parameter selection.\n")
+}
 ```
 
 # Automatic Parameter Optimization
@@ -1154,24 +1495,85 @@ determine_parameter_bounds <- function(quality_profiles, target_amplicon_size = 
     earliest_drop_r <- max_reverse_cycle
   }
   
-  # Find the lowest safe truncation points (where quality is still good)
-  min_trunc_f <- max(150, floor(max_forward_cycle * 0.6)) # Minimum 150bp or 60% of read
-  min_trunc_r <- max(150, floor(max_reverse_cycle * 0.6)) # Minimum 150bp or 60% of read
-  
-  # Determine maximum truncation values (should be before quality drops too much)
-  max_trunc_f <- max_forward_cycle
-  max_trunc_r <- max_reverse_cycle
+  # Use read length analysis if available for more informed parameter selection
+  if (exists("modal_forward_length") && exists("modal_reverse_length") && 
+      exists("suggested_truncF") && exists("suggested_truncR")) {
+    
+    # Use read length analysis with some safety margin
+    safe_forward_length <- suggested_truncF
+    safe_reverse_length <- suggested_truncR
+    
+    cat("Incorporating read length analysis into parameter bounds...\n")
+    cat("Modal forward length:", modal_forward_length, "bp\n")
+    cat("Modal reverse length:", modal_reverse_length, "bp\n")
+    
+    # Consider both read length and quality profile
+    # Set minimum truncation to the smaller of suggested truncation or earliest quality drop
+    min_trunc_f <- min(safe_forward_length, earliest_drop_f)
+    min_trunc_r <- min(safe_reverse_length, earliest_drop_r)
+    
+    # Ensure minimum threshold for effective reads
+    min_trunc_f <- max(min_trunc_f, 150)  # Minimum 150bp
+    min_trunc_r <- max(min_trunc_r, 150)  # Minimum 150bp
+    
+    # For maximum truncation, use the observed modal lengths with a small buffer
+    max_trunc_f <- min(modal_forward_length, max_forward_cycle)
+    max_trunc_r <- min(modal_reverse_length, max_reverse_cycle)
+    
+    cat("Setting parameter bounds based on observed read lengths and quality profiles\n")
+  } else {
+    # Default approach when read length analysis is not available
+    # Find the lowest safe truncation points (where quality is still good)
+    min_trunc_f <- max(150, floor(max_forward_cycle * 0.6)) # Minimum 150bp or 60% of read
+    min_trunc_r <- max(150, floor(max_reverse_cycle * 0.6)) # Minimum 150bp or 60% of read
+    
+    # Determine maximum truncation values (should be before quality drops too much)
+    max_trunc_f <- max_forward_cycle
+    max_trunc_r <- max_reverse_cycle
+    
+    cat("Using default parameter bounds based only on quality profiles\n")
+  }
   
   # If we have amplicon size information, ensure we'll have sufficient overlap
   if (!is.null(target_amplicon_size)) {
     min_combined_length <- target_amplicon_size + min_overlap
     
-    # Ensure minimum truncation points will allow sufficient overlap
-    if (min_trunc_f + min_trunc_r < min_combined_length) {
-      # Adjust min truncation values to ensure overlap is possible
-      adjustment <- ceiling((min_combined_length - (min_trunc_f + min_trunc_r)) / 2)
-      min_trunc_f <- min(min_trunc_f + adjustment, max_forward_cycle - 10)
-      min_trunc_r <- min(min_trunc_r + adjustment, max_reverse_cycle - 10)
+    # If expected overlap was calculated from read length analysis, use it for overlap considerations
+    if (exists("expected_overlap")) {
+      cat("Using expected overlap of", expected_overlap, "bp from read length analysis\n")
+      
+      if (expected_overlap < min_overlap) {
+        cat("WARNING: Expected overlap from read length analysis (", expected_overlap, 
+            "bp) is less than minimum required (", min_overlap, "bp)\n", sep="")
+        cat("Adjusting truncation parameters to ensure sufficient overlap...\n")
+        
+        # Calculate how much to adjust to achieve minimum overlap
+        needed_adjustment <- min_overlap - expected_overlap
+        
+        # Distribute the adjustment between forward and reverse reads
+        forward_adjustment <- ceiling(needed_adjustment / 2)
+        reverse_adjustment <- needed_adjustment - forward_adjustment
+        
+        # Apply the adjustments
+        if (max_trunc_f - forward_adjustment > min_trunc_f) {
+          max_trunc_f <- max_trunc_f - forward_adjustment
+          cat("Reduced maximum forward truncation to", max_trunc_f, "bp\n")
+        }
+        
+        if (max_trunc_r - reverse_adjustment > min_trunc_r) {
+          max_trunc_r <- max_trunc_r - reverse_adjustment
+          cat("Reduced maximum reverse truncation to", max_trunc_r, "bp\n")
+        }
+      }
+    } else {
+      # Traditional approach when expected_overlap isn't available
+      # Ensure minimum truncation points will allow sufficient overlap
+      if (min_trunc_f + min_trunc_r < min_combined_length) {
+        # Adjust min truncation values to ensure overlap is possible
+        adjustment <- ceiling((min_combined_length - (min_trunc_f + min_trunc_r)) / 2)
+        min_trunc_f <- min(min_trunc_f + adjustment, max_forward_cycle - 10)
+        min_trunc_r <- min(min_trunc_r + adjustment, max_reverse_cycle - 10)
+      }
     }
   }
   
@@ -1187,11 +1589,12 @@ determine_parameter_bounds <- function(quality_profiles, target_amplicon_size = 
   min_trunc_r <- as.integer(min_trunc_r)
   max_trunc_r <- as.integer(max_trunc_r)
   
-  # Calculate expected overlap range
+  # Calculate expected overlap range based on parameter bounds
   if (!is.null(target_amplicon_size)) {
     min_overlap_possible <- min_trunc_f + min_trunc_r - target_amplicon_size
     max_overlap_possible <- max_trunc_f + max_trunc_r - target_amplicon_size
-    cat("Possible overlap range: ", min_overlap_possible, " - ", max_overlap_possible, " bp\n", sep="")
+    cat("Possible overlap range based on parameter bounds: ", min_overlap_possible, 
+        " - ", max_overlap_possible, " bp\n", sep="")
     
     if (min_overlap_possible < min_overlap) {
       cat("WARNING: Minimum possible overlap may be less than recommended (", min_overlap, " bp)\n", sep="")
@@ -1204,8 +1607,14 @@ determine_parameter_bounds <- function(quality_profiles, target_amplicon_size = 
     truncR_bounds = c(min_trunc_r, max_trunc_r),
     maxEE_f_bounds = c(min_maxEE_f, max_maxEE_f),
     maxEE_r_bounds = c(min_maxEE_r, max_maxEE_r),
-    target_amplicon_size = target_amplicon_size
+    target_amplicon_size = target_amplicon_size,
+    read_length_info = if(exists("read_length_info")) read_length_info else NULL,
+    expected_overlap = if(exists("expected_overlap")) expected_overlap else NULL
   )
+  
+  cat("Final parameter bounds for optimization:\n")
+  cat("Forward truncation range:", min_trunc_f, "-", max_trunc_f, "bp\n")
+  cat("Reverse truncation range:", min_trunc_r, "-", max_trunc_r, "bp\n")
   
   return(bounds_list)
 }
@@ -1420,25 +1829,77 @@ dada2_optimization_function <- function(truncF, truncR, maxEE_F, maxEE_R) {
       retention_score <- retention_rate * 100  # Scale up to make it significant
       maxEE_penalty <- (maxEE_F + maxEE_R) * 1  # Reduced penalty for higher error rates
       
-      # Add length reward to prefer keeping more of the read
-      length_reward <- (truncF / 250 + truncR / 250) * 25  # Reward for longer reads
+      # Enhanced length reward based on read length analysis if available
+      length_reward <- 0
+      if (exists("modal_forward_length") && exists("modal_reverse_length")) {
+        # Calculate how close the truncation is to the modal length (as a percentage)
+        forward_length_pct <- truncF / modal_forward_length
+        reverse_length_pct <- truncR / modal_reverse_length
+        
+        # Reward values close to the modal lengths, with diminishing returns for excessive truncation
+        # Optimal is to keep 95-100% of the modal read length
+        length_reward <- (
+          (min(forward_length_pct, 1.0) * 20) +  # Max 20 points for forward
+          (min(reverse_length_pct, 1.0) * 20)    # Max 20 points for reverse
+        )
+        
+        # Penalty for truncating too much (below 85% of modal length)
+        if (forward_length_pct < 0.85) {
+          length_reward <- length_reward - (0.85 - forward_length_pct) * 30
+        }
+        if (reverse_length_pct < 0.85) {
+          length_reward <- length_reward - (0.85 - reverse_length_pct) * 30
+        }
+      } else {
+        # Fall back to original formula when modal lengths aren't available
+        length_reward <- (truncF / 250 + truncR / 250) * 25
+      }
       
-      # Calculate amplicon length compliance score
+      # Calculate amplicon length compliance score with enhancements from read length analysis
       amplicon_score <- 0
       if (!is.null(param_bounds$target_amplicon_size)) {
         target_size <- param_bounds$target_amplicon_size
         expected_overlap <- truncF + truncR - target_size
         
-        # Penalty if overlap is too small
+        # Check if we have expected_overlap from read length analysis
+        has_read_length_overlap <- exists("expected_overlap") && !is.null(expected_overlap)
+        
+        # If we have expected overlap from read length analysis, use it to inform scoring
+        if (has_read_length_overlap) {
+          # Calculate how close the truncation's overlap is to the expected overlap
+          optimal_overlap_diff <- abs(expected_overlap - expected_overlap)
+          
+          # Reward proposed truncation values that produce an overlap close to the expected overlap
+          if (optimal_overlap_diff < 10) {
+            # Very close to expected overlap - higher reward
+            amplicon_score <- amplicon_score + 25
+          } else if (optimal_overlap_diff < 20) {
+            # Reasonably close to expected overlap
+            amplicon_score <- amplicon_score + 15
+          }
+        }
+        
+        # Standard overlap checking (still needed)
         if (expected_overlap < 20) {
-          amplicon_score <- -50  # Severe penalty
+          amplicon_score <- amplicon_score - 50  # Severe penalty for insufficient overlap
+        } else if (expected_overlap >= 20 && expected_overlap < 30) {
+          amplicon_score <- amplicon_score + (expected_overlap - 20)  # Small positive score for minimal acceptable overlap
+        } else if (expected_overlap >= 30 && expected_overlap < 50) {
+          amplicon_score <- amplicon_score + 10 + (expected_overlap - 30) * 0.5  # Good score for moderate overlap
         } else {
-          amplicon_score <- min(expected_overlap * 0.2, 20)  # Reward for good overlap
+          amplicon_score <- amplicon_score + 20  # Maximum score for abundant overlap
         }
       }
       
-      # Simple final score with added length reward
+      # Simple final score with enhanced rewards
       final_score <- retention_score - maxEE_penalty + amplicon_score + length_reward
+      
+      # Add information about the read length analysis if available
+      if (exists("read_length_info") && !is.null(param_bounds$read_length_info)) {
+        # Additional bonus for parameters that align with read length analysis
+        read_length_bonus <- 5
+        final_score <- final_score + read_length_bonus
+      }
       
       return(final_score)
       
@@ -1858,54 +2319,113 @@ unlink(validate_filtRs)
 # Ensure valid parameters
 ensure_valid_maxEE()
 
-# Create parameter summary table
+# Create parameter summary table with read length analysis information
 platform_value <- ifelse(exists("quality_profiles") && is.list(quality_profiles) && "platform" %in% names(quality_profiles),
                         quality_profiles$platform, "Unknown")
-forward_length <- ifelse(exists("quality_profiles") && is.list(quality_profiles) && "max_forward_cycle" %in% names(quality_profiles),
-                        quality_profiles$max_forward_cycle, NA)
-reverse_length <- ifelse(exists("quality_profiles") && is.list(quality_profiles) && "max_reverse_cycle" %in% names(quality_profiles),
-                        quality_profiles$max_reverse_cycle, NA)
+
+# Use read length analysis values if available
+forward_length <- ifelse(exists("modal_forward_length"), 
+                        modal_forward_length,
+                        ifelse(exists("quality_profiles") && is.list(quality_profiles) && "max_forward_cycle" %in% names(quality_profiles),
+                               quality_profiles$max_forward_cycle, NA))
+
+reverse_length <- ifelse(exists("modal_reverse_length"), 
+                        modal_reverse_length,
+                        ifelse(exists("quality_profiles") && is.list(quality_profiles) && "max_reverse_cycle" %in% names(quality_profiles),
+                               quality_profiles$max_reverse_cycle, NA))
+
+# Create param_summary rows vector incrementally to allow for optional read length analysis rows
+param_rows <- c(
+  "Platform", 
+  "Forward Read Length", 
+  "Reverse Read Length"
+)
+
+value_rows <- c(
+  platform_value,
+  forward_length,
+  reverse_length
+)
+
+notes_rows <- c(
+  "Detected sequencing platform",
+  "Modal length from read length analysis",
+  "Modal length from read length analysis"
+)
+
+# Add read length analysis specific rows if available
+if (exists("suggested_truncF") && exists("suggested_truncR")) {
+  param_rows <- c(param_rows, "Suggested Forward Truncation", "Suggested Reverse Truncation")
+  value_rows <- c(value_rows, suggested_truncF, suggested_truncR)
+  notes_rows <- c(notes_rows, "Based on read length analysis (95% of modal length)", 
+                  "Based on read length analysis (95% of modal length)")
+}
+
+# Add expected overlap from read length analysis if available
+if (exists("expected_overlap")) {
+  param_rows <- c(param_rows, "Expected Read Overlap")
+  value_rows <- c(value_rows, expected_overlap)
+  notes_rows <- c(notes_rows, "Calculated from modal read lengths and amplicon size")
+}
+
+# Add Bayesian optimization results
+param_rows <- c(param_rows,
+  "Forward Truncation Length", 
+  "Reverse Truncation Length",
+  "Forward maxEE", 
+  "Reverse maxEE",
+  "Expected Amplicon Size",
+  "Final Expected Overlap"
+)
+
+value_rows <- c(value_rows,
+  truncLen_forward,
+  truncLen_reverse,
+  sprintf("%.1f", maxEE_forward),
+  sprintf("%.1f", maxEE_reverse),
+  ifelse(exists("expected_amplicon_size"), expected_amplicon_size, NA),
+  truncLen_forward + truncLen_reverse - 
+    ifelse(exists("expected_amplicon_size"), expected_amplicon_size, NA)
+)
+
+notes_rows <- c(notes_rows,
+  "Bayesian optimized truncation position",
+  "Bayesian optimized truncation position",
+  "Bayesian optimized maximum expected errors",
+  "Bayesian optimized maximum expected errors",
+  "Expected amplicon size based on primer",
+  "Expected overlap after truncation with optimized parameters"
+)
 
 # Create a consolidated parameter summary dataframe
 param_summary <- data.frame(
-  Parameter = c(
-    "Platform", 
-    "Forward Read Length", 
-    "Reverse Read Length",
-    "Forward Truncation Length", 
-    "Reverse Truncation Length",
-    "Forward maxEE", 
-    "Reverse maxEE",
-    "Expected Amplicon Size",
-    "Expected Overlap"
-  ),
-  Value = c(
-    platform_value,
-    forward_length,
-    reverse_length,
-    truncLen_forward,
-    truncLen_reverse,
-    sprintf("%.1f", maxEE_forward),
-    sprintf("%.1f", maxEE_reverse),
-    ifelse(exists("expected_amplicon_size"), expected_amplicon_size, NA),
-    ifelse(exists("expected_overlap"), expected_overlap, NA)
-  ),
-  Notes = c(
-    "Detected sequencing platform",
-    "Maximum cycle number in forward reads",
-    "Maximum cycle number in reverse reads",
-    "Bayesian optimized truncation position",
-    "Bayesian optimized truncation position",
-    "Bayesian optimized maximum expected errors",
-    "Bayesian optimized maximum expected errors",
-    "Expected amplicon size based on primer",
-    "Expected overlap after truncation"
-  ),
+  Parameter = param_rows,
+  Value = value_rows,
+  Notes = notes_rows,
   stringsAsFactors = FALSE
 )
 
 # Display the parameter summary table
-kable(param_summary, caption = "Bayesian Optimized DADA2 Parameters")
+kable(param_summary, caption = "DADA2 Parameters with Read Length Analysis Integration")
+
+# Create a comparison of suggested vs optimized parameters if both are available
+if (exists("suggested_truncF") && exists("suggested_truncR")) {
+  param_comparison <- data.frame(
+    Parameter = c("Forward Truncation", "Reverse Truncation"),
+    Suggested = c(suggested_truncF, suggested_truncR),
+    Optimized = c(truncLen_forward, truncLen_reverse),
+    Difference = c(truncLen_forward - suggested_truncF, truncLen_reverse - suggested_truncR),
+    stringsAsFactors = FALSE
+  )
+  
+  # Add percentage difference
+  param_comparison$PercentDiff <- round(
+    c((truncLen_forward - suggested_truncF) / suggested_truncF * 100,
+      (truncLen_reverse - suggested_truncR) / suggested_truncR * 100),
+    1)
+  
+  # Display comparative summary
+  kable(param_comparison, caption = "Comparison of Read Length Analysis vs Bayesian Optimization")
 
 # Create a separate validation results table
 if (exists("validation") && is.list(validation)) {
@@ -1967,9 +2487,9 @@ expected_overlap_value <- ifelse(exists("expected_overlap") && !is.null(expected
 expected_amplicon_size_value <- ifelse(exists("expected_amplicon_size") && !is.null(expected_amplicon_size), 
                                      expected_amplicon_size, NA)
 
-# Create the results summary with appropriate values
+# Create the results summary with appropriate values and read length analysis
 bayesian_optimization_results <- list(
-  method = "Bayesian Optimization with Fallbacks",
+  method = "Bayesian Optimization with Read Length Analysis Integration",
   platform = platform_value,
   parameters = list(
     truncLen = c(forward = truncLen_forward, reverse = truncLen_reverse),
@@ -1978,12 +2498,52 @@ bayesian_optimization_results <- list(
   validation = validation,
   expected_overlap = expected_overlap_value,
   target_amplicon_size = expected_amplicon_size_value,
-  parameter_source = "Bayesian optimization"
+  parameter_source = "Bayesian optimization with read length analysis"
 )
+
+# Add read length analysis information if available
+if (exists("read_length_info")) {
+  bayesian_optimization_results$read_length_analysis <- list(
+    modal_lengths = c(
+      forward = if(exists("modal_forward_length")) modal_forward_length else NA,
+      reverse = if(exists("modal_reverse_length")) modal_reverse_length else NA
+    ),
+    suggested_truncation = c(
+      forward = if(exists("suggested_truncF")) suggested_truncF else NA,
+      reverse = if(exists("suggested_truncR")) suggested_truncR else NA
+    ),
+    expected_overlap = if(exists("expected_overlap")) expected_overlap else NA,
+    comparison = if(exists("param_comparison")) param_comparison else NULL
+  )
+}
+
+# Add k-mer analysis results if available
+if (file.exists("results/kmer_analysis.rds")) {
+  kmer_results <- readRDS("results/kmer_analysis.rds")
+  bayesian_optimization_results$kmer_analysis <- list(
+    forward_homogeneity = list(
+      five_prime = if(!is.null(kmer_results$forward$homogeneity$five_prime)) kmer_results$forward$homogeneity$five_prime else NA,
+      three_prime = if(!is.null(kmer_results$forward$homogeneity$three_prime)) kmer_results$forward$homogeneity$three_prime else NA
+    ),
+    reverse_homogeneity = list(
+      five_prime = if(!is.null(kmer_results$reverse$homogeneity$five_prime)) kmer_results$reverse$homogeneity$five_prime else NA,
+      three_prime = if(!is.null(kmer_results$reverse$homogeneity$three_prime)) kmer_results$reverse$homogeneity$three_prime else NA
+    ),
+    trimming_applied = list(
+      forward = if(exists("trimLeft_forward")) trimLeft_forward else 0,
+      reverse = if(exists("trimLeft_reverse")) trimLeft_reverse else 0
+    )
+  )
+}
 
 # Save optimization results for reporting/dashboards
 if (!dir.exists("results")) dir.create("results")
 saveRDS(bayesian_optimization_results, "results/bayesian_optimization_results.rds")
+
+# Save read length information separately for easier access
+if (exists("read_length_info")) {
+  saveRDS(read_length_info, "results/read_length_analysis.rds")
+}
 ```
 
 # Filter and Trim
@@ -2002,6 +2562,8 @@ ensure_valid_parameters <- function() {
   default_truncLen_R <- 160  # Typical good value for MiSeq/HiSeq reverse reads
   default_maxEE_F <- 2.0     # Standard value for maxEE forward
   default_maxEE_R <- 2.0     # Standard value for maxEE reverse
+  default_trimLeft_F <- 0    # Default is no 5' trimming for forward reads
+  default_trimLeft_R <- 0    # Default is no 5' trimming for reverse reads
   
   # Check and fix truncation lengths
   if (!exists("truncLen_forward") || is.null(truncLen_forward) || length(truncLen_forward) == 0 || !is.numeric(truncLen_forward)) {
@@ -2037,10 +2599,56 @@ ensure_valid_parameters <- function() {
     cat("Using maxEE_reverse:", maxEE_reverse, "\n")
   }
   
+  # Check if we have k-mer analysis results and extract trimLeft parameters
+  trimLeft_F <- default_trimLeft_F
+  trimLeft_R <- default_trimLeft_R
+  
+  if (file.exists("results/kmer_analysis.rds")) {
+    cat("Loading k-mer analysis results to determine trimLeft parameters...\n")
+    kmer_results <- readRDS("results/kmer_analysis.rds")
+    
+    # Extract forward read 5' homogeneity
+    if (!is.null(kmer_results$forward$homogeneity$five_prime)) {
+      fwd_5prime_homogeneity <- kmer_results$forward$homogeneity$five_prime
+      if (fwd_5prime_homogeneity > 30) {
+        # Use 5 as a default when homogeneity is high, or higher if extremely high
+        if (fwd_5prime_homogeneity > 50) {
+          trimLeft_F <- 8
+        } else {
+          trimLeft_F <- 5
+        }
+        cat("K-mer analysis detected high 5' homogeneity in forward reads (", 
+            fwd_5prime_homogeneity, "%). Setting trimLeft_F =", trimLeft_F, "\n")
+      }
+    }
+    
+    # Extract reverse read 5' homogeneity
+    if (!is.null(kmer_results$reverse$homogeneity$five_prime)) {
+      rev_5prime_homogeneity <- kmer_results$reverse$homogeneity$five_prime
+      if (rev_5prime_homogeneity > 30) {
+        # Use 5 as a default when homogeneity is high, or higher if extremely high
+        if (rev_5prime_homogeneity > 50) {
+          trimLeft_R <- 8
+        } else {
+          trimLeft_R <- 5
+        }
+        cat("K-mer analysis detected high 5' homogeneity in reverse reads (", 
+            rev_5prime_homogeneity, "%). Setting trimLeft_R =", trimLeft_R, "\n")
+      }
+    }
+  } else {
+    cat("No k-mer analysis results found. Using default trimLeft values (0,0).\n")
+  }
+  
+  # Make these accessible globally
+  trimLeft_forward <<- trimLeft_F
+  trimLeft_reverse <<- trimLeft_R
+  
   # Create or update the GLOBAL parameter vectors
   # These are the vectors that will actually be used in filterAndTrim calls
   GLOBAL_TRUNCLEN_VECTOR <<- c(truncLen_forward, truncLen_reverse)
   GLOBAL_MAXEE_VECTOR <<- c(maxEE_forward, maxEE_reverse)
+  GLOBAL_TRIMLEFT_VECTOR <<- c(trimLeft_forward, trimLeft_reverse)
   
   # Extra validation to ensure the vectors are properly formed
   if (length(GLOBAL_TRUNCLEN_VECTOR) != 2) {
@@ -2053,14 +2661,22 @@ ensure_valid_parameters <- function() {
     GLOBAL_MAXEE_VECTOR <<- c(default_maxEE_F, default_maxEE_R)
   }
   
+  if (length(GLOBAL_TRIMLEFT_VECTOR) != 2) {
+    cat("ERROR: GLOBAL_TRIMLEFT_VECTOR has incorrect length. Recreating with default values.\n")
+    GLOBAL_TRIMLEFT_VECTOR <<- c(default_trimLeft_F, default_trimLeft_R)
+  }
+  
   # Verify the vectors are valid
   cat("FINAL PARAMETERS FOR FILTERING:\n")
   cat("truncLen_forward =", truncLen_forward, "\n")
   cat("truncLen_reverse =", truncLen_reverse, "\n")
   cat("maxEE_forward =", maxEE_forward, "\n")
   cat("maxEE_reverse =", maxEE_reverse, "\n")
+  cat("trimLeft_forward =", trimLeft_forward, "\n")
+  cat("trimLeft_reverse =", trimLeft_reverse, "\n")
   cat("GLOBAL_TRUNCLEN_VECTOR =", paste(GLOBAL_TRUNCLEN_VECTOR, collapse=", "), "\n")
   cat("GLOBAL_MAXEE_VECTOR =", paste(GLOBAL_MAXEE_VECTOR, collapse=", "), "\n")
+  cat("GLOBAL_TRIMLEFT_VECTOR =", paste(GLOBAL_TRIMLEFT_VECTOR, collapse=", "), "\n")
   
   # Return TRUE to indicate successful validation
   return(TRUE)
@@ -2352,11 +2968,16 @@ if(length(fnFs) > 50) {
       cat("WARNING: GLOBAL_MAXEE_VECTOR is missing or invalid. Recreating with defaults.\n")
       GLOBAL_MAXEE_VECTOR <<- c(2.0, 2.0)
     }
+    if (!exists("GLOBAL_TRIMLEFT_VECTOR") || length(GLOBAL_TRIMLEFT_VECTOR) != 2) {
+      cat("WARNING: GLOBAL_TRIMLEFT_VECTOR is missing or invalid. Recreating with defaults.\n")
+      GLOBAL_TRIMLEFT_VECTOR <<- c(0, 0)
+    }
     
     # Use validated global parameter vectors
     cat("\nUSING VALIDATED GLOBAL PARAMETERS FOR FILTERING BATCH:\n")
     cat("truncLen =", paste(GLOBAL_TRUNCLEN_VECTOR, collapse=", "), "\n")
     cat("maxEE =", paste(GLOBAL_MAXEE_VECTOR, collapse=", "), "\n")
+    cat("trimLeft =", paste(GLOBAL_TRIMLEFT_VECTOR, collapse=", "), "\n")
     
     # Use our guaranteed global parameter vectors
     batch_out <- filterAndTrim(
@@ -2364,6 +2985,7 @@ if(length(fnFs) > 50) {
       truncLen = GLOBAL_TRUNCLEN_VECTOR,  # Using validated global vector
       maxN = 0, 
       maxEE = GLOBAL_MAXEE_VECTOR,        # Using validated global vector
+      trimLeft = GLOBAL_TRIMLEFT_VECTOR,  # Using validated k-mer-based trimming values
       truncQ = 2,
       rm.phix = TRUE, 
       compress = TRUE, 
