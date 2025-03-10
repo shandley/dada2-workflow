@@ -923,6 +923,149 @@ print(forward_qual)
 print(reverse_qual)
 ```
 
+# Read Length Distribution Analysis
+
+Before optimizing parameters, let's analyze the read length distribution to better understand our sequencing data.
+
+```{r read-length-distribution}
+# Function to analyze read lengths from fastq files
+analyze_read_lengths <- function(fastq_files, max_files = 5, max_reads = 5000) {
+  # Sample a subset of files for efficiency
+  n_files <- min(max_files, length(fastq_files))
+  sampled_files <- fastq_files[sample(length(fastq_files), n_files)]
+  
+  cat("Analyzing read lengths from", n_files, "sample files...\n")
+  
+  # Initialize results data frame
+  read_lengths <- data.frame(
+    Sample = character(),
+    ReadLength = integer(),
+    Count = integer(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Process each sampled file
+  for(i in seq_along(sampled_files)) {
+    file_path <- sampled_files[i]
+    sample_name <- basename(file_path)
+    
+    # Use ShortRead to efficiently sample reads
+    cat("Processing file:", sample_name, "\n")
+    reads <- ShortRead::readFastq(file_path)
+    
+    # Limit to max_reads if needed
+    if(length(reads) > max_reads) {
+      set.seed(42)  # For reproducibility
+      reads <- reads[sample(length(reads), max_reads)]
+    }
+    
+    # Extract read lengths
+    lengths <- width(reads)
+    length_table <- table(lengths)
+    
+    # Convert to data frame and add to results
+    length_df <- data.frame(
+      Sample = sample_name,
+      ReadLength = as.integer(names(length_table)),
+      Count = as.integer(length_table),
+      stringsAsFactors = FALSE
+    )
+    
+    read_lengths <- rbind(read_lengths, length_df)
+  }
+  
+  return(read_lengths)
+}
+
+# Analyze forward and reverse read lengths
+cat("Analyzing forward read lengths...\n")
+forward_lengths <- analyze_read_lengths(fnFs)
+
+cat("Analyzing reverse read lengths...\n")
+reverse_lengths <- analyze_read_lengths(fnRs)
+
+# Add read direction information
+forward_lengths$Direction <- "Forward"
+reverse_lengths$Direction <- "Reverse"
+
+# Combine the data
+all_lengths <- rbind(forward_lengths, reverse_lengths)
+
+# Create summary statistics
+length_summary <- all_lengths %>%
+  group_by(Direction, ReadLength) %>%
+  summarize(TotalCount = sum(Count)) %>%
+  group_by(Direction) %>%
+  mutate(Percentage = TotalCount / sum(TotalCount) * 100)
+
+# Get the modal (most common) read length for each direction
+modal_lengths <- length_summary %>%
+  group_by(Direction) %>%
+  filter(TotalCount == max(TotalCount)) %>%
+  select(Direction, ReadLength, TotalCount, Percentage)
+
+# Display the modal read lengths
+cat("\nMost common read lengths:\n")
+print(as.data.frame(modal_lengths))
+
+# Plot read length distributions
+ggplot(length_summary, aes(x = ReadLength, y = Percentage, fill = Direction)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.7) +
+  labs(title = "Read Length Distribution",
+       x = "Read Length (bp)",
+       y = "Percentage of Reads") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Forward" = "blue", "Reverse" = "red")) +
+  geom_vline(data = modal_lengths, aes(xintercept = ReadLength, color = Direction),
+             linetype = "dashed") +
+  scale_color_manual(values = c("Forward" = "darkblue", "Reverse" = "darkred")) +
+  theme(legend.position = "top")
+
+# Create read length report
+cat("\nRead length analysis results:\n")
+cat("Forward reads:", paste0(modal_lengths$ReadLength[modal_lengths$Direction == "Forward"], " bp"), 
+    "(", round(modal_lengths$Percentage[modal_lengths$Direction == "Forward"], 1), "% of reads)\n")
+cat("Reverse reads:", paste0(modal_lengths$ReadLength[modal_lengths$Direction == "Reverse"], " bp"), 
+    "(", round(modal_lengths$Percentage[modal_lengths$Direction == "Reverse"], 1), "% of reads)\n")
+
+# Calculate expected overlap based on read lengths and amplicon size
+if(exists("expected_amplicon_size") && !is.null(expected_amplicon_size)) {
+  forward_modal <- modal_lengths$ReadLength[modal_lengths$Direction == "Forward"]
+  reverse_modal <- modal_lengths$ReadLength[modal_lengths$Direction == "Reverse"]
+  
+  expected_overlap <- forward_modal + reverse_modal - expected_amplicon_size
+  
+  cat("\nExpected read overlap calculation:\n")
+  cat("Forward read length:", forward_modal, "bp\n")
+  cat("Reverse read length:", reverse_modal, "bp\n")
+  cat("Expected amplicon size:", expected_amplicon_size, "bp\n")
+  cat("Expected overlap:", expected_overlap, "bp\n")
+  
+  if(expected_overlap < 20) {
+    cat("WARNING: Expected overlap is less than 20 bp, which may cause merging problems.\n")
+    cat("Consider adjusting truncation parameters to ensure sufficient overlap.\n")
+  } else {
+    cat("The expected overlap is", expected_overlap, "bp, which should be sufficient for reliable read merging.\n")
+  }
+}
+
+# Save read length information for later use
+read_length_info <- list(
+  forward = list(
+    modal = modal_lengths$ReadLength[modal_lengths$Direction == "Forward"],
+    distribution = forward_lengths
+  ),
+  reverse = list(
+    modal = modal_lengths$ReadLength[modal_lengths$Direction == "Reverse"],
+    distribution = reverse_lengths
+  ),
+  expected_overlap = if(exists("expected_overlap")) expected_overlap else NULL,
+  expected_amplicon_size = if(exists("expected_amplicon_size")) expected_amplicon_size else NULL
+)
+```
+
+# Automatic Parameter Optimization
+
 # Automatic Parameter Optimization
 
 ```{r parameter-optimization}
