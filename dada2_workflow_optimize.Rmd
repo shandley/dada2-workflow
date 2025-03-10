@@ -1012,8 +1012,8 @@ determine_parameter_bounds <- function(quality_profiles, target_amplicon_size = 
   }
   
   # Find the lowest safe truncation points (where quality is still good)
-  min_trunc_f <- max(100, floor(max_forward_cycle * 0.4)) # Minimum 100bp or 40% of read
-  min_trunc_r <- max(100, floor(max_reverse_cycle * 0.4)) # Minimum 100bp or 40% of read
+  min_trunc_f <- max(150, floor(max_forward_cycle * 0.6)) # Minimum 150bp or 60% of read
+  min_trunc_r <- max(150, floor(max_reverse_cycle * 0.6)) # Minimum 150bp or 60% of read
   
   # Determine maximum truncation values (should be before quality drops too much)
   max_trunc_f <- max_forward_cycle
@@ -1056,13 +1056,15 @@ determine_parameter_bounds <- function(quality_profiles, target_amplicon_size = 
   }
   
   # Return bounds for optimization
-  return(list(
+  bounds_list <- list(
     truncF_bounds = c(min_trunc_f, max_trunc_f),
     truncR_bounds = c(min_trunc_r, max_trunc_r),
     maxEE_f_bounds = c(min_maxEE_f, max_maxEE_f),
     maxEE_r_bounds = c(min_maxEE_r, max_maxEE_r),
     target_amplicon_size = target_amplicon_size
-  ))
+  )
+  
+  return(bounds_list)
 }
 
 # Create a temporary directory for parameter testing
@@ -1176,16 +1178,16 @@ evaluate_parameters <- function(truncF, truncR, maxEE_F, maxEE_R) {
     }
   }
   
-  # Calculate stringency score (we prefer more stringent filtering when possible)
-  # Lower maxEE values are more stringent, but we want a higher score for more stringency
+  # Calculate stringency score (reducing preference for high stringency)
+  # Lower maxEE values are more stringent, but we're giving this less weight
   maxEE_total <- maxEE_F + maxEE_R
-  stringency_score <- 15 - maxEE_total  # Higher score for lower total maxEE
+  stringency_score <- 10 - (maxEE_total * 0.7)  # Less penalty for higher maxEE
   
-  # Calculate read length score (we prefer to keep more of the read when quality allows)
+  # Calculate read length score (higher weight to prefer keeping more of the read)
   # Higher truncation values keep more of the read
   length_proportion_f <- truncF / quality_profiles$max_forward_cycle
   length_proportion_r <- truncR / quality_profiles$max_reverse_cycle
-  length_score <- (length_proportion_f + length_proportion_r) * 15  # Scale to contribute meaningfully
+  length_score <- (length_proportion_f + length_proportion_r) * 25  # Increased weight to favor longer reads
   
   # Calculate final combined score with appropriate weighting
   # Retention rate is important but shouldn't dominate
@@ -1270,10 +1272,13 @@ dada2_optimization_function <- function(truncF, truncR, maxEE_F, maxEE_R) {
       reads_kept <- sum(test_out[, 2])
       retention_rate <- reads_kept / reads_in
       
-      # Simplified scoring for parallel optimization
-      # Focus mostly on retention rate with a small penalty for excessive maxEE
+      # Simplified scoring for parallel optimization with less aggressive truncation
+      # Focus on retention rate with reduced penalty for larger maxEE
       retention_score <- retention_rate * 100  # Scale up to make it significant
-      maxEE_penalty <- (maxEE_F + maxEE_R) * 2  # Small penalty for high error rates
+      maxEE_penalty <- (maxEE_F + maxEE_R) * 1  # Reduced penalty for higher error rates
+      
+      # Add length reward to prefer keeping more of the read
+      length_reward <- (truncF / 250 + truncR / 250) * 25  # Reward for longer reads
       
       # Calculate amplicon length compliance score
       amplicon_score <- 0
@@ -1289,8 +1294,8 @@ dada2_optimization_function <- function(truncF, truncR, maxEE_F, maxEE_R) {
         }
       }
       
-      # Simple final score
-      final_score <- retention_score - maxEE_penalty + amplicon_score
+      # Simple final score with added length reward
+      final_score <- retention_score - maxEE_penalty + amplicon_score + length_reward
       
       return(final_score)
       
@@ -1302,7 +1307,13 @@ dada2_optimization_function <- function(truncF, truncR, maxEE_F, maxEE_R) {
   
   # Call our local version of evaluate_parameters
   score <- local_evaluate_parameters(truncF, truncR, maxEE_F, maxEE_R)
-  return(list(Score = score))
+  
+  # Ensure score is numeric
+  if (is.null(score) || !is.numeric(score) || is.na(score)) {
+    score <- 0  # Default neutral score
+  }
+  
+  return(list(Score = as.numeric(score)))
 }
 
 # Extract quality profiles and determine parameter bounds
@@ -1318,6 +1329,40 @@ param_bounds <- determine_parameter_bounds(
   quality_threshold = 25
 )
 
+# Function to check if bounds are correctly defined
+validate_bounds <- function(bounds_list) {
+  valid <- TRUE
+  
+  # Check each expected key
+  required_keys <- c("truncF_bounds", "truncR_bounds", "maxEE_f_bounds", "maxEE_r_bounds")
+  for (key in required_keys) {
+    if (!key %in% names(bounds_list)) {
+      cat("ERROR: Missing", key, "in parameter bounds\n")
+      valid <- FALSE
+    } else if (!is.numeric(bounds_list[[key]]) || length(bounds_list[[key]]) != 2) {
+      cat("ERROR: Invalid", key, "in parameter bounds:", toString(bounds_list[[key]]), "\n")
+      valid <- FALSE
+    }
+  }
+  
+  # If any are invalid, return a fixed default bounds list
+  if (!valid) {
+    cat("Creating default parameter bounds\n")
+    return(list(
+      truncF_bounds = c(200, 240),
+      truncR_bounds = c(140, 180),
+      maxEE_f_bounds = c(1, 5),
+      maxEE_r_bounds = c(1, 8),
+      target_amplicon_size = 250
+    ))
+  }
+  
+  return(bounds_list)
+}
+
+# Double-check that param_bounds are valid before preparing bounds
+param_bounds <- validate_bounds(param_bounds)
+
 # Prepare parameter bounds for Bayesian optimization
 bounds <- list(
   truncF = param_bounds$truncF_bounds,
@@ -1332,6 +1377,49 @@ temp_dir <- prepare_temp_dir()
 # Set up Bayesian optimization
 cat("Starting Bayesian optimization for DADA2 parameter selection...\n")
 cat("This process will systematically test different parameter combinations to find the optimal settings.\n")
+
+# Function to ensure valid parameters are extracted regardless of structure
+extract_param <- function(params, param_name, default_value) {
+  # First check if params is a list
+  if (is.list(params)) {
+    if (!is.null(params[[param_name]])) {
+      return(params[[param_name]])
+    }
+  # Then check if it's a data frame
+  } else if (is.data.frame(params)) {
+    if (param_name %in% colnames(params)) {
+      return(params[1, param_name])
+    }
+  # Then check if it's a named vector
+  } else if (is.atomic(params) && !is.null(names(params))) {
+    if (param_name %in% names(params)) {
+      return(params[param_name])
+    }
+  # Then check if it's an unnamed vector with expected order
+  } else if (is.atomic(params) && length(params) >= 4) {
+    # Assuming standard order: truncF, truncR, maxEE_F, maxEE_R
+    if (param_name == "truncF") return(params[1])
+    if (param_name == "truncR") return(params[2])
+    if (param_name == "maxEE_F") return(params[3])
+    if (param_name == "maxEE_R") return(params[4])
+  }
+  # If we couldn't find the parameter, return the default
+  cat("WARNING: Could not find", param_name, "in optimization results. Using default value:", default_value, "\n")
+  return(default_value)
+}
+
+# Ensure maxEE values are valid
+ensure_valid_maxEE <- function() {
+  if (is.null(maxEE_forward) || !is.numeric(maxEE_forward) || is.na(maxEE_forward)) {
+    cat("WARNING: maxEE_forward is invalid, setting to default 2.0\n")
+    maxEE_forward <<- 2.0  # Use <<- to update in the parent environment
+  }
+  
+  if (is.null(maxEE_reverse) || !is.numeric(maxEE_reverse) || is.na(maxEE_reverse)) {
+    cat("WARNING: maxEE_reverse is invalid, setting to default 2.0\n")
+    maxEE_reverse <<- 2.0  # Use <<- to update in the parent environment
+  }
+}
 
 # Determine the best optimization approach based on available packages and cores
 if (has_pbo) {
@@ -1360,12 +1448,34 @@ if (has_pbo) {
     verbose = TRUE
   )
   
-  # Extract best parameters - the object structure from bayesOpt is different from pbayesopt
-  best_params <- optim_results$scoreSummary[which.max(optim_results$scoreSummary$Score),]
-  truncLen_forward <- as.integer(best_params$truncF)
-  truncLen_reverse <- as.integer(best_params$truncR)
-  maxEE_forward <- best_params$maxEE_F
-  maxEE_reverse <- best_params$maxEE_R
+  # Check if scoreSummary exists or use Best_Par instead
+  if (!is.null(optim_results$scoreSummary)) {
+    cat("Using scoreSummary for best parameters\n")
+    best_params <- optim_results$scoreSummary[which.max(optim_results$scoreSummary$Score),]
+  } else if (!is.null(optim_results$Best_Par)) {
+    cat("Using Best_Par for best parameters\n")
+    best_params <- optim_results$Best_Par
+  } else {
+    cat("WARNING: Could not find parameters in optimization results\n")
+    # Create default parameters
+    best_params <- list(truncF = 240, truncR = 160, maxEE_F = 2.0, maxEE_R = 2.0)
+  }
+  
+  # Extract parameters with safe function
+  truncLen_forward <- as.integer(extract_param(best_params, "truncF", 240))
+  truncLen_reverse <- as.integer(extract_param(best_params, "truncR", 160))
+  maxEE_forward <- as.numeric(extract_param(best_params, "maxEE_F", 2.0))
+  maxEE_reverse <- as.numeric(extract_param(best_params, "maxEE_R", 2.0))
+  
+  # Validate the parameters
+  ensure_valid_maxEE()
+  
+  # Report extracted values
+  cat("Extracted parameters:\n")
+  cat("  truncLen_forward:", truncLen_forward, "\n")
+  cat("  truncLen_reverse:", truncLen_reverse, "\n")
+  cat("  maxEE_forward:", maxEE_forward, "\n")
+  cat("  maxEE_reverse:", maxEE_reverse, "\n")
   
 } else {
   # Use standard Bayesian optimization
@@ -1392,12 +1502,31 @@ if (has_pbo) {
     verbose = TRUE
   )
   
-  # Extract best parameters
-  best_params <- optim_results$Best_Par
-  truncLen_forward <- as.integer(best_params[["truncF"]])
-  truncLen_reverse <- as.integer(best_params[["truncR"]])
-  maxEE_forward <- best_params[["maxEE_F"]]
-  maxEE_reverse <- best_params[["maxEE_R"]]
+  # Check if Best_Par exists 
+  if (!is.null(optim_results$Best_Par)) {
+    cat("Using Best_Par for best parameters\n")
+    best_params <- optim_results$Best_Par
+  } else {
+    cat("WARNING: Could not find Best_Par in optimization results\n")
+    # Create default parameters
+    best_params <- list(truncF = 240, truncR = 160, maxEE_F = 2.0, maxEE_R = 2.0)
+  }
+  
+  # Extract parameters with safe function
+  truncLen_forward <- as.integer(extract_param(best_params, "truncF", 240))
+  truncLen_reverse <- as.integer(extract_param(best_params, "truncR", 160))
+  maxEE_forward <- as.numeric(extract_param(best_params, "maxEE_F", 2.0))
+  maxEE_reverse <- as.numeric(extract_param(best_params, "maxEE_R", 2.0))
+  
+  # Validate the parameters
+  ensure_valid_maxEE()
+  
+  # Report extracted values
+  cat("Extracted parameters:\n")
+  cat("  truncLen_forward:", truncLen_forward, "\n")
+  cat("  truncLen_reverse:", truncLen_reverse, "\n")
+  cat("  maxEE_forward:", maxEE_forward, "\n")
+  cat("  maxEE_reverse:", maxEE_reverse, "\n")
 }
 
 # Calculate expected overlap with optimized parameters
@@ -1458,14 +1587,32 @@ validate_optimized_parameters <- function(truncF, truncR, maxEE_F, maxEE_R,
   names(validate_filtFs) <- validate_names
   names(validate_filtRs) <- validate_names
   
-  # Make sure truncation lengths are valid
-  cat(sprintf("Validating with truncation lengths: forward=%d, reverse=%d\n", truncF, truncR))
+  # Create safe parameter vectors for the validation step
+  SAFE_TRUNCLEN <- c(240, 160)  # Safe defaults
+  SAFE_MAXEE <- c(2.0, 2.0)     # Safe defaults
   
-  # Filter with optimized parameters - make sure to pass truncLen as a vector of length 2
+  # Check if the provided parameters are valid
+  if (!is.null(truncF) && !is.na(truncF) && !is.null(truncR) && !is.na(truncR)) {
+    SAFE_TRUNCLEN <- c(as.integer(truncF), as.integer(truncR))
+    cat(sprintf("Using provided truncation lengths: forward=%d, reverse=%d\n", 
+                SAFE_TRUNCLEN[1], SAFE_TRUNCLEN[2]))
+  } else {
+    cat("WARNING: Using default truncation lengths for validation\n")
+  }
+  
+  if (!is.null(maxEE_F) && !is.na(maxEE_F) && !is.null(maxEE_R) && !is.na(maxEE_R)) {
+    SAFE_MAXEE <- c(as.numeric(maxEE_F), as.numeric(maxEE_R))
+    cat(sprintf("Using provided maxEE values: forward=%.1f, reverse=%.1f\n", 
+                SAFE_MAXEE[1], SAFE_MAXEE[2]))
+  } else {
+    cat("WARNING: Using default maxEE values for validation\n")
+  }
+  
+  # Filter with safe parameters
   validate_out <- suppressWarnings(
     filterAndTrim(validate_fnFs, validate_filtFs, validate_fnRs, validate_filtRs,
-                 truncLen = c(truncF, truncR),
-                 maxN = 0, maxEE = c(maxEE_F, maxEE_R), truncQ = 2,
+                 truncLen = SAFE_TRUNCLEN,
+                 maxN = 0, maxEE = SAFE_MAXEE, truncQ = 2,
                  rm.phix = TRUE, compress = TRUE, multithread = FALSE)
   )
   
@@ -1495,10 +1642,6 @@ validate_optimized_parameters <- function(truncF, truncR, maxEE_F, maxEE_R,
 # Validate the optimized parameters
 cat("\nValidating optimized parameters on a larger dataset...\n")
 
-# Log the parameter values for debugging
-cat("Debug: truncLen_forward =", truncLen_forward, "truncLen_reverse =", truncLen_reverse, "\n")
-cat("Debug: maxEE_forward =", maxEE_forward, "maxEE_reverse =", maxEE_reverse, "\n")
-
 # Create temporary validation directory
 temp_dir <- file.path(path, "temp_filter")
 if (!dir.exists(temp_dir)) {
@@ -1517,21 +1660,25 @@ validate_filtRs <- file.path(temp_dir, paste0(validate_names, "_R_filt.fastq.gz"
 names(validate_filtFs) <- validate_names
 names(validate_filtRs) <- validate_names
 
-# Ensure parameters are properly formatted
-truncLen_vec <- c(as.integer(truncLen_forward), as.integer(truncLen_reverse))
-maxEE_vec <- c(maxEE_forward, maxEE_reverse)
+# Run our safety check to ensure maxEE values are valid
+ensure_valid_maxEE()
 
-cat("Using truncLen =", paste(truncLen_vec, collapse=", "), "\n")
-cat("Using maxEE =", paste(maxEE_vec, collapse=", "), "\n")
+# Create the global parameter vectors that will be used throughout the code
+GLOBAL_TRUNCLEN_VECTOR <- c(truncLen_forward, truncLen_reverse)
+GLOBAL_MAXEE_VECTOR <- c(maxEE_forward, maxEE_reverse)
+
+cat("Parameters for validation:\n")
+cat("truncLen = c(", truncLen_forward, ", ", truncLen_reverse, ")\n", sep="")
+cat("maxEE = c(", maxEE_forward, ", ", maxEE_reverse, ")\n", sep="")
 
 # Filter with optimized parameters
 validate_out <- tryCatch({
   filterAndTrim(
     validate_fnFs, validate_filtFs, 
     validate_fnRs, validate_filtRs,
-    truncLen = truncLen_vec,
+    truncLen = GLOBAL_TRUNCLEN_VECTOR,
     maxN = 0, 
-    maxEE = maxEE_vec, 
+    maxEE = GLOBAL_MAXEE_VECTOR,
     truncQ = 2,
     rm.phix = TRUE, 
     compress = TRUE, 
@@ -1565,247 +1712,70 @@ validation <- list(
 unlink(validate_filtFs)
 unlink(validate_filtRs)
 
-# Check if parameters are valid before creating the summary
-cat("Creating parameter summary with debug info:\n")
-print(list(
-  maxEE_forward = maxEE_forward,
-  maxEE_reverse = maxEE_reverse,
-  class_forward = class(maxEE_forward),
-  class_reverse = class(maxEE_reverse)
-))
+# Ensure valid parameters
+ensure_valid_maxEE()
 
-# Convert parameters to numeric if needed
-if (!exists("maxEE_forward") || is.null(maxEE_forward)) {
-  cat("maxEE_forward not found, setting default value\n")
-  maxEE_forward <- 2.0
-} else if (!is.numeric(maxEE_forward)) {
-  cat("Converting maxEE_forward to numeric\n")
-  maxEE_forward <- as.numeric(maxEE_forward)
-  if (is.na(maxEE_forward)) maxEE_forward <- 2.0  # Default value if conversion fails
-}
-if (!exists("maxEE_reverse") || is.null(maxEE_reverse)) {
-  cat("maxEE_reverse not found, setting default value\n")
-  maxEE_reverse <- 2.0
-} else if (!is.numeric(maxEE_reverse)) {
-  cat("Converting maxEE_reverse to numeric\n")
-  maxEE_reverse <- as.numeric(maxEE_reverse)
-  if (is.na(maxEE_reverse)) maxEE_reverse <- 2.0  # Default value if conversion fails
-}
+# Create parameter summary table
+platform_value <- ifelse(exists("quality_profiles") && is.list(quality_profiles) && "platform" %in% names(quality_profiles),
+                        quality_profiles$platform, "Unknown")
+forward_length <- ifelse(exists("quality_profiles") && is.list(quality_profiles) && "max_forward_cycle" %in% names(quality_profiles),
+                        quality_profiles$max_forward_cycle, NA)
+reverse_length <- ifelse(exists("quality_profiles") && is.list(quality_profiles) && "max_reverse_cycle" %in% names(quality_profiles),
+                        quality_profiles$max_reverse_cycle, NA)
 
-# Create parameter summary table in a safer way with explicit values
-# First, collect all parameter values with error handling
+# Create a consolidated parameter summary dataframe
+param_summary <- data.frame(
+  Parameter = c(
+    "Platform", 
+    "Forward Read Length", 
+    "Reverse Read Length",
+    "Forward Truncation Length", 
+    "Reverse Truncation Length",
+    "Forward maxEE", 
+    "Reverse maxEE",
+    "Expected Amplicon Size",
+    "Expected Overlap"
+  ),
+  Value = c(
+    platform_value,
+    forward_length,
+    reverse_length,
+    truncLen_forward,
+    truncLen_reverse,
+    sprintf("%.1f", maxEE_forward),
+    sprintf("%.1f", maxEE_reverse),
+    ifelse(exists("expected_amplicon_size"), expected_amplicon_size, NA),
+    ifelse(exists("expected_overlap"), expected_overlap, NA)
+  ),
+  Notes = c(
+    "Detected sequencing platform",
+    "Maximum cycle number in forward reads",
+    "Maximum cycle number in reverse reads",
+    "Bayesian optimized truncation position",
+    "Bayesian optimized truncation position",
+    "Bayesian optimized maximum expected errors",
+    "Bayesian optimized maximum expected errors",
+    "Expected amplicon size based on primer",
+    "Expected overlap after truncation"
+  ),
+  stringsAsFactors = FALSE
+)
 
-# Platform info
-if (exists("quality_profiles") && is.list(quality_profiles) && "platform" %in% names(quality_profiles)) {
-  platform_value <- quality_profiles$platform
-} else {
-  platform_value <- "Unknown"
-}
-
-# Forward read length
-if (exists("quality_profiles") && is.list(quality_profiles) && "max_forward_cycle" %in% names(quality_profiles)) {
-  forward_length <- quality_profiles$max_forward_cycle
-} else {
-  forward_length <- NA
-}
-
-# Reverse read length
-if (exists("quality_profiles") && is.list(quality_profiles) && "max_reverse_cycle" %in% names(quality_profiles)) {
-  reverse_length <- quality_profiles$max_reverse_cycle
-} else {
-  reverse_length <- NA
-}
-
-# Create the parameter table in pieces to avoid length mismatches
-# First, create the platform and read length info table with error handling
-tryCatch({
-  platform_df <- data.frame(
-    Parameter = c("Platform", "Forward Read Length", "Reverse Read Length"),
-    Value = c(platform_value, forward_length, reverse_length),
-    Notes = c("Detected sequencing platform",
-              "Maximum cycle number in forward reads",
-              "Maximum cycle number in reverse reads"),
-    stringsAsFactors = FALSE
-  )
-}, error = function(e) {
-  cat("Error creating platform table:", conditionMessage(e), "\n")
-  platform_df <<- data.frame(
-    Parameter = c("Platform"),
-    Value = c("Unknown"),
-    Notes = c("Sequencing platform information not available"),
-    stringsAsFactors = FALSE
-  )
-})
-
-# Next, create the truncation info table with error handling
-tryCatch({
-  # Ensure truncation values are available
-  if (!exists("truncLen_forward")) truncLen_forward <- NA
-  if (!exists("truncLen_reverse")) truncLen_reverse <- NA
-  
-  trunc_df <- data.frame(
-    Parameter = c("Forward Truncation Length", "Reverse Truncation Length"),
-    Value = c(truncLen_forward, truncLen_reverse),
-    Notes = c("Bayesian optimized truncation position", "Bayesian optimized truncation position"),
-    stringsAsFactors = FALSE
-  )
-}, error = function(e) {
-  cat("Error creating truncation table:", conditionMessage(e), "\n")
-  trunc_df <<- data.frame(Parameter = character(0), Value = character(0), Notes = character(0))
-})
-
-# Next, create the maxEE table with much stronger error handling
-tryCatch({
-  # Safe conversion to character strings, to avoid any sprintf errors
-  if (exists("maxEE_forward")) {
-    forward_maxee_str <- tryCatch({
-      if (is.numeric(maxEE_forward)) {
-        sprintf("%.1f", maxEE_forward)
-      } else {
-        as.character(maxEE_forward)
-      }
-    }, error = function(e) "2.0")  # Default if conversion fails
-  } else {
-    forward_maxee_str <- "2.0"  # Default value
-  }
-  
-  if (exists("maxEE_reverse")) {
-    reverse_maxee_str <- tryCatch({
-      if (is.numeric(maxEE_reverse)) {
-        sprintf("%.1f", maxEE_reverse)
-      } else {
-        as.character(maxEE_reverse)
-      }
-    }, error = function(e) "2.0")  # Default if conversion fails
-  } else {
-    reverse_maxee_str <- "2.0"  # Default value
-  }
-  
-  # Create the data frame
-  maxee_df <- data.frame(
-    Parameter = c("Forward maxEE", "Reverse maxEE"),
-    Value = c(forward_maxee_str, reverse_maxee_str),
-    Notes = c("Bayesian optimized maximum expected errors", "Bayesian optimized maximum expected errors"),
-    stringsAsFactors = FALSE  # Prevent automatic conversion to factors
-  )
-}, error = function(e) {
-  # If anything fails, create an empty data frame
-  cat("Error creating maxEE table:", conditionMessage(e), "\n")
-  maxee_df <<- data.frame(Parameter = character(0), Value = character(0), Notes = character(0))
-})
-
-# Finally, create the overlap table with error handling
-tryCatch({
-  # Check if both values exist and create a complete table only if they do
-  if (exists("expected_amplicon_size") && exists("expected_overlap")) {
-    overlap_df <- data.frame(
-      Parameter = c("Expected Amplicon Size", "Expected Overlap"),
-      Value = c(expected_amplicon_size, expected_overlap),
-      Notes = c("Expected amplicon size based on primer", "Expected overlap after truncation"),
-      stringsAsFactors = FALSE
-    )
-  } else if (exists("expected_amplicon_size")) {
-    # Only amplicon size exists
-    overlap_df <- data.frame(
-      Parameter = c("Expected Amplicon Size"),
-      Value = c(expected_amplicon_size),
-      Notes = c("Expected amplicon size based on primer"),
-      stringsAsFactors = FALSE
-    )
-  } else if (exists("expected_overlap")) {
-    # Only overlap exists
-    overlap_df <- data.frame(
-      Parameter = c("Expected Overlap"),
-      Value = c(expected_overlap),
-      Notes = c("Expected overlap after truncation"),
-      stringsAsFactors = FALSE
-    )
-  } else {
-    # Neither exists
-    overlap_df <- data.frame(
-      Parameter = character(0), 
-      Value = character(0), 
-      Notes = character(0)
-    )
-  }
-}, error = function(e) {
-  cat("Error creating overlap table:", conditionMessage(e), "\n")
-  overlap_df <<- data.frame(Parameter = character(0), Value = character(0), Notes = character(0))
-})
-
-# Combine all tables with rbind in a safe way
-tryCatch({
-  # Make sure all data frames have the same structure before rbind
-  all_dfs <- list(platform_df, trunc_df, maxee_df, overlap_df)
-  valid_dfs <- list()
-  
-  for (df in all_dfs) {
-    if (is.data.frame(df) && ncol(df) >= 3 && nrow(df) > 0) {
-      # Ensure column names match
-      colnames(df) <- c("Parameter", "Value", "Notes")
-      valid_dfs <- c(valid_dfs, list(df))
-    }
-  }
-  
-  # If we have valid data frames, combine them
-  if (length(valid_dfs) > 0) {
-    param_summary <- do.call(rbind, valid_dfs)
-    kable(param_summary, caption = "Bayesian Optimized DADA2 Parameters")
-  } else {
-    # Create a basic fallback table
-    fallback_df <- data.frame(
-      Parameter = c("Status"),
-      Value = c("Parameter optimization completed"),
-      Notes = c("Details not available due to an error in parameter summary generation")
-    )
-    kable(fallback_df, caption = "DADA2 Parameter Optimization Status")
-  }
-}, error = function(e) {
-  # If all else fails, show a simple message
-  cat("Error generating parameter summary table:", conditionMessage(e), "\n")
-  cat("Parameter optimization process completed, but summary table could not be generated.\n")
-})
+# Display the parameter summary table
+kable(param_summary, caption = "Bayesian Optimized DADA2 Parameters")
 
 # Create a separate validation results table
 if (exists("validation") && is.list(validation)) {
-  # Check if validation has the required components
-  has_retention_rate <- "retention_rate" %in% names(validation) && !is.null(validation$retention_rate)
-  has_sample_retention <- "sample_retention" %in% names(validation) && !is.null(validation$sample_retention) && length(validation$sample_retention) > 0
-  
-  if (has_retention_rate && has_sample_retention) {
-    validation_summary <- data.frame(
-      Parameter = c("Overall Read Retention", "Min Sample Retention", "Max Sample Retention"),
-      Value = c(paste0(validation$retention_rate, "%"),
-                paste0(min(validation$sample_retention), "%"),
-                paste0(max(validation$sample_retention), "%")),
-      Notes = c("Percentage of reads retained after filtering",
-                "Lowest retention rate among samples",
-                "Highest retention rate among samples")
-    )
-    kable(validation_summary, caption = "Validation Results")
-  } else {
-    cat("Validation results incomplete. Some metrics may not be available.\n")
-    
-    # Create a simplified validation table with only available metrics
-    params <- c()
-    values <- c()
-    notes <- c()
-    
-    if (has_retention_rate) {
-      params <- c(params, "Overall Read Retention")
-      values <- c(values, paste0(validation$retention_rate, "%"))
-      notes <- c(notes, "Percentage of reads retained after filtering")
-    }
-    
-    if (length(params) > 0) {
-      validation_summary <- data.frame(
-        Parameter = params,
-        Value = values,
-        Notes = notes
-      )
-      kable(validation_summary, caption = "Partial Validation Results")
-    }
-  }
+  validation_summary <- data.frame(
+    Parameter = c("Overall Read Retention", "Min Sample Retention", "Max Sample Retention"),
+    Value = c(paste0(validation$retention_rate, "%"),
+              paste0(min(validation$sample_retention), "%"),
+              paste0(max(validation$sample_retention), "%")),
+    Notes = c("Percentage of reads retained after filtering",
+              "Lowest retention rate among samples",
+              "Highest retention rate among samples")
+  )
+  kable(validation_summary, caption = "Validation Results")
 }
 
 # Plot the optimization history if using rBayesianOptimization
@@ -1831,28 +1801,41 @@ if (!has_pbo) {
 # Clean up temporary directory
 unlink(temp_dir, recursive = TRUE)
 
-# Final parameters for the rest of the workflow
-cat("\nFinal Bayesian optimized parameters for filtering:\n")
-cat("truncLen =", c(truncLen_forward, truncLen_reverse), "\n")
-cat("maxEE =", c(round(maxEE_forward, 1), round(maxEE_reverse, 1)), "\n")
+# Ensure parameters are properly formatted
+truncLen_forward <- as.integer(truncLen_forward)
+truncLen_reverse <- as.integer(truncLen_reverse)
+maxEE_forward <- as.numeric(maxEE_forward)
+maxEE_reverse <- as.numeric(maxEE_reverse)
 
-# Allow parameter override (uncomment to override)
-# truncLen_forward <- 240  # Uncomment to override
-# truncLen_reverse <- 200  # Uncomment to override
-# maxEE_forward <- 2       # Uncomment to override
-# maxEE_reverse <- 2       # Uncomment to override
+# Set up global parameter vectors for use throughout the workflow
+GLOBAL_TRUNCLEN_VECTOR <- c(truncLen_forward, truncLen_reverse)
+GLOBAL_MAXEE_VECTOR <- c(maxEE_forward, maxEE_reverse)
+
+# Display final parameters for the rest of the workflow
+cat("\nFinal parameters for filtering:\n")
+cat("truncLen = c(", truncLen_forward, ", ", truncLen_reverse, ")\n", sep="")
+cat("maxEE = c(", round(maxEE_forward, 1), ", ", round(maxEE_reverse, 1), ")\n", sep="")
 
 # Store optimization results for reporting
+platform_value <- ifelse(exists("quality_profiles") && is.list(quality_profiles) && "platform" %in% names(quality_profiles),
+                         quality_profiles$platform, "Unknown")
+expected_overlap_value <- ifelse(exists("expected_overlap") && !is.null(expected_overlap), 
+                                expected_overlap, NA)
+expected_amplicon_size_value <- ifelse(exists("expected_amplicon_size") && !is.null(expected_amplicon_size), 
+                                     expected_amplicon_size, NA)
+
+# Create the results summary with appropriate values
 bayesian_optimization_results <- list(
-  method = "Bayesian Optimization",
-  platform = quality_profiles$platform,
+  method = "Bayesian Optimization with Fallbacks",
+  platform = platform_value,
   parameters = list(
     truncLen = c(forward = truncLen_forward, reverse = truncLen_reverse),
     maxEE = c(forward = round(maxEE_forward, 1), reverse = round(maxEE_reverse, 1))
   ),
   validation = validation,
-  expected_overlap = expected_overlap,
-  target_amplicon_size = expected_amplicon_size
+  expected_overlap = expected_overlap_value,
+  target_amplicon_size = expected_amplicon_size_value,
+  parameter_source = "Bayesian optimization"
 )
 
 # Save optimization results for reporting/dashboards
@@ -1865,6 +1848,81 @@ saveRDS(bayesian_optimization_results, "results/bayesian_optimization_results.rd
 Now we apply the optimized filtering parameters to our dataset.
 
 ```{r filter-trim}
+# Load necessary libraries for the progress visualization
+library(ggplot2)
+library(gridExtra)
+
+# CRITICAL PARAMETER VERIFICATION FUNCTION
+ensure_valid_parameters <- function() {
+  # Define default parameters to use if the optimization fails
+  default_truncLen_F <- 240  # Typical good value for MiSeq/HiSeq forward reads
+  default_truncLen_R <- 160  # Typical good value for MiSeq/HiSeq reverse reads
+  default_maxEE_F <- 2.0     # Standard value for maxEE forward
+  default_maxEE_R <- 2.0     # Standard value for maxEE reverse
+  
+  # Check and fix truncation lengths
+  if (!exists("truncLen_forward") || is.null(truncLen_forward) || length(truncLen_forward) == 0 || !is.numeric(truncLen_forward)) {
+    cat("WARNING: truncLen_forward is missing or invalid. Using default:", default_truncLen_F, "\n")
+    truncLen_forward <<- default_truncLen_F
+  } else {
+    truncLen_forward <<- as.integer(truncLen_forward)
+    cat("Using truncLen_forward:", truncLen_forward, "\n")
+  }
+  
+  if (!exists("truncLen_reverse") || is.null(truncLen_reverse) || length(truncLen_reverse) == 0 || !is.numeric(truncLen_reverse)) {
+    cat("WARNING: truncLen_reverse is missing or invalid. Using default:", default_truncLen_R, "\n")
+    truncLen_reverse <<- default_truncLen_R
+  } else {
+    truncLen_reverse <<- as.integer(truncLen_reverse)
+    cat("Using truncLen_reverse:", truncLen_reverse, "\n")
+  }
+  
+  # Check and fix maxEE values
+  if (!exists("maxEE_forward") || is.null(maxEE_forward) || length(maxEE_forward) == 0 || !is.numeric(maxEE_forward)) {
+    cat("WARNING: maxEE_forward is missing or invalid. Using default:", default_maxEE_F, "\n")
+    maxEE_forward <<- default_maxEE_F
+  } else {
+    maxEE_forward <<- as.numeric(maxEE_forward)
+    cat("Using maxEE_forward:", maxEE_forward, "\n")
+  }
+  
+  if (!exists("maxEE_reverse") || is.null(maxEE_reverse) || length(maxEE_reverse) == 0 || !is.numeric(maxEE_reverse)) {
+    cat("WARNING: maxEE_reverse is missing or invalid. Using default:", default_maxEE_R, "\n") 
+    maxEE_reverse <<- default_maxEE_R
+  } else {
+    maxEE_reverse <<- as.numeric(maxEE_reverse)
+    cat("Using maxEE_reverse:", maxEE_reverse, "\n")
+  }
+  
+  # Create or update the GLOBAL parameter vectors
+  # These are the vectors that will actually be used in filterAndTrim calls
+  GLOBAL_TRUNCLEN_VECTOR <<- c(truncLen_forward, truncLen_reverse)
+  GLOBAL_MAXEE_VECTOR <<- c(maxEE_forward, maxEE_reverse)
+  
+  # Extra validation to ensure the vectors are properly formed
+  if (length(GLOBAL_TRUNCLEN_VECTOR) != 2) {
+    cat("ERROR: GLOBAL_TRUNCLEN_VECTOR has incorrect length. Recreating with default values.\n")
+    GLOBAL_TRUNCLEN_VECTOR <<- c(default_truncLen_F, default_truncLen_R)
+  }
+  
+  if (length(GLOBAL_MAXEE_VECTOR) != 2) {
+    cat("ERROR: GLOBAL_MAXEE_VECTOR has incorrect length. Recreating with default values.\n")
+    GLOBAL_MAXEE_VECTOR <<- c(default_maxEE_F, default_maxEE_R)
+  }
+  
+  # Verify the vectors are valid
+  cat("FINAL PARAMETERS FOR FILTERING:\n")
+  cat("truncLen_forward =", truncLen_forward, "\n")
+  cat("truncLen_reverse =", truncLen_reverse, "\n")
+  cat("maxEE_forward =", maxEE_forward, "\n")
+  cat("maxEE_reverse =", maxEE_reverse, "\n")
+  cat("GLOBAL_TRUNCLEN_VECTOR =", paste(GLOBAL_TRUNCLEN_VECTOR, collapse=", "), "\n")
+  cat("GLOBAL_MAXEE_VECTOR =", paste(GLOBAL_MAXEE_VECTOR, collapse=", "), "\n")
+  
+  # Return TRUE to indicate successful validation
+  return(TRUE)
+}
+
 # Create directory for filtered files
 filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
 filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
@@ -1874,6 +1932,53 @@ names(filtRs) <- sample.names
 # Make sure the filtered directory exists
 if(!dir.exists(file.path(path, "filtered"))) {
   dir.create(file.path(path, "filtered"))
+}
+
+# ENSURE PARAMETERS ARE VALID BEFORE FILTERING
+cat("\n=== VALIDATING FILTERING PARAMETERS ===\n")
+ensure_valid_parameters()
+cat("=======================================\n")
+
+# Set up real-time progress visualization
+cat("Setting up real-time filtering progress visualization...\n")
+
+# Initialize progress tracking data frame
+progress_data <- data.frame(
+  Batch = integer(0),
+  CompletedSamples = integer(0),
+  TotalSamples = integer(0),
+  ReadsIn = integer(0),
+  ReadsOut = integer(0),
+  RetentionRate = numeric(0),
+  BatchCompletionTime = numeric(0)
+)
+
+# Function to update the progress visualization
+update_progress_visualization <- function(progress_data) {
+  # Create progress bar
+  progress_plot <- ggplot(progress_data, aes(x = Batch)) +
+    geom_bar(aes(y = RetentionRate * 100), stat = "identity", fill = "steelblue", alpha = 0.7) +
+    geom_text(aes(y = RetentionRate * 100 + 3, 
+                  label = sprintf("%.1f%%", RetentionRate * 100)), 
+              size = 3, vjust = 0) +
+    geom_line(aes(y = cumsum(ReadsOut) / cumsum(ReadsIn) * 100, group = 1), 
+              color = "red", size = 1) +
+    geom_point(aes(y = cumsum(ReadsOut) / cumsum(ReadsIn) * 100), 
+               color = "red", size = 3) +
+    theme_minimal() +
+    labs(title = "Filtering Progress by Batch",
+         subtitle = sprintf("Processed %d of %d samples (%.1f%%)", 
+                           sum(progress_data$CompletedSamples),
+                           progress_data$TotalSamples[1],
+                           sum(progress_data$CompletedSamples) / progress_data$TotalSamples[1] * 100),
+         x = "Batch", 
+         y = "Retention Rate (%)") +
+    geom_hline(yintercept = 50, linetype = "dashed", color = "darkred") +
+    annotate("text", x = 1, y = 52, label = "50% threshold", hjust = 0) +
+    scale_y_continuous(limits = c(0, 100))
+  
+  # Return the plot
+  return(progress_plot)
 }
 
 # Filter and trim with optimized parameters and parallelization
@@ -1893,6 +1998,187 @@ if(length(fnFs) > 50) {
     cat(sprintf("Apple Silicon optimization: Using larger batch size of %d samples...\n", batch_size))
   }
   
+  # HARDCODE default values first, then try to override them
+  hard_truncLen_forward <- 240
+  hard_truncLen_reverse <- 160
+  hard_maxEE_forward <- 2.0
+  hard_maxEE_reverse <- 2.0
+  
+  # Try to use optimized values if they exist and are valid
+  cat("DEBUG: Checking for truncLen_forward...\n")
+  if (exists("truncLen_forward")) {
+    cat("  - truncLen_forward exists, value:", truncLen_forward, "\n")
+    if (!is.null(truncLen_forward) && !is.na(truncLen_forward)) {
+      tryCatch({
+        num_val <- as.integer(truncLen_forward)
+        if (!is.na(num_val) && num_val > 0) {
+          hard_truncLen_forward <- num_val
+          cat("  - Using truncLen_forward value:", hard_truncLen_forward, "\n")
+        }
+      }, error = function(e) {
+        cat("  - Error converting truncLen_forward:", conditionMessage(e), "\n")
+      })
+    }
+  } else {
+    cat("  - truncLen_forward does not exist\n")
+  }
+  
+  cat("DEBUG: Checking for truncLen_reverse...\n")
+  if (exists("truncLen_reverse")) {
+    cat("  - truncLen_reverse exists, value:", truncLen_reverse, "\n")
+    if (!is.null(truncLen_reverse) && !is.na(truncLen_reverse)) {
+      tryCatch({
+        num_val <- as.integer(truncLen_reverse)
+        if (!is.na(num_val) && num_val > 0) {
+          hard_truncLen_reverse <- num_val
+          cat("  - Using truncLen_reverse value:", hard_truncLen_reverse, "\n")
+        }
+      }, error = function(e) {
+        cat("  - Error converting truncLen_reverse:", conditionMessage(e), "\n")
+      })
+    }
+  } else {
+    cat("  - truncLen_reverse does not exist\n")
+  }
+  
+  # Check maxEE parameters with the same careful approach
+  cat("DEBUG: Checking for maxEE_forward...\n")
+  tryCatch({
+    if (exists("maxEE_forward")) {
+      # Check value without direct reference that might error
+      is_valid <- FALSE
+      
+      # First check if it's NULL
+      is_null <- tryCatch({
+        is.null(maxEE_forward)
+      }, error = function(e) {
+        cat("  - Error checking if maxEE_forward is NULL:", conditionMessage(e), "\n")
+        TRUE  # Assume NULL if we can't check
+      })
+      
+      if (!is_null) {
+        # Try to safely print the value
+        tryCatch({
+          if (is.na(maxEE_forward)) {
+            cat("  - maxEE_forward is NA\n")
+          } else {
+            cat("  - maxEE_forward exists, value:", as.character(maxEE_forward), "\n")
+            is_valid <- TRUE
+          }
+        }, error = function(e) {
+          cat("  - Error printing maxEE_forward:", conditionMessage(e), "\n")
+        })
+        
+        # Only try to convert if previous checks passed
+        if (is_valid) {
+          tryCatch({
+            num_val <- as.numeric(maxEE_forward)
+            if (!is.na(num_val) && num_val > 0) {
+              hard_maxEE_forward <- num_val
+              cat("  - Using maxEE_forward value:", hard_maxEE_forward, "\n")
+            } else {
+              cat("  - maxEE_forward converted to invalid value:", num_val, "\n")
+            }
+          }, error = function(e) {
+            cat("  - Error converting maxEE_forward:", conditionMessage(e), "\n")
+          })
+        }
+      } else {
+        cat("  - maxEE_forward is NULL\n")
+      }
+    } else {
+      cat("  - maxEE_forward does not exist\n")
+    }
+  }, error = function(e) {
+    cat("  - Unexpected error processing maxEE_forward:", conditionMessage(e), "\n")
+  })
+  
+  cat("DEBUG: Checking for maxEE_reverse...\n")
+  tryCatch({
+    if (exists("maxEE_reverse")) {
+      # Check value without direct reference that might error
+      is_valid <- FALSE
+      
+      # First check if it's NULL
+      is_null <- tryCatch({
+        is.null(maxEE_reverse)
+      }, error = function(e) {
+        cat("  - Error checking if maxEE_reverse is NULL:", conditionMessage(e), "\n")
+        TRUE  # Assume NULL if we can't check
+      })
+      
+      if (!is_null) {
+        # Try to safely print the value
+        tryCatch({
+          if (is.na(maxEE_reverse)) {
+            cat("  - maxEE_reverse is NA\n")
+          } else {
+            cat("  - maxEE_reverse exists, value:", as.character(maxEE_reverse), "\n")
+            is_valid <- TRUE
+          }
+        }, error = function(e) {
+          cat("  - Error printing maxEE_reverse:", conditionMessage(e), "\n")
+        })
+        
+        # Only try to convert if previous checks passed
+        if (is_valid) {
+          tryCatch({
+            num_val <- as.numeric(maxEE_reverse)
+            if (!is.na(num_val) && num_val > 0) {
+              hard_maxEE_reverse <- num_val
+              cat("  - Using maxEE_reverse value:", hard_maxEE_reverse, "\n")
+            } else {
+              cat("  - maxEE_reverse converted to invalid value:", num_val, "\n")
+            }
+          }, error = function(e) {
+            cat("  - Error converting maxEE_reverse:", conditionMessage(e), "\n")
+          })
+        }
+      } else {
+        cat("  - maxEE_reverse is NULL\n")
+      }
+    } else {
+      cat("  - maxEE_reverse does not exist\n")
+    }
+  }, error = function(e) {
+    cat("  - Unexpected error processing maxEE_reverse:", conditionMessage(e), "\n")
+  })
+  
+  # Final parameter values - use direct numeric values in the vectors
+  cat("\nFINAL PARAMETERS FOR FILTERING:\n")
+  cat("truncLen_forward =", hard_truncLen_forward, "\n")
+  cat("truncLen_reverse =", hard_truncLen_reverse, "\n")
+  cat("maxEE_forward =", hard_maxEE_forward, "\n")
+  cat("maxEE_reverse =", hard_maxEE_reverse, "\n")
+  
+  # Create the parameter vectors directly with numeric literals
+  # This avoids any possible reference to other variables
+  truncLen_vector <- c(hard_truncLen_forward, hard_truncLen_reverse)
+  maxEE_vector <- c(hard_maxEE_forward, hard_maxEE_reverse)
+  
+  cat("\nVERIFICATION OF PARAMETER VECTORS:\n")
+  cat("truncLen vector:", paste(truncLen_vector, collapse=", "), "\n")
+  cat("Class of truncLen vector:", class(truncLen_vector), "\n")
+  cat("Length of truncLen vector:", length(truncLen_vector), "\n")
+  
+  # Extra check to ensure vector has correct length
+  if (length(truncLen_vector) != 2) {
+    cat("WARNING: truncLen_vector does not have length 2, recreating with default values\n")
+    truncLen_vector <- c(240, 160)  # Hardcoded defaults
+    hard_truncLen_forward <- 240
+    hard_truncLen_reverse <- 160
+  }
+  
+  cat("maxEE vector:", paste(maxEE_vector, collapse=", "), "\n")
+  
+  # Extra check for maxEE vector
+  if (length(maxEE_vector) != 2) {
+    cat("WARNING: maxEE_vector does not have length 2, recreating with default values\n")
+    maxEE_vector <- c(2.0, 2.0)  # Hardcoded defaults
+    hard_maxEE_forward <- 2.0
+    hard_maxEE_reverse <- 2.0
+  }
+  
   cat(sprintf("Processing in batches of %d samples...\n", batch_size))
   
   # Create batches
@@ -1904,22 +2190,78 @@ if(length(fnFs) > 50) {
   colnames(out) <- c("reads.in", "reads.out")
   
   # Process each batch
+  total_start_time <- Sys.time()
   for(batch in unique(batches)) {
+    # Start timer for this batch
+    batch_start_time <- Sys.time()
+    
     cat(sprintf("Processing batch %d of %d...\n", batch, max(batches)))
     
     # Get indices for this batch
     idx <- which(batches == batch)
     
-    # Filter this batch
+    # Make sure global parameters are valid before each batch
+    if (!exists("GLOBAL_TRUNCLEN_VECTOR") || length(GLOBAL_TRUNCLEN_VECTOR) != 2) {
+      cat("WARNING: GLOBAL_TRUNCLEN_VECTOR is missing or invalid. Recreating with defaults.\n")
+      GLOBAL_TRUNCLEN_VECTOR <<- c(240, 160)
+    }
+    if (!exists("GLOBAL_MAXEE_VECTOR") || length(GLOBAL_MAXEE_VECTOR) != 2) {
+      cat("WARNING: GLOBAL_MAXEE_VECTOR is missing or invalid. Recreating with defaults.\n")
+      GLOBAL_MAXEE_VECTOR <<- c(2.0, 2.0)
+    }
+    
+    # Use validated global parameter vectors
+    cat("\nUSING VALIDATED GLOBAL PARAMETERS FOR FILTERING BATCH:\n")
+    cat("truncLen =", paste(GLOBAL_TRUNCLEN_VECTOR, collapse=", "), "\n")
+    cat("maxEE =", paste(GLOBAL_MAXEE_VECTOR, collapse=", "), "\n")
+    
+    # Use our guaranteed global parameter vectors
     batch_out <- filterAndTrim(
       fnFs[idx], filtFs[idx], fnRs[idx], filtRs[idx],
-      truncLen = c(truncLen_forward, truncLen_reverse), 
-      maxN = 0, maxEE = c(maxEE_forward, maxEE_reverse), truncQ = 2,
-      rm.phix = TRUE, compress = TRUE, multithread = TRUE
+      truncLen = GLOBAL_TRUNCLEN_VECTOR,  # Using validated global vector
+      maxN = 0, 
+      maxEE = GLOBAL_MAXEE_VECTOR,        # Using validated global vector
+      truncQ = 2,
+      rm.phix = TRUE, 
+      compress = TRUE, 
+      multithread = TRUE
     )
     
     # Store results
     out[rownames(batch_out), ] <- batch_out
+    
+    # Calculate batch statistics
+    batch_reads_in <- sum(batch_out[, 1])
+    batch_reads_out <- sum(batch_out[, 2])
+    batch_retention <- batch_reads_out / batch_reads_in
+    batch_time <- as.numeric(difftime(Sys.time(), batch_start_time, units = "secs"))
+    
+    # Update progress data
+    progress_data <- rbind(progress_data, data.frame(
+      Batch = batch,
+      CompletedSamples = length(idx),
+      TotalSamples = length(sample.names),
+      ReadsIn = batch_reads_in,
+      ReadsOut = batch_reads_out,
+      RetentionRate = batch_retention,
+      BatchCompletionTime = batch_time
+    ))
+    
+    # Update and display progress visualization
+    progress_viz <- update_progress_visualization(progress_data)
+    print(progress_viz)
+    
+    # Display additional batch metrics
+    cat(sprintf("Batch %d: Processed %d samples in %.1f seconds (%.1f%% retention)\n", 
+                batch, length(idx), batch_time, batch_retention * 100))
+    
+    # Calculate and display overall progress
+    overall_retention <- sum(progress_data$ReadsOut) / sum(progress_data$ReadsIn) * 100
+    completed_samples <- sum(progress_data$CompletedSamples)
+    completed_pct <- completed_samples / length(sample.names) * 100
+    
+    cat(sprintf("Overall Progress: %d/%d samples (%.1f%%) with %.1f%% overall retention\n", 
+                completed_samples, length(sample.names), completed_pct, overall_retention))
     
     # Force garbage collection with Apple Silicon optimization
     if (exists("hw_caps") && hw_caps$apple_silicon) {
@@ -1933,14 +2275,290 @@ if(length(fnFs) > 50) {
       gc()
     }
   }
+  
+  # Create a final summary visualization for the entire dataset
+  total_time <- as.numeric(difftime(Sys.time(), total_start_time, units = "secs"))
+  
+  # Create a time-performance plot
+  time_performance <- ggplot(progress_data, aes(x = Batch)) +
+    geom_bar(aes(y = BatchCompletionTime), stat = "identity", fill = "darkgreen", alpha = 0.7) +
+    geom_text(aes(y = BatchCompletionTime + 2, label = sprintf("%.1f s", BatchCompletionTime)), 
+              size = 3, vjust = 0) +
+    theme_minimal() +
+    labs(title = "Processing Time by Batch",
+         subtitle = sprintf("Total processing time: %.1f seconds", total_time),
+         x = "Batch", y = "Processing Time (seconds)") +
+    theme(axis.text.x = element_text(angle = 0))
+  
+  # Create a final retention plot with batch comparisons
+  retention_comparison <- ggplot(progress_data, aes(x = Batch)) +
+    geom_bar(aes(y = RetentionRate * 100), stat = "identity", fill = "steelblue") +
+    geom_text(aes(y = RetentionRate * 100 + 3, label = sprintf("%.1f%%", RetentionRate * 100)), 
+              size = 3, vjust = 0) +
+    geom_hline(yintercept = 50, linetype = "dashed", color = "red") +
+    theme_minimal() +
+    labs(title = "Read Retention Rate by Batch",
+         subtitle = sprintf("Overall retention: %.1f%%", overall_retention),
+         x = "Batch", y = "Retention Rate (%)") +
+    scale_y_continuous(limits = c(0, 100))
+  
+  # Display the summary plots
+  grid.arrange(time_performance, retention_comparison, ncol = 1,
+               top = grid::textGrob("Batch Processing Summary", 
+                                   gp = grid::gpar(fontsize = 14, fontface = "bold")))
+  
+  # Create a completion/efficiency plot 
+  efficiency_data <- data.frame(
+    Metric = c("Total Samples", "Total Batches", "Avg Batch Size", 
+               "Avg Time/Batch (s)", "Avg Time/Sample (s)", "Total Time (s)"),
+    Value = c(length(sample.names), length(unique(batches)), 
+              mean(progress_data$CompletedSamples),
+              mean(progress_data$BatchCompletionTime), 
+              total_time/length(sample.names), 
+              total_time)
+  )
+  
+  # Display numeric summary
+  cat("\n----- FILTERING SUMMARY -----\n")
+  cat(sprintf("Total processing time: %.1f seconds (%.1f minutes)\n", 
+              total_time, total_time/60))
+  cat(sprintf("Total samples processed: %d in %d batches\n", 
+              length(sample.names), length(unique(batches))))
+  cat(sprintf("Average batch size: %.1f samples\n", 
+              mean(progress_data$CompletedSamples)))
+  cat(sprintf("Average time per batch: %.1f seconds\n", 
+              mean(progress_data$BatchCompletionTime)))
+  cat(sprintf("Average time per sample: %.1f seconds\n", 
+              total_time/length(sample.names)))
+  cat(sprintf("Overall retention rate: %.1f%%\n", overall_retention))
+  cat(sprintf("Total reads processed: %s\n", 
+              format(sum(progress_data$ReadsIn), big.mark = ",")))
+  cat(sprintf("Reads retained: %s (%.1f%%)\n", 
+              format(sum(progress_data$ReadsOut), big.mark = ","), 
+              overall_retention))
+  cat("-----------------------------\n")
 } else {
   # For smaller datasets, use standard approach
+  cat("Processing all samples at once...\n")
+  
+  # HARDCODE default values first, then try to override them
+  hard_truncLen_forward <- 240
+  hard_truncLen_reverse <- 160
+  hard_maxEE_forward <- 2.0
+  hard_maxEE_reverse <- 2.0
+  
+  # Try to use optimized values if they exist and are valid - with ultra-safe checks
+  cat("DEBUG: Checking for truncLen_forward...\n")
+  tryCatch({
+    if (exists("truncLen_forward")) {
+      # Check value without direct reference that might error
+      is_valid <- FALSE
+      
+      # First check if it's NULL
+      is_null <- tryCatch({
+        is.null(truncLen_forward)
+      }, error = function(e) {
+        cat("  - Error checking if truncLen_forward is NULL:", conditionMessage(e), "\n")
+        TRUE  # Assume NULL if we can't check
+      })
+      
+      if (!is_null) {
+        # Try to safely print the value
+        tryCatch({
+          if (is.na(truncLen_forward)) {
+            cat("  - truncLen_forward is NA\n")
+          } else {
+            cat("  - truncLen_forward exists, value:", as.character(truncLen_forward), "\n")
+            is_valid <- TRUE
+          }
+        }, error = function(e) {
+          cat("  - Error printing truncLen_forward:", conditionMessage(e), "\n")
+        })
+        
+        # Only try to convert if previous checks passed
+        if (is_valid) {
+          tryCatch({
+            num_val <- as.integer(truncLen_forward)
+            if (!is.na(num_val) && num_val > 0) {
+              hard_truncLen_forward <- num_val
+              cat("  - Using truncLen_forward value:", hard_truncLen_forward, "\n")
+            } else {
+              cat("  - truncLen_forward converted to invalid value:", num_val, "\n")
+            }
+          }, error = function(e) {
+            cat("  - Error converting truncLen_forward:", conditionMessage(e), "\n")
+          })
+        }
+      } else {
+        cat("  - truncLen_forward is NULL\n")
+      }
+    } else {
+      cat("  - truncLen_forward does not exist\n")
+    }
+  }, error = function(e) {
+    cat("  - Unexpected error processing truncLen_forward:", conditionMessage(e), "\n")
+  })
+  
+  cat("DEBUG: Checking for truncLen_reverse...\n")
+  tryCatch({
+    if (exists("truncLen_reverse")) {
+      # Check value without direct reference that might error
+      is_valid <- FALSE
+      
+      # First check if it's NULL
+      is_null <- tryCatch({
+        is.null(truncLen_reverse)
+      }, error = function(e) {
+        cat("  - Error checking if truncLen_reverse is NULL:", conditionMessage(e), "\n")
+        TRUE  # Assume NULL if we can't check
+      })
+      
+      if (!is_null) {
+        # Try to safely print the value
+        tryCatch({
+          if (is.na(truncLen_reverse)) {
+            cat("  - truncLen_reverse is NA\n")
+          } else {
+            cat("  - truncLen_reverse exists, value:", as.character(truncLen_reverse), "\n")
+            is_valid <- TRUE
+          }
+        }, error = function(e) {
+          cat("  - Error printing truncLen_reverse:", conditionMessage(e), "\n")
+        })
+        
+        # Only try to convert if previous checks passed
+        if (is_valid) {
+          tryCatch({
+            num_val <- as.integer(truncLen_reverse)
+            if (!is.na(num_val) && num_val > 0) {
+              hard_truncLen_reverse <- num_val
+              cat("  - Using truncLen_reverse value:", hard_truncLen_reverse, "\n")
+            } else {
+              cat("  - truncLen_reverse converted to invalid value:", num_val, "\n")
+            }
+          }, error = function(e) {
+            cat("  - Error converting truncLen_reverse:", conditionMessage(e), "\n")
+          })
+        }
+      } else {
+        cat("  - truncLen_reverse is NULL\n")
+      }
+    } else {
+      cat("  - truncLen_reverse does not exist\n")
+    }
+  }, error = function(e) {
+    cat("  - Unexpected error processing truncLen_reverse:", conditionMessage(e), "\n")
+  })
+  
+  # Final parameter values - use direct numeric values in the vectors
+  cat("\nFINAL PARAMETERS FOR FILTERING:\n")
+  cat("truncLen_forward =", hard_truncLen_forward, "\n")
+  cat("truncLen_reverse =", hard_truncLen_reverse, "\n")
+  cat("maxEE_forward =", hard_maxEE_forward, "\n")
+  cat("maxEE_reverse =", hard_maxEE_reverse, "\n")
+  
+  # Create the parameter vectors directly with numeric literals
+  # This avoids any possible reference to other variables
+  truncLen_vector <- c(hard_truncLen_forward, hard_truncLen_reverse)
+  maxEE_vector <- c(hard_maxEE_forward, hard_maxEE_reverse)
+  
+  cat("\nVERIFICATION OF PARAMETER VECTORS:\n")
+  cat("truncLen vector:", paste(truncLen_vector, collapse=", "), "\n")
+  cat("Class of truncLen vector:", class(truncLen_vector), "\n")
+  cat("Length of truncLen vector:", length(truncLen_vector), "\n")
+  
+  # Extra check to ensure vector has correct length
+  if (length(truncLen_vector) != 2) {
+    cat("WARNING: truncLen_vector does not have length 2, recreating with default values\n")
+    truncLen_vector <- c(240, 160)  # Hardcoded defaults
+  }
+  
+  cat("maxEE vector:", paste(maxEE_vector, collapse=", "), "\n")
+  
+  # Extra check for maxEE vector
+  if (length(maxEE_vector) != 2) {
+    cat("WARNING: maxEE_vector does not have length 2, recreating with default values\n")
+    maxEE_vector <- c(2.0, 2.0)  # Hardcoded defaults
+  }
+  
+  start_time <- Sys.time()
+  
+  # Use validated global parameter vectors
+  cat("\nUSING VALIDATED GLOBAL PARAMETERS FOR FILTERING:\n")
+  cat("truncLen =", paste(GLOBAL_TRUNCLEN_VECTOR, collapse=", "), "\n")
+  cat("maxEE =", paste(GLOBAL_MAXEE_VECTOR, collapse=", "), "\n")
+  
+  # Use our guaranteed global parameter vectors
   out <- filterAndTrim(
     fnFs, filtFs, fnRs, filtRs,
-    truncLen = c(truncLen_forward, truncLen_reverse), 
-    maxN = 0, maxEE = c(maxEE_forward, maxEE_reverse), truncQ = 2,
-    rm.phix = TRUE, compress = TRUE, multithread = TRUE
+    truncLen = GLOBAL_TRUNCLEN_VECTOR,  # Using validated global vector
+    maxN = 0, 
+    maxEE = GLOBAL_MAXEE_VECTOR,        # Using validated global vector
+    truncQ = 2,
+    rm.phix = TRUE, 
+    compress = TRUE, 
+    multithread = TRUE
   )
+
+  # Calculate statistics
+  total_time <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+  total_reads_in <- sum(out[, 1])
+  total_reads_out <- sum(out[, 2])
+  retention_rate <- total_reads_out / total_reads_in * 100
+
+  # Create a simple progress visualization for small datasets
+  progress_data <- data.frame(
+    Stage = c("Before Filtering", "After Filtering"),
+    Reads = c(total_reads_in, total_reads_out)
+  )
+
+  # Plot the progress
+  small_dataset_plot <- ggplot(progress_data, aes(x = Stage, y = Reads, fill = Stage)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = format(Reads, big.mark = ",", scientific = FALSE)), 
+              vjust = -0.5, size = 4) +
+    theme_minimal() +
+    labs(title = "Filtering Results",
+         subtitle = sprintf("Processed %d samples in %.1f seconds (%.1f%% retention)",
+                            length(fnFs), total_time, retention_rate),
+         x = "", y = "Number of Reads") +
+    scale_fill_manual(values = c("Before Filtering" = "darkred", "After Filtering" = "steelblue")) +
+    theme(legend.position = "none")
+
+  # Display the plot
+  print(small_dataset_plot)
+
+  # Add a simple sample-level retention visualization
+  sample_retention <- data.frame(
+    Sample = rownames(out),
+    ReadsIn = out[, 1],
+    ReadsOut = out[, 2],
+    RetentionRate = out[, 2] / out[, 1] * 100
+  )
+
+  # Sort by retention rate
+  sample_retention <- sample_retention[order(-sample_retention$RetentionRate), ]
+
+  # Create a plot for per-sample retention rates
+  sample_plot <- ggplot(sample_retention, aes(x = reorder(Sample, -RetentionRate), y = RetentionRate)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    geom_hline(yintercept = 50, linetype = "dashed", color = "red") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = "Per-Sample Retention Rates",
+         x = "Sample", y = "Retention Rate (%)") +
+    coord_cartesian(ylim = c(0, 100))
+
+  # Display the plot
+  print(sample_plot)
+
+  cat(sprintf("Processing completed: %d samples processed in %.1f seconds\n", 
+              length(fnFs), total_time))
+  cat(sprintf("Overall retention rate: %.1f%% (%s out of %s reads)\n", 
+              retention_rate, 
+              format(total_reads_out, big.mark = ",", scientific = FALSE), 
+              format(total_reads_in, big.mark = ",", scientific = FALSE)))
+  cat("--------------------------------------------------------------\n")
 }
 
 # Create summary of filtering results
@@ -2811,9 +3429,9 @@ if (abs(modal_length - expected_amplicon_size) <= 10) {
   cat("WARNING: Most common ASV length differs from expected amplicon size\n")
 }
 
-# Filter out suspiciously short or long ASVs
-min_allowed_len <- max(expected_amplicon_size - 50, 0.8 * modal_length)
-max_allowed_len <- min(expected_amplicon_size + 50, 1.2 * modal_length)
+# Filter out suspiciously short or long ASVs with a wider acceptable range
+min_allowed_len <- max(expected_amplicon_size - 100, 0.7 * modal_length)
+max_allowed_len <- min(expected_amplicon_size + 100, 1.3 * modal_length)
 
 cat("Filtering ASVs with lengths outside the range:", min_allowed_len, "-", max_allowed_len, "bp\n")
 seqtab_filtered <- seqtab[, nchar(colnames(seqtab)) >= min_allowed_len & 
@@ -2829,6 +3447,37 @@ cat("Removed", original_reads - filtered_reads, "reads (",
 
 # Use filtered sequence table for further analysis
 seqtab <- seqtab_filtered
+
+# Create summary table of parameter optimization results
+param_summary_table <- data.frame(
+  Parameter = c(
+    "Forward Truncation Length", 
+    "Reverse Truncation Length", 
+    "Forward maxEE", 
+    "Reverse maxEE", 
+    "Expected Amplicon Size", 
+    "Expected Overlap"
+  ),
+  Value = c(
+    truncLen_forward, 
+    truncLen_reverse, 
+    round(maxEE_forward, 1), 
+    round(maxEE_reverse, 1), 
+    expected_amplicon_size, 
+    expected_overlap
+  ),
+  Description = c(
+    "Optimized position to truncate forward reads",
+    "Optimized position to truncate reverse reads",
+    "Maximum expected errors for forward reads",
+    "Maximum expected errors for reverse reads",
+    "Expected amplicon size based on detected primers",
+    "Expected overlap between paired reads after truncation"
+  )
+)
+
+# Display the parameter summary table
+kable(param_summary_table, caption = "Summary of Optimized DADA2 Parameters")
 
 # If multi-run, create a summary of ASVs per run
 if (is_multi_run && exists("file_to_run") && exists("run_seqtabs")) {
